@@ -89,6 +89,11 @@ module.exports = {
     suspendThreshold: 3.0,
   },
 
+  admin: {
+    // Override with GOAPP_ADMIN_TOKEN env var in production
+    token: process.env.GOAPP_ADMIN_TOKEN || 'goapp-admin-secret',
+  },
+
   rideStatuses: {
     REQUESTED: 'REQUESTED',
     MATCHING: 'MATCHING',

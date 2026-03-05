@@ -14,17 +14,28 @@ const rideService = require('./services/ride-service');
 const identityService = require('./services/identity-service');
 const redis = require('./services/redis-mock');
 const mockDb = require('./services/mock-db');
+const zoneService = require('./services/zone-service');
 const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
 
 // Test Data
 const { generateIdentityUsers } = require('./data/test-data');
 
+// ─── Admin auth helper ────────────────────────────────────────────────────
+function requireAdmin(headers) {
+  const token = headers['x-admin-token'];
+  if (!token || token !== config.admin.token) {
+    return { status: 401, data: { error: 'Admin authentication required. Provide X-Admin-Token header.' } };
+  }
+  return null; // no error
+}
+
 function startAPIServer(port) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${port}`);
     const path = url.pathname;
     const method = req.method;
+    const headers = req.headers;
 
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
@@ -55,7 +66,7 @@ function startAPIServer(port) {
         res.end(JSON.stringify({ error: 'Invalid JSON body' }));
         return;
       }
-      const response = await handleRoute(method, path, json, url.searchParams);
+      const response = await handleRoute(method, path, json, url.searchParams, headers);
       res.writeHead(response.status || 200);
       res.end(JSON.stringify(response.data, null, 2));
     } catch (err) {
@@ -94,13 +105,19 @@ function startAPIServer(port) {
     console.log('  GET  /api/v1/stats');
     console.log('  GET  /api/v1/formulas/haversine?lat1=X&lng1=Y&lat2=X&lng2=Y');
     console.log('  GET  /api/v1/formulas/bearing?lat1=X&lng1=Y&lat2=X&lng2=Y');
+    console.log('  --- Admin (requires X-Admin-Token header) ---');
+    console.log('  GET    /api/v1/admin/zones');
+    console.log('  POST   /api/v1/admin/zones');
+    console.log('  PUT    /api/v1/admin/zones/:id/enable');
+    console.log('  PUT    /api/v1/admin/zones/:id/disable');
+    console.log('  DELETE /api/v1/admin/zones/:id');
     console.log('');
   });
 
   return server;
 }
 
-async function handleRoute(method, path, body, params) {
+async function handleRoute(method, path, body, params, headers = {}) {
   if (path === '/api/v1/health') {
     return {
       data: {
@@ -180,6 +197,16 @@ async function handleRoute(method, path, body, params) {
   }
 
   if (path === '/api/v1/rides/request' && method === 'POST') {
+    const pickupLat = parseFloat(body.pickupLat);
+    const pickupLng = parseFloat(body.pickupLng);
+
+    if (Number.isFinite(pickupLat) && Number.isFinite(pickupLng)) {
+      const zoneCheck = zoneService.checkPickup(pickupLat, pickupLng);
+      if (!zoneCheck.allowed) {
+        return { status: 403, data: { error: zoneCheck.message, reason: zoneCheck.reason } };
+      }
+    }
+
     const result = await rideService.createRide({
       ...body,
       idempotencyKey: body.idempotencyKey || crypto.randomUUID(),
@@ -287,6 +314,54 @@ async function handleRoute(method, path, body, params) {
     }
 
     return { data: { bearingDeg: Math.round(bearing(lat1, lng1, lat2, lng2) * 10) / 10 } };
+  }
+
+  // ═══════════════════════════════════════════
+  // ADMIN: Service Zone Management
+  // All routes require X-Admin-Token header
+  // ═══════════════════════════════════════════
+
+  if (path.startsWith('/api/v1/admin/zones')) {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+
+    // GET /api/v1/admin/zones — list all zones
+    if (path === '/api/v1/admin/zones' && method === 'GET') {
+      const zones = zoneService.listZones();
+      return { data: { zones, stats: zoneService.getStats() } };
+    }
+
+    // POST /api/v1/admin/zones — create a zone
+    if (path === '/api/v1/admin/zones' && method === 'POST') {
+      const result = zoneService.createZone({
+        name: body.name,
+        lat: parseFloat(body.lat),
+        lng: parseFloat(body.lng),
+        radiusKm: parseFloat(body.radiusKm),
+      });
+      return { status: result.success ? 201 : 400, data: result };
+    }
+
+    // PUT /api/v1/admin/zones/:id/enable — enable a zone
+    const enableMatch = path.match(/^\/api\/v1\/admin\/zones\/(.+)\/enable$/);
+    if (enableMatch && method === 'PUT') {
+      const result = zoneService.setZoneEnabled(enableMatch[1], true);
+      return { status: result.success ? 200 : 404, data: result };
+    }
+
+    // PUT /api/v1/admin/zones/:id/disable — disable a zone
+    const disableMatch = path.match(/^\/api\/v1\/admin\/zones\/(.+)\/disable$/);
+    if (disableMatch && method === 'PUT') {
+      const result = zoneService.setZoneEnabled(disableMatch[1], false);
+      return { status: result.success ? 200 : 404, data: result };
+    }
+
+    // DELETE /api/v1/admin/zones/:id — delete a zone
+    const deleteMatch = path.match(/^\/api\/v1\/admin\/zones\/(.+)$/);
+    if (deleteMatch && method === 'DELETE') {
+      const result = zoneService.deleteZone(deleteMatch[1]);
+      return { status: result.success ? 200 : 404, data: result };
+    }
   }
 
   return { status: 404, data: { error: 'Not found', path, method } };
