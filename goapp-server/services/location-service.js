@@ -70,43 +70,6 @@ class LocationService {
     return { success: true, lat, lng };
   }
 
-
-  // Bulk bootstrap path for warm-starting from test fixtures.
-  // Skips expensive fraud checks and emits a single summary event by default.
-  bulkLoadLocations(drivers, { publishEvents = false } = {}) {
-    for (const driver of drivers) {
-      redis.geoadd(GEO_KEY, driver.lng, driver.lat, driver.driverId);
-      driverMeta.set(driver.driverId, {
-        lat: driver.lat,
-        lng: driver.lng,
-        speed: driver.speed || 0,
-        heading: driver.heading || 0,
-        updatedAt: Date.now(),
-        prevLat: null,
-        prevLng: null,
-        jumpCount: 0,
-      });
-
-      if (publishEvents) {
-        eventBus.publish('driver_location_update', {
-          driverId: driver.driverId,
-          lat: driver.lat,
-          lng: driver.lng,
-          speed: driver.speed || 0,
-          heading: driver.heading || 0,
-          timestamp: Date.now(),
-        });
-      }
-    }
-
-    eventBus.publish('driver_locations_bootstrapped', {
-      count: drivers.length,
-      emittedIndividualEvents: publishEvents,
-    });
-
-    return { success: true, loaded: drivers.length };
-  }
-
   // Get driver's current position (with staleness handling)
   getDriverLocation(driverId) {
     const meta = driverMeta.get(driverId);
