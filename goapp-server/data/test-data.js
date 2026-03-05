@@ -72,6 +72,25 @@ function generateRiders(count = 10, seed = 99) {
   }));
 }
 
+function generateIdentityUsers(count = 20, seed = 123) {
+  const rng = createRng(seed);
+  const countries = ['+91', '+1', '+44'];
+
+  return Array.from({ length: count }, (_, i) => {
+    const country = countries[i % countries.length];
+    const localNumber = `${Math.floor(6000000000 + (rng() * 3999999999))}`;
+    return {
+      userId: `USR-${String(i + 1).padStart(4, '0')}`,
+      phoneNumber: `${country}${localNumber}`,
+      name: `${names[i % names.length]} User`,
+      userType: i % 7 === 0 ? 'driver' : 'rider',
+      phoneVerified: i % 4 !== 0,
+      status: 'active',
+      createdAt: FIXED_NOW - Math.floor(rng() * 10 * 24 * 60 * 60 * 1000),
+    };
+  });
+}
+
 function generateRideScenarios() {
   return [
     {
@@ -139,6 +158,7 @@ module.exports = {
   chennaiLocations,
   generateDrivers,
   generateRiders,
+  generateIdentityUsers,
   generateRideScenarios,
   generateSurgeScenarios,
   generateFraudTestData,

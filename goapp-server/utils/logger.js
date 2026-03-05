@@ -56,6 +56,7 @@ class EventBus extends EventEmitter {
   constructor() {
     super();
     this.events = [];
+    this.maxEvents = Number(process.env.EVENT_BUS_MAX_EVENTS || 5000);
     this.setMaxListeners(100);
   }
 
@@ -68,6 +69,7 @@ class EventBus extends EventEmitter {
       isoTime: new Date().toISOString(),
     };
     this.events.push(event);
+    if (this.events.length > this.maxEvents) this.events.shift();
     logger.event(eventName, { rideId: data.rideId, driverId: data.driverId });
     this.emit(eventName, event);
     this.emit('*', event); // wildcard listener

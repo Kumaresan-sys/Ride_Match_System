@@ -1,26 +1,9 @@
 #!/usr/bin/env node
 
-// ═══════════════════════════════════════════════════════════════
-//  GoApp Ride Matching Platform - Complete Node.js System
-//  Version 2.0 | Production Architecture Simulation
-// ═══════════════════════════════════════════════════════════════
-//
-//  This system demonstrates:
-//  ├── REST API (http://localhost:3000)
-//  ├── WebSocket Server (ws://localhost:3001)
-//  ├── Redis GEO (in-memory mock)
-//  ├── Kafka Event Bus (in-memory mock)
-//  └── Full ride lifecycle simulation
-//
-//  Usage:
-//    node server.js              → Run simulation + start servers
-//    node server.js --sim-only   → Run simulation only (no servers)
-//    node server.js --api-only   → Start API servers only
-// ═══════════════════════════════════════════════════════════════
-
 const http = require('http');
 const crypto = require('crypto');
 const config = require('./config');
+const enterpriseConfig = require('./config/enterprise-architecture');
 const { logger, eventBus } = require('./utils/logger');
 
 // Services
@@ -28,34 +11,38 @@ const locationService = require('./services/location-service');
 const matchingEngine = require('./services/matching-engine');
 const pricingService = require('./services/pricing-service');
 const rideService = require('./services/ride-service');
+const identityService = require('./services/identity-service');
 const redis = require('./services/redis-mock');
+const mockDb = require('./services/mock-db');
 const WebSocketServer = require('./websocket/ws-gateway');
-const { haversine, bearing, calculateCompositeScore, detectSpoofing } = require('./utils/formulas');
+const { haversine, bearing } = require('./utils/formulas');
 
 // Test Data
-const { generateDrivers, generateRiders, generateRideScenarios, chennaiLocations } = require('./data/test-data');
+const { generateIdentityUsers } = require('./data/test-data');
 
-// ─── REST API Server ───
 function startAPIServer(port) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${port}`);
     const path = url.pathname;
     const method = req.method;
 
-    // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     res.setHeader('Content-Type', 'application/json');
 
-    if (method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
+    if (method === 'OPTIONS') {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
 
     try {
       let body = '';
       if (method === 'POST' || method === 'PUT') {
         body = await new Promise((resolve) => {
           let data = '';
-          req.on('data', chunk => data += chunk);
+          req.on('data', chunk => { data += chunk; });
           req.on('end', () => resolve(data));
         });
       }
@@ -64,17 +51,25 @@ function startAPIServer(port) {
       const response = await handleRoute(method, path, json, url.searchParams);
       res.writeHead(response.status || 200);
       res.end(JSON.stringify(response.data, null, 2));
-
     } catch (err) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: err.message }));
     }
   });
 
+  server.keepAliveTimeout = enterpriseConfig.performance.httpKeepAliveMs;
+  server.requestTimeout = enterpriseConfig.performance.requestTimeoutMs;
+
   server.listen(port, () => {
     logger.success('API', `REST API running on http://localhost:${port}`);
     logger.info('API', 'Endpoints:');
     console.log('  GET  /api/v1/health');
+    console.log('  GET  /api/v1/microservices');
+    console.log('  GET  /api/v1/aws/readiness');
+    console.log('  GET  /api/v1/users?limit=20');
+    console.log('  POST /api/v1/auth/otp/request');
+    console.log('  POST /api/v1/auth/otp/verify');
+    console.log('  GET  /api/v1/auth/stats');
     console.log('  GET  /api/v1/drivers');
     console.log('  GET  /api/v1/drivers/nearby?lat=X&lng=Y&radius=Z');
     console.log('  PUT  /api/v1/drivers/:id/location');
@@ -98,21 +93,62 @@ function startAPIServer(port) {
   return server;
 }
 
-// ─── Route Handler ───
 async function handleRoute(method, path, body, params) {
-  // Health
   if (path === '/api/v1/health') {
-    return { data: {
-      status: 'ok', service: 'GoApp Ride Matching Platform', version: '2.0',
-      uptime: process.uptime(),
-      redis: redis.getStats(),
-      location: locationService.getStats(),
-      pricing: pricingService.getStats(),
-      rides: rideService.getStats(),
-    }};
+    return {
+      data: {
+        status: 'ok',
+        service: 'GoApp Ride Matching Platform',
+        version: '2.1',
+        uptime: process.uptime(),
+        runtime: enterpriseConfig.runtime,
+        redis: redis.getStats(),
+        identity: identityService.getStats(),
+        location: locationService.getStats(),
+        pricing: pricingService.getStats(),
+        rides: rideService.getStats(),
+        mockDb: mockDb.getStats(),
+      },
+    };
   }
 
-  // ─── Drivers ───
+  if (path === '/api/v1/microservices' && method === 'GET') {
+    return { data: enterpriseConfig.microservices };
+  }
+
+  if (path === '/api/v1/aws/readiness' && method === 'GET') {
+    return {
+      data: {
+        runtime: enterpriseConfig.runtime,
+        aws: enterpriseConfig.aws,
+        checks: {
+          canRunWithoutDatabase: true,
+          eventBusBuffered: true,
+          inMemoryTestDataSeeded: Boolean(mockDb.getStats().seedMeta),
+        },
+      },
+    };
+  }
+
+  if (path === '/api/v1/users' && method === 'GET') {
+    const limit = Number(params.get('limit') || 20);
+    return { data: { users: identityService.getUsers(limit) } };
+  }
+
+  if (path === '/api/v1/auth/stats' && method === 'GET') {
+    return { data: identityService.getStats() };
+  }
+
+  if (path === '/api/v1/auth/otp/request' && method === 'POST') {
+    const result = identityService.requestOtp(body);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  if (path === '/api/v1/auth/otp/verify' && method === 'POST') {
+    const result = identityService.verifyOtp(body);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
   if (path === '/api/v1/drivers' && method === 'GET') {
     return { data: { drivers: locationService.getAllTracked() } };
   }
@@ -121,7 +157,11 @@ async function handleRoute(method, path, body, params) {
     const lat = parseFloat(params.get('lat'));
     const lng = parseFloat(params.get('lng'));
     const radius = parseFloat(params.get('radius') || '5');
-    if (!lat || !lng) return { status: 400, data: { error: 'lat and lng required' } };
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return { status: 400, data: { error: 'lat and lng required' } };
+    }
+
     const nearby = locationService.findNearby(lat, lng, radius, 20);
     return { data: { count: nearby.length, drivers: nearby } };
   }
@@ -132,7 +172,6 @@ async function handleRoute(method, path, body, params) {
     return { data: result };
   }
 
-  // ─── Rides ───
   if (path === '/api/v1/rides/request' && method === 'POST') {
     const result = await rideService.createRide({
       ...body,
@@ -175,13 +214,11 @@ async function handleRoute(method, path, body, params) {
     return { data: ride || { error: 'Ride not found' } };
   }
 
-  // ─── Fare ───
   if (path === '/api/v1/fare/estimate' && method === 'POST') {
     const estimates = pricingService.getEstimates(body.pickupLat, body.pickupLng, body.destLat, body.destLng);
     return { data: estimates };
   }
 
-  // ─── Surge ───
   if (path === '/api/v1/surge/zones' && method === 'GET') {
     return { data: { zones: pricingService.getSurgeZones() } };
   }
@@ -191,47 +228,89 @@ async function handleRoute(method, path, body, params) {
     return { data: result };
   }
 
-  // ─── Events ───
   if (path === '/api/v1/events' && method === 'GET') {
-    const count = parseInt(params.get('count') || '20');
+    const count = parseInt(params.get('count') || '20', 10);
     return { data: { events: eventBus.getRecentEvents(count) } };
   }
 
-  // ─── Stats ───
   if (path === '/api/v1/stats' && method === 'GET') {
-    return { data: {
-      redis: redis.getStats(),
-      location: locationService.getStats(),
-      pricing: pricingService.getStats(),
-      rides: rideService.getStats(),
-      events: { total: eventBus.events.length },
-    }};
+    return {
+      data: {
+        redis: redis.getStats(),
+        identity: identityService.getStats(),
+        location: locationService.getStats(),
+        pricing: pricingService.getStats(),
+        rides: rideService.getStats(),
+        events: { total: eventBus.events.length },
+      },
+    };
   }
 
-  // ─── Formula Endpoints ───
   if (path === '/api/v1/formulas/haversine' && method === 'GET') {
     const lat1 = parseFloat(params.get('lat1'));
     const lng1 = parseFloat(params.get('lng1'));
     const lat2 = parseFloat(params.get('lat2'));
     const lng2 = parseFloat(params.get('lng2'));
-    if (!lat1 || !lng1 || !lat2 || !lng2) return { status: 400, data: { error: 'lat1, lng1, lat2, lng2 required' } };
+
+    if (![lat1, lng1, lat2, lng2].every(Number.isFinite)) {
+      return { status: 400, data: { error: 'lat1, lng1, lat2, lng2 required' } };
+    }
+
     const dist = haversine(lat1, lng1, lat2, lng2);
     const bear = bearing(lat1, lng1, lat2, lng2);
-    return { data: {
-      from: { lat: lat1, lng: lng1 }, to: { lat: lat2, lng: lng2 },
-      distanceKm: Math.round(dist * 100) / 100,
-      bearingDeg: Math.round(bear * 10) / 10,
-      etaMin: Math.round((dist * 1.3 / config.scoring.avgCitySpeedKmh) * 60 * 10) / 10,
-    }};
+    return {
+      data: {
+        from: { lat: lat1, lng: lng1 },
+        to: { lat: lat2, lng: lng2 },
+        distanceKm: Math.round(dist * 100) / 100,
+        bearingDeg: Math.round(bear * 10) / 10,
+        etaMin: Math.round((dist * 1.3 / config.scoring.avgCitySpeedKmh) * 60 * 10) / 10,
+      },
+    };
   }
 
-  // 404
+  if (path === '/api/v1/formulas/bearing' && method === 'GET') {
+    const lat1 = parseFloat(params.get('lat1'));
+    const lng1 = parseFloat(params.get('lng1'));
+    const lat2 = parseFloat(params.get('lat2'));
+    const lng2 = parseFloat(params.get('lng2'));
+
+    if (![lat1, lng1, lat2, lng2].every(Number.isFinite)) {
+      return { status: 400, data: { error: 'lat1, lng1, lat2, lng2 required' } };
+    }
+
+    return { data: { bearingDeg: Math.round(bearing(lat1, lng1, lat2, lng2) * 10) / 10 } };
+  }
+
   return { status: 404, data: { error: 'Not found', path, method } };
 }
 
-// ═══════════════════════════════════════════════════
-// MAIN
-// ═══════════════════════════════════════════════════
+function bootstrapTestData() {
+  const seedResult = mockDb.seed({
+    driverCount: enterpriseConfig.performance.bootstrapBatchSize,
+    riderCount: 200,
+  });
+
+  for (const driver of seedResult.drivers) {
+    matchingEngine.registerDriver(driver);
+    locationService.updateLocation(driver.driverId, {
+      lat: driver.lat,
+      lng: driver.lng,
+      speed: driver.speed,
+      heading: driver.heading,
+    });
+  }
+
+  const identityUsers = generateIdentityUsers(300);
+  identityService.seedUsers(identityUsers);
+
+  logger.success('BOOTSTRAP', 'Seeded test datasets (no real DB dependency).', {
+    drivers: seedResult.driverCount,
+    riders: seedResult.riderCount,
+    identityUsers: identityUsers.length,
+  });
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const simOnly = args.includes('--sim-only');
@@ -240,36 +319,24 @@ async function main() {
   console.clear();
   console.log('');
   console.log('  ╔══════════════════════════════════════════════════════╗');
-  console.log('  ║   GoApp Ride Matching Platform v2.0                 ║');
-  console.log('  ║   Complete Node.js System Simulation                ║');
+  console.log('  ║   GoApp Ride Matching Platform v2.1                 ║');
+  console.log('  ║   Microservice-ready + AWS-aware + Mock Data        ║');
   console.log('  ╚══════════════════════════════════════════════════════╝');
   console.log('');
 
-  if (!simOnly) {
-    // Setup test data for API mode
-    const drivers = generateDrivers(20);
-    drivers.forEach(d => {
-      matchingEngine.registerDriver(d);
-      locationService.updateLocation(d.driverId, {
-        lat: d.lat, lng: d.lng, speed: d.speed, heading: d.heading,
-      });
-    });
+  bootstrapTestData();
 
-    // Start REST API
+  if (!simOnly) {
     startAPIServer(config.server.port);
 
-    // Start WebSocket
     const wsServer = new WebSocketServer();
     wsServer.start(config.server.wsPort);
-
-    // Wire WebSocket location updates to location service
     wsServer.onLocationUpdate = (driverId, data) => {
       locationService.updateLocation(driverId, data);
     };
   }
 
   if (!apiOnly) {
-    // Run simulation
     const Simulator = require('./simulation/simulator');
     const sim = new Simulator();
     await sim.run();
@@ -277,13 +344,9 @@ async function main() {
 
   if (!simOnly) {
     console.log('\n  Servers are running. Press Ctrl+C to stop.\n');
-    console.log('  Try these API calls:');
     console.log('  curl http://localhost:3000/api/v1/health');
-    console.log('  curl http://localhost:3000/api/v1/drivers/nearby?lat=13.0418\\&lng=80.2341\\&radius=5');
-    console.log('  curl http://localhost:3000/api/v1/stats');
-    console.log('  curl http://localhost:3000/api/v1/formulas/haversine?lat1=13.0827\\&lng1=80.2707\\&lat2=13.0418\\&lng2=80.2341');
-    console.log('  curl -X POST http://localhost:3000/api/v1/rides/request -H "Content-Type: application/json" -d \'{"riderId":"RDR-001","pickupLat":13.0418,"pickupLng":80.2341,"destLat":13.0827,"destLng":80.2707,"rideType":"sedan"}\'');
-    console.log('');
+    console.log('  curl http://localhost:3000/api/v1/microservices');
+    console.log("  curl -X POST http://localhost:3000/api/v1/auth/otp/request -H 'Content-Type: application/json' -d '{\"phoneNumber\":\"+919876543210\",\"otpType\":\"login\"}'");
   }
 }
 
