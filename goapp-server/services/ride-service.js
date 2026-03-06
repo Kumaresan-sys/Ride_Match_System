@@ -6,6 +6,7 @@ const config = require('../config');
 const redis = require('./redis-mock');
 const matchingEngine = require('./matching-engine');
 const pricingService = require('./pricing-service');
+const notificationService = require('./notification-service');
 const { haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
 
@@ -77,6 +78,7 @@ class RideService {
 
     // ─── Start Matching ───
     this._updateStatus(rideId, S.MATCHING);
+    notificationService.notifyRideRequested(riderId, rideId);
 
     const matchResult = await matchingEngine.startMatching(ride);
 
@@ -86,6 +88,15 @@ class RideService {
       ride.matchResult = matchResult;
       this._updateStatus(rideId, S.ACCEPTED);
       this._updateStatus(rideId, S.DRIVER_ARRIVING);
+
+      notificationService.notifyRideMatched(riderId, matchResult.driverId, {
+        rideId,
+        driverName: matchResult.driverName,
+        vehicleType: matchResult.vehicleType,
+        vehicleNumber: matchResult.vehicleNumber,
+        etaMin: matchResult.etaMin,
+        score: matchResult.score,
+      });
 
       return {
         rideId,
@@ -103,6 +114,7 @@ class RideService {
       };
     } else {
       this._updateStatus(rideId, S.NO_DRIVERS);
+      notificationService.notifyNoDrivers(riderId, rideId);
       return {
         rideId,
         status: S.NO_DRIVERS,
@@ -123,6 +135,10 @@ class RideService {
     this._updateStatus(rideId, S.DRIVER_ARRIVED);
     eventBus.publish('driver_arrived', { rideId, driverId: ride.driverId, riderId: ride.riderId });
     logger.success('RIDE', `Driver arrived at pickup for ride ${rideId}`);
+
+    const arrivedDriver = matchingEngine.getDriver(ride.driverId);
+    notificationService.notifyDriverArrived(ride.riderId, arrivedDriver?.name || 'Your driver', rideId);
+
     return ride;
   }
 
@@ -134,6 +150,9 @@ class RideService {
     this._updateStatus(rideId, S.TRIP_STARTED);
     eventBus.publish('ride_started', { rideId, driverId: ride.driverId, riderId: ride.riderId });
     logger.success('RIDE', `Trip started for ride ${rideId}`);
+
+    notificationService.notifyTripStarted(ride.riderId, rideId);
+
     return ride;
   }
 
@@ -172,6 +191,12 @@ class RideService {
 
     logger.divider(`RIDE COMPLETED: ${rideId}`);
     logger.success('RIDE', `Fare: ₹${finalFare.finalFare} | Driver: ₹${finalFare.driverEarnings} | Platform: ₹${finalFare.platformCommission}`);
+
+    notificationService.notifyTripCompleted(ride.riderId, ride.driverId, {
+      rideId,
+      finalFare: finalFare.finalFare,
+      driverEarnings: finalFare.driverEarnings,
+    });
 
     return {
       rideId,
@@ -222,6 +247,9 @@ class RideService {
         eventBus.publish('ride_cancelled_by_rider', {
           rideId, phase: 'after_accept', cancelFee, driverId: ride.driverId,
         });
+
+        // Notify the driver that the rider cancelled
+        notificationService.notifyCancelledByRider(ride.driverId, rideId, cancelFee);
       }
 
       // Track rider cancellations
@@ -248,6 +276,9 @@ class RideService {
 
       logger.warn('RIDE', `Driver cancelled ride ${rideId} - resuming matching from stage ${lastStage}`);
 
+      // Notify rider that driver cancelled and we are finding a new one
+      notificationService.notifyCancelledByDriver(ride.riderId, rideId);
+
       // Resume matching asynchronously so the rider isn't left stranded
       ride.driverId = null;
       this._updateStatus(rideId, S.MATCHING);
@@ -258,12 +289,23 @@ class RideService {
           ride.matchResult = matchResult;
           this._updateStatus(rideId, S.ACCEPTED);
           this._updateStatus(rideId, S.DRIVER_ARRIVING);
+
+          // Notify rider that a new driver was found
+          notificationService.notifyRematchSuccess(ride.riderId, matchResult.driverId, {
+            rideId,
+            driverName: matchResult.driverName,
+            vehicleType: matchResult.vehicleType,
+            vehicleNumber: matchResult.vehicleNumber,
+            etaMin: matchResult.etaMin,
+          });
         } else {
           this._updateStatus(rideId, S.NO_DRIVERS);
+          notificationService.notifyNoDrivers(ride.riderId, rideId);
         }
       }).catch(err => {
         logger.error('RIDE', `Re-matching failed for ride ${rideId}: ${err.message}`);
         this._updateStatus(rideId, S.NO_DRIVERS);
+        notificationService.notifyNoDrivers(ride.riderId, rideId);
       });
     }
 

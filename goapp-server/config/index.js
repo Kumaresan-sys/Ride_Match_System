@@ -94,6 +94,15 @@ module.exports = {
     token: process.env.GOAPP_ADMIN_TOKEN || 'goapp-admin-secret',
   },
 
+  firebase: {
+    // Firebase service account credentials (required for FCM push notifications).
+    // Download from: Firebase Console → Project Settings → Service Accounts → Generate new private key
+    projectId:   process.env.FIREBASE_PROJECT_ID   || '',
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL || '',
+    // Paste the full -----BEGIN RSA PRIVATE KEY----- block (newlines as \n in .env)
+    privateKey:  process.env.FIREBASE_PRIVATE_KEY  || '',
+  },
+
   rideStatuses: {
     REQUESTED: 'REQUESTED',
     MATCHING: 'MATCHING',

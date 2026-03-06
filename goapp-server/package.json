@@ -1,0 +1,14 @@
+{
+  "name": "goapp-server",
+  "version": "2.1.0",
+  "description": "GoApp Ride Matching Platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "api": "node server.js --api-only",
+    "sim": "node server.js --sim-only"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.1.0"
+  }
+}

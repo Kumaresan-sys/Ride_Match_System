@@ -15,6 +15,7 @@ const identityService = require('./services/identity-service');
 const redis = require('./services/redis-mock');
 const mockDb = require('./services/mock-db');
 const zoneService = require('./services/zone-service');
+const notificationService = require('./services/notification-service');
 const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
 
@@ -105,12 +106,15 @@ function startAPIServer(port) {
     console.log('  GET  /api/v1/stats');
     console.log('  GET  /api/v1/formulas/haversine?lat1=X&lng1=Y&lat2=X&lng2=Y');
     console.log('  GET  /api/v1/formulas/bearing?lat1=X&lng1=Y&lat2=X&lng2=Y');
+    console.log('  POST /api/v1/users/:id/device-token');
+    console.log('  DELETE /api/v1/users/:id/device-token');
     console.log('  --- Admin (requires X-Admin-Token header) ---');
     console.log('  GET    /api/v1/admin/zones');
     console.log('  POST   /api/v1/admin/zones');
     console.log('  PUT    /api/v1/admin/zones/:id/enable');
     console.log('  PUT    /api/v1/admin/zones/:id/disable');
     console.log('  DELETE /api/v1/admin/zones/:id');
+    console.log('  GET    /api/v1/admin/notifications/stats');
     console.log('');
   });
 
@@ -132,6 +136,7 @@ async function handleRoute(method, path, body, params, headers = {}) {
         pricing: pricingService.getStats(),
         rides: rideService.getStats(),
         mockDb: mockDb.getStats(),
+        notifications: notificationService.getStats(),
       },
     };
   }
@@ -317,6 +322,25 @@ async function handleRoute(method, path, body, params, headers = {}) {
   }
 
   // ═══════════════════════════════════════════
+  // DEVICE TOKEN — FCM registration
+  // ═══════════════════════════════════════════
+
+  // POST /api/v1/users/:id/device-token  { token, platform }
+  const tokenRegMatch = path.match(/^\/api\/v1\/users\/(.+)\/device-token$/);
+  if (tokenRegMatch && method === 'POST') {
+    const userId = tokenRegMatch[1];
+    const result = notificationService.registerToken(userId, body.token, body.platform);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // DELETE /api/v1/users/:id/device-token
+  const tokenDelMatch = path.match(/^\/api\/v1\/users\/(.+)\/device-token$/);
+  if (tokenDelMatch && method === 'DELETE') {
+    notificationService.removeToken(tokenDelMatch[1]);
+    return { data: { success: true } };
+  }
+
+  // ═══════════════════════════════════════════
   // ADMIN: Service Zone Management
   // All routes require X-Admin-Token header
   // ═══════════════════════════════════════════
@@ -361,6 +385,11 @@ async function handleRoute(method, path, body, params, headers = {}) {
     if (deleteMatch && method === 'DELETE') {
       const result = zoneService.deleteZone(deleteMatch[1]);
       return { status: result.success ? 200 : 404, data: result };
+    }
+
+    // GET /api/v1/admin/notifications/stats — FCM token registry
+    if (path === '/api/v1/admin/notifications/stats' && method === 'GET') {
+      return { data: notificationService.getStats() };
     }
   }
 
