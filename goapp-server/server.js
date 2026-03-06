@@ -13,6 +13,10 @@ const pricingService = require('./services/pricing-service');
 const rideService = require('./services/ride-service');
 const identityService = require('./services/identity-service');
 const walletService = require('./services/wallet-service');
+const driverWalletService = require('./services/driver-wallet-service');
+const demandAggregationService = require('./services/demand-aggregation-service');
+const incentiveService = require('./services/incentive-service');
+const ticketService = require('./services/ticket-service');
 const sosService = require('./services/sos-service');
 const smsService = require('./services/sms-service');
 const redis = require('./services/redis-mock');
@@ -142,10 +146,38 @@ function startAPIServer(port) {
     console.log('  GET  /api/v1/formulas/bearing?lat1=X&lng1=Y&lat2=X&lng2=Y');
     console.log('  POST /api/v1/users/:id/device-token');
     console.log('  DELETE /api/v1/users/:id/device-token');
-    console.log('  --- Wallet / Coins ---');
+    console.log('  --- Rider Wallet (Coins + Cash) ---');
     console.log('  GET  /api/v1/wallet/:userId/balance');
     console.log('  GET  /api/v1/wallet/:userId/transactions');
+    console.log('  POST /api/v1/wallet/:userId/topup           { amount, method, referenceId? }');
+    console.log('  POST /api/v1/wallet/:userId/pay             { fareInr, rideId }');
+    console.log('  POST /api/v1/wallet/:userId/refund          { amount, rideId, reason? }');
     console.log('  POST /api/v1/wallet/:userId/redeem          { fareInr, coinsToUse? }');
+    console.log('  --- Driver Wallet (min ₹300 gate) ---');
+    console.log('  GET  /api/v1/driver-wallet/:driverId/balance');
+    console.log('  GET  /api/v1/driver-wallet/:driverId/transactions');
+    console.log('  GET  /api/v1/driver-wallet/:driverId/eligibility');
+    console.log('  POST /api/v1/driver-wallet/:driverId/recharge  { amount, method }');
+    console.log('  --- Pool / Demand Aggregation ---');
+    console.log('  POST /api/v1/pool/match                     { riderId, pickupLat, pickupLng, destLat, destLng, fareInr }');
+    console.log('  POST /api/v1/pool                           { riderId, pickupLat, pickupLng, destLat, destLng, fareInr }');
+    console.log('  GET  /api/v1/pool/:poolId');
+    console.log('  POST /api/v1/pool/:poolId/join              { riderId, pickupLat, pickupLng }');
+    console.log('  POST /api/v1/pool/:poolId/leave             { riderId }');
+    console.log('  GET  /api/v1/riders/:riderId/pools');
+    console.log('  --- Driver Incentives ---');
+    console.log('  GET  /api/v1/incentives?activeOnly=true');
+    console.log('  GET  /api/v1/incentives/:taskId');
+    console.log('  POST /api/v1/incentives/:taskId/enrol       { driverId }');
+    console.log('  POST /api/v1/incentives/:taskId/claim       { driverId }');
+    console.log('  GET  /api/v1/incentives/:taskId/leaderboard');
+    console.log('  GET  /api/v1/drivers/:driverId/incentives');
+    console.log('  --- Chat Ticket System ---');
+    console.log('  POST /api/v1/tickets                        { userId, userType, subject, message, category?, rideId?, priority? }');
+    console.log('  GET  /api/v1/tickets/:ticketId');
+    console.log('  POST /api/v1/tickets/:ticketId/messages     { senderId, senderRole, content }');
+    console.log('  PUT  /api/v1/tickets/:ticketId/read         { readBy }');
+    console.log('  GET  /api/v1/users/:userId/tickets');
     console.log('  --- SOS / Safety ---');
     console.log('  POST /api/v1/sos                            { userId, userType, rideId?, lat, lng, sosType? }');
     console.log('  GET  /api/v1/sos/:sosId');
@@ -161,8 +193,27 @@ function startAPIServer(port) {
     console.log('  GET    /api/v1/admin/sos');
     console.log('  PUT    /api/v1/admin/sos/:sosId/status      { status, resolvedBy?, resolutionNote? }');
     console.log('  GET    /api/v1/admin/sos/stats');
-    console.log('  POST   /api/v1/admin/wallet/:userId/adjust  { coins, reason }');
+    console.log('  POST   /api/v1/admin/wallet/:userId/adjust          { coins, reason }');
+    console.log('  POST   /api/v1/admin/wallet/:userId/adjust-cash     { amount, reason }');
     console.log('  GET    /api/v1/admin/wallet/stats');
+    console.log('  POST   /api/v1/admin/driver-wallet/:driverId/adjust { amount, reason }');
+    console.log('  GET    /api/v1/admin/driver-wallet/stats');
+    console.log('  GET    /api/v1/admin/pool?status=OPEN');
+    console.log('  POST   /api/v1/admin/pool/:poolId/dispatch          { driverId }');
+    console.log('  PUT    /api/v1/admin/pool/:poolId/status            { status }');
+    console.log('  GET    /api/v1/admin/pool/stats');
+    console.log('  POST   /api/v1/admin/incentives                     { title, type, targetValue, rewardAmount, startDate, endDate }');
+    console.log('  GET    /api/v1/admin/incentives');
+    console.log('  PUT    /api/v1/admin/incentives/:taskId             { status, rewardAmount, ... }');
+    console.log('  DELETE /api/v1/admin/incentives/:taskId');
+    console.log('  GET    /api/v1/admin/incentives/stats');
+    console.log('  GET    /api/v1/admin/incentives/:taskId/leaderboard');
+    console.log('  GET    /api/v1/admin/tickets?status=OPEN');
+    console.log('  PUT    /api/v1/admin/tickets/:ticketId/status       { status, resolution? }');
+    console.log('  PUT    /api/v1/admin/tickets/:ticketId/assign       { agentId }');
+    console.log('  GET    /api/v1/admin/tickets/stats');
+    console.log('  GET    /api/v1/admin/tickets/agents');
+    console.log('  POST   /api/v1/admin/tickets/agents                 { agentId, name, email }');
     console.log('  GET    /api/v1/admin/sms/stats');
     console.log('');
   });
@@ -187,6 +238,10 @@ async function handleRoute(method, path, body, params, headers = {}) {
         mockDb: mockDb.getStats(),
         notifications: notificationService.getStats(),
         wallet: walletService.getStats(),
+        driverWallet: driverWalletService.getStats(),
+        demandAggregation: demandAggregationService.getStats(),
+        incentives: incentiveService.getStats(),
+        tickets: ticketService.getStats(),
         sos: sosService.getStats(),
         sms: smsService.getStats(),
       },
@@ -335,6 +390,16 @@ async function handleRoute(method, path, body, params, headers = {}) {
       const earnFare = result.fare?.finalFare;
       const earnResult = walletService.earnCoins(ride.riderId, earnFare, rideId);
       if (earnResult) result.coinsEarned = earnResult.coins;
+    }
+
+    // Update driver incentive progress on ride completion
+    if (ride && ride.driverId) {
+      const fareInr = result.fare?.finalFare || 0;
+      const now = new Date();
+      const hour = now.getHours();
+      const isPeakHour = (hour >= 7 && hour <= 10) || (hour >= 17 && hour <= 21);
+      const incentiveUpdates = incentiveService.onRideCompleted(ride.driverId, { fareInr, isPeakHour });
+      if (incentiveUpdates.length > 0) result.incentiveProgress = incentiveUpdates;
     }
 
     if (coinRedemption) result.coinRedemption = coinRedemption;
@@ -596,6 +661,374 @@ async function handleRoute(method, path, body, params, headers = {}) {
     const authErr = requireAdmin(headers);
     if (authErr) return authErr;
     return { data: smsService.getStats() };
+  }
+
+  // ═══════════════════════════════════════════
+  // RIDER WALLET — Cash topup + Pay with wallet
+  // ═══════════════════════════════════════════
+
+  // POST /api/v1/wallet/:userId/topup  { amount, method, referenceId? }
+  const walletTopupMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/topup$/);
+  if (walletTopupMatch && method === 'POST') {
+    const userId = walletTopupMatch[1];
+    const { amount, method: payMethod = 'upi', referenceId } = body;
+    if (!amount || amount <= 0) return { status: 400, data: { error: 'amount required and must be > 0' } };
+    const result = walletService.topupWallet(userId, parseFloat(amount), payMethod, referenceId);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // POST /api/v1/wallet/:userId/pay  { fareInr, rideId }
+  const walletPayMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/pay$/);
+  if (walletPayMatch && method === 'POST') {
+    const userId = walletPayMatch[1];
+    const { fareInr, rideId } = body;
+    if (!fareInr || fareInr <= 0) return { status: 400, data: { error: 'fareInr required' } };
+    const result = walletService.payWithWallet(userId, parseFloat(fareInr), rideId);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // POST /api/v1/wallet/:userId/refund  { amount, rideId, reason? }
+  const walletRefundMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/refund$/);
+  if (walletRefundMatch && method === 'POST') {
+    const userId = walletRefundMatch[1];
+    const { amount, rideId, reason } = body;
+    if (!amount || amount <= 0) return { status: 400, data: { error: 'amount required' } };
+    const result = walletService.refundToWallet(userId, parseFloat(amount), rideId, reason);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // POST /api/v1/admin/wallet/:userId/adjust-cash  { amount, reason }
+  if (path.match(/^\/api\/v1\/admin\/wallet\/(.+)\/adjust-cash$/) && method === 'POST') {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+    const userId = path.split('/')[5];
+    const { amount, reason } = body;
+    if (typeof amount !== 'number') return { status: 400, data: { error: 'amount (number) required' } };
+    return { data: walletService.adjustCash(userId, amount, reason || 'admin adjustment') };
+  }
+
+  // ═══════════════════════════════════════════
+  // DRIVER WALLET — Balance gate ≥ ₹300
+  // ═══════════════════════════════════════════
+
+  // GET /api/v1/driver-wallet/:driverId/balance
+  const drvWalletBalMatch = path.match(/^\/api\/v1\/driver-wallet\/(.+)\/balance$/);
+  if (drvWalletBalMatch && method === 'GET') {
+    return { data: driverWalletService.getBalance(drvWalletBalMatch[1]) };
+  }
+
+  // GET /api/v1/driver-wallet/:driverId/transactions?limit=20
+  const drvWalletTxnMatch = path.match(/^\/api\/v1\/driver-wallet\/(.+)\/transactions$/);
+  if (drvWalletTxnMatch && method === 'GET') {
+    const limit = parseInt(params.get('limit') || '20', 10);
+    return { data: driverWalletService.getTransactions(drvWalletTxnMatch[1], Math.min(limit, 100)) };
+  }
+
+  // POST /api/v1/driver-wallet/:driverId/recharge  { amount, method, referenceId? }
+  const drvRechargeMatch = path.match(/^\/api\/v1\/driver-wallet\/(.+)\/recharge$/);
+  if (drvRechargeMatch && method === 'POST') {
+    const driverId = drvRechargeMatch[1];
+    const { amount, method: payMethod = 'upi', referenceId } = body;
+    if (!amount || amount <= 0) return { status: 400, data: { error: 'amount required and must be > 0' } };
+    const result = driverWalletService.rechargeWallet(driverId, parseFloat(amount), payMethod, referenceId);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // GET /api/v1/driver-wallet/:driverId/eligibility — can driver receive rides?
+  const drvEligibleMatch = path.match(/^\/api\/v1\/driver-wallet\/(.+)\/eligibility$/);
+  if (drvEligibleMatch && method === 'GET') {
+    return { data: driverWalletService.canReceiveRide(drvEligibleMatch[1]) };
+  }
+
+  // POST /api/v1/admin/driver-wallet/:driverId/adjust  { amount, reason }
+  if (path.match(/^\/api\/v1\/admin\/driver-wallet\/(.+)\/adjust$/) && method === 'POST') {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+    const driverId = path.split('/')[5];
+    const { amount, reason } = body;
+    if (typeof amount !== 'number') return { status: 400, data: { error: 'amount (number) required' } };
+    return { data: driverWalletService.adminAdjust(driverId, amount, reason || 'admin adjustment') };
+  }
+
+  // GET /api/v1/admin/driver-wallet/stats
+  if (path === '/api/v1/admin/driver-wallet/stats' && method === 'GET') {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+    return { data: driverWalletService.getStats() };
+  }
+
+  // ═══════════════════════════════════════════
+  // DEMAND AGGREGATION — Pool Rides
+  // ═══════════════════════════════════════════
+
+  // POST /api/v1/pool/match  { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType? }
+  if (path === '/api/v1/pool/match' && method === 'POST') {
+    const { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType } = body;
+    if (!riderId || !pickupLat || !pickupLng || !destLat || !destLng || !fareInr) {
+      return { status: 400, data: { error: 'riderId, pickupLat, pickupLng, destLat, destLng, fareInr required' } };
+    }
+    const result = demandAggregationService.smartMatch({
+      riderId,
+      pickupLat: parseFloat(pickupLat),
+      pickupLng: parseFloat(pickupLng),
+      destLat: parseFloat(destLat),
+      destLng: parseFloat(destLng),
+      fareInr: parseFloat(fareInr),
+      rideType,
+    });
+    return { data: result };
+  }
+
+  // POST /api/v1/pool  { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType? }
+  if (path === '/api/v1/pool' && method === 'POST') {
+    const result = demandAggregationService.createPool(body);
+    return { status: result.success ? 201 : 400, data: result };
+  }
+
+  // GET /api/v1/pool/:poolId
+  const poolGetMatch = path.match(/^\/api\/v1\/pool\/([^/]+)$/);
+  if (poolGetMatch && method === 'GET') {
+    const pool = demandAggregationService.getPool(poolGetMatch[1]);
+    return { data: pool || { error: 'Pool not found' } };
+  }
+
+  // POST /api/v1/pool/:poolId/join  { riderId, pickupLat, pickupLng }
+  const poolJoinMatch = path.match(/^\/api\/v1\/pool\/(.+)\/join$/);
+  if (poolJoinMatch && method === 'POST') {
+    const result = demandAggregationService.joinPool(poolJoinMatch[1], body);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // POST /api/v1/pool/:poolId/leave  { riderId }
+  const poolLeaveMatch = path.match(/^\/api\/v1\/pool\/(.+)\/leave$/);
+  if (poolLeaveMatch && method === 'POST') {
+    const result = demandAggregationService.leavePool(poolLeaveMatch[1], body.riderId);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // GET /api/v1/riders/:riderId/pools
+  const riderPoolsMatch = path.match(/^\/api\/v1\/riders\/(.+)\/pools$/);
+  if (riderPoolsMatch && method === 'GET') {
+    return { data: { pools: demandAggregationService.getRiderPools(riderPoolsMatch[1]) } };
+  }
+
+  // Admin pool routes
+  if (path.startsWith('/api/v1/admin/pool')) {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+
+    // GET /api/v1/admin/pool?status=OPEN&limit=50
+    if (path === '/api/v1/admin/pool' && method === 'GET') {
+      const status = params.get('status') || undefined;
+      const limit = parseInt(params.get('limit') || '50', 10);
+      return { data: { pools: demandAggregationService.listPools({ status, limit: Math.min(limit, 200) }) } };
+    }
+
+    // POST /api/v1/admin/pool/:poolId/dispatch  { driverId, rideId? }
+    const poolDispatchMatch = path.match(/^\/api\/v1\/admin\/pool\/(.+)\/dispatch$/);
+    if (poolDispatchMatch && method === 'POST') {
+      const result = demandAggregationService.dispatchDriver(poolDispatchMatch[1], body.driverId, body.rideId);
+      return { status: result.success ? 200 : 400, data: result };
+    }
+
+    // PUT /api/v1/admin/pool/:poolId/status  { status }
+    const poolStatusMatch = path.match(/^\/api\/v1\/admin\/pool\/(.+)\/status$/);
+    if (poolStatusMatch && method === 'PUT') {
+      const result = demandAggregationService.updateStatus(poolStatusMatch[1], body.status);
+      return { status: result.success ? 200 : 400, data: result };
+    }
+
+    // GET /api/v1/admin/pool/stats
+    if (path === '/api/v1/admin/pool/stats' && method === 'GET') {
+      return { data: demandAggregationService.getStats() };
+    }
+  }
+
+  // ═══════════════════════════════════════════
+  // DRIVER INCENTIVES — Tasks & Progress
+  // ═══════════════════════════════════════════
+
+  // GET /api/v1/incentives?activeOnly=true&type=trip_count
+  if (path === '/api/v1/incentives' && method === 'GET') {
+    const activeOnly = params.get('activeOnly') === 'true';
+    const type = params.get('type') || null;
+    const limit = parseInt(params.get('limit') || '50', 10);
+    return { data: { tasks: incentiveService.listTasks({ activeOnly, type, limit: Math.min(limit, 200) }) } };
+  }
+
+  // GET /api/v1/incentives/:taskId
+  const incentiveGetMatch = path.match(/^\/api\/v1\/incentives\/([^/]+)$/);
+  if (incentiveGetMatch && method === 'GET') {
+    const task = incentiveService.getTask(incentiveGetMatch[1]);
+    return { data: task || { error: 'Task not found' } };
+  }
+
+  // POST /api/v1/incentives/:taskId/enrol  { driverId }
+  const incentiveEnrolMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/enrol$/);
+  if (incentiveEnrolMatch && method === 'POST') {
+    const result = incentiveService.enrolDriver(body.driverId, incentiveEnrolMatch[1]);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // POST /api/v1/incentives/:taskId/claim  { driverId }
+  const incentiveClaimMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/claim$/);
+  if (incentiveClaimMatch && method === 'POST') {
+    const { driverId } = body;
+    if (!driverId) return { status: 400, data: { error: 'driverId required' } };
+    const result = incentiveService.claimReward(driverId, incentiveClaimMatch[1]);
+    if (!result.success) return { status: 400, data: result };
+
+    // Credit reward to driver wallet
+    let walletResult = null;
+    if (result.rewardType === 'cash' && result.rewardAmount > 0) {
+      walletResult = driverWalletService.creditIncentive(driverId, result.rewardAmount, incentiveClaimMatch[1], result.task.title);
+    } else if (result.rewardType === 'coins' && result.rewardCoins > 0) {
+      walletResult = walletService.adjustCoins(driverId, result.rewardCoins, `Incentive: ${result.task.title}`);
+    }
+
+    return { data: { ...result, walletCredit: walletResult } };
+  }
+
+  // GET /api/v1/drivers/:driverId/incentives — driver's progress on enrolled tasks
+  const driverIncentivesMatch = path.match(/^\/api\/v1\/drivers\/(.+)\/incentives$/);
+  if (driverIncentivesMatch && method === 'GET') {
+    return { data: { progress: incentiveService.getDriverProgress(driverIncentivesMatch[1]) } };
+  }
+
+  // GET /api/v1/incentives/:taskId/leaderboard?limit=20
+  const incentiveLeaderboardMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/leaderboard$/);
+  if (incentiveLeaderboardMatch && method === 'GET') {
+    const limit = parseInt(params.get('limit') || '20', 10);
+    return { data: { leaderboard: incentiveService.getTaskLeaderboard(incentiveLeaderboardMatch[1], Math.min(limit, 100)) } };
+  }
+
+  // Admin incentive routes
+  if (path.startsWith('/api/v1/admin/incentives')) {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+
+    // POST /api/v1/admin/incentives  — create task
+    if (path === '/api/v1/admin/incentives' && method === 'POST') {
+      const result = incentiveService.createTask({ ...body, createdBy: 'admin' });
+      return { status: result.success ? 201 : 400, data: result };
+    }
+
+    // GET /api/v1/admin/incentives  — list all tasks
+    if (path === '/api/v1/admin/incentives' && method === 'GET') {
+      const limit = parseInt(params.get('limit') || '50', 10);
+      return { data: { tasks: incentiveService.listTasks({ limit: Math.min(limit, 500) }) } };
+    }
+
+    // PUT /api/v1/admin/incentives/:taskId  — update task
+    const adminIncentiveUpdateMatch = path.match(/^\/api\/v1\/admin\/incentives\/([^/]+)$/);
+    if (adminIncentiveUpdateMatch && method === 'PUT') {
+      const result = incentiveService.updateTask(adminIncentiveUpdateMatch[1], body);
+      return { status: result.success ? 200 : 400, data: result };
+    }
+
+    // DELETE /api/v1/admin/incentives/:taskId
+    const adminIncentiveDeleteMatch = path.match(/^\/api\/v1\/admin\/incentives\/([^/]+)$/);
+    if (adminIncentiveDeleteMatch && method === 'DELETE') {
+      const result = incentiveService.deleteTask(adminIncentiveDeleteMatch[1]);
+      return { status: result.success ? 200 : 404, data: result };
+    }
+
+    // GET /api/v1/admin/incentives/stats
+    if (path === '/api/v1/admin/incentives/stats' && method === 'GET') {
+      return { data: incentiveService.getStats() };
+    }
+
+    // GET /api/v1/admin/incentives/:taskId/leaderboard
+    const adminLeaderboardMatch = path.match(/^\/api\/v1\/admin\/incentives\/(.+)\/leaderboard$/);
+    if (adminLeaderboardMatch && method === 'GET') {
+      const limit = parseInt(params.get('limit') || '20', 10);
+      return { data: { leaderboard: incentiveService.getTaskLeaderboard(adminLeaderboardMatch[1], Math.min(limit, 500)) } };
+    }
+  }
+
+  // ═══════════════════════════════════════════
+  // CHAT TICKET SYSTEM — Support
+  // ═══════════════════════════════════════════
+
+  // POST /api/v1/tickets  { userId, userType, subject, message, category?, rideId?, priority? }
+  if (path === '/api/v1/tickets' && method === 'POST') {
+    const result = ticketService.createTicket(body);
+    return { status: result.success ? 201 : 400, data: result };
+  }
+
+  // GET /api/v1/tickets/:ticketId
+  const ticketGetMatch = path.match(/^\/api\/v1\/tickets\/([^/]+)$/);
+  if (ticketGetMatch && method === 'GET') {
+    const ticket = ticketService.getTicket(ticketGetMatch[1]);
+    return { data: ticket || { error: 'Ticket not found' } };
+  }
+
+  // POST /api/v1/tickets/:ticketId/messages  { senderId, senderRole, content, attachments? }
+  const ticketMsgMatch = path.match(/^\/api\/v1\/tickets\/(.+)\/messages$/);
+  if (ticketMsgMatch && method === 'POST') {
+    const result = ticketService.addMessage(ticketMsgMatch[1], body);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // PUT /api/v1/tickets/:ticketId/read  { readBy }
+  const ticketReadMatch = path.match(/^\/api\/v1\/tickets\/(.+)\/read$/);
+  if (ticketReadMatch && method === 'PUT') {
+    const result = ticketService.markMessagesRead(ticketReadMatch[1], body.readBy);
+    return { status: result.success ? 200 : 404, data: result };
+  }
+
+  // GET /api/v1/users/:userId/tickets?limit=20&status=OPEN
+  const userTicketsMatch = path.match(/^\/api\/v1\/users\/(.+)\/tickets$/);
+  if (userTicketsMatch && method === 'GET') {
+    const limit = parseInt(params.get('limit') || '20', 10);
+    const status = params.get('status') || null;
+    return { data: { tickets: ticketService.getUserTickets(userTicketsMatch[1], { limit: Math.min(limit, 100), status }) } };
+  }
+
+  // Admin ticket routes
+  if (path.startsWith('/api/v1/admin/tickets')) {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+
+    // GET /api/v1/admin/tickets?status=OPEN&category=payment_issue&priority=urgent
+    if (path === '/api/v1/admin/tickets' && method === 'GET') {
+      const status   = params.get('status')   || null;
+      const category = params.get('category') || null;
+      const priority = params.get('priority') || null;
+      const agentId  = params.get('agentId')  || null;
+      const limit    = parseInt(params.get('limit') || '50', 10);
+      return { data: { tickets: ticketService.listTickets({ status, category, priority, agentId, limit: Math.min(limit, 500) }) } };
+    }
+
+    // PUT /api/v1/admin/tickets/:ticketId/status  { status, resolvedBy?, resolution?, agentId? }
+    const ticketStatusMatch = path.match(/^\/api\/v1\/admin\/tickets\/(.+)\/status$/);
+    if (ticketStatusMatch && method === 'PUT') {
+      const result = ticketService.updateStatus(ticketStatusMatch[1], body);
+      return { status: result.success ? 200 : 400, data: result };
+    }
+
+    // PUT /api/v1/admin/tickets/:ticketId/assign  { agentId }
+    const ticketAssignMatch = path.match(/^\/api\/v1\/admin\/tickets\/(.+)\/assign$/);
+    if (ticketAssignMatch && method === 'PUT') {
+      const result = ticketService.assignAgent(ticketAssignMatch[1], body.agentId);
+      return { status: result.success ? 200 : 400, data: result };
+    }
+
+    // GET /api/v1/admin/tickets/stats
+    if (path === '/api/v1/admin/tickets/stats' && method === 'GET') {
+      return { data: ticketService.getStats() };
+    }
+
+    // GET /api/v1/admin/tickets/agents
+    if (path === '/api/v1/admin/tickets/agents' && method === 'GET') {
+      return { data: { agents: ticketService.listAgents() } };
+    }
+
+    // POST /api/v1/admin/tickets/agents  { agentId, name, email }
+    if (path === '/api/v1/admin/tickets/agents' && method === 'POST') {
+      const result = ticketService.addAgent(body);
+      return { status: result.success ? 201 : 400, data: result };
+    }
   }
 
   return { status: 404, data: { error: 'Not found', path, method } };
