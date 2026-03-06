@@ -2,8 +2,8 @@
 
 module.exports = {
   server: {
-    port: 3000,
-    wsPort: 3001,
+    port:   parseInt(process.env.PORT    || '3000', 10),
+    wsPort: parseInt(process.env.WS_PORT || '3001', 10),
   },
 
   matching: {
@@ -161,5 +161,31 @@ module.exports = {
     CANCELLED_BY_RIDER: 'CANCELLED_BY_RIDER',
     CANCELLED_BY_DRIVER: 'CANCELLED_BY_DRIVER',
     NO_DRIVERS: 'NO_DRIVERS',
+  },
+
+  // ─── Database ──────────────────────────────────────────────────────────────
+  // DB_BACKEND=mock  → in-memory MockDb (default — zero setup for development)
+  // DB_BACKEND=pg    → real PostgreSQL via pg.Pool (required for test/production)
+  db: {
+    backend:  process.env.DB_BACKEND        || 'mock',
+    host:     process.env.POSTGRES_HOST     || 'localhost',
+    port:     parseInt(process.env.POSTGRES_PORT || '5432', 10),
+    user:     process.env.POSTGRES_USER     || 'goapp',
+    password: process.env.POSTGRES_PASSWORD || 'goapp',
+    database: process.env.POSTGRES_DB       || 'goapp_dev',
+    pool: {
+      min: parseInt(process.env.POSTGRES_POOL_MIN || '2',  10),
+      max: parseInt(process.env.POSTGRES_POOL_MAX || '10', 10),
+    },
+    ssl: process.env.POSTGRES_SSL === 'true',
+  },
+
+  // ─── Redis ─────────────────────────────────────────────────────────────────
+  // REDIS_BACKEND=mock  → in-memory RedisMock (default — zero setup for development)
+  // REDIS_BACKEND=real  → real Redis client (required for test/production)
+  redis: {
+    backend: process.env.REDIS_BACKEND || 'mock',
+    host:    process.env.REDIS_HOST    || 'localhost',
+    port:    parseInt(process.env.REDIS_PORT || '6379', 10),
   },
 };

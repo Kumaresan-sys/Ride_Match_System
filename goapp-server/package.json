@@ -4,13 +4,21 @@
   "description": "GoApp Ride Matching Platform",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "api": "node server.js --api-only",
-    "sim": "node server.js --sim-only",
-    "test": "node --test --test-force-exit tests/*.test.js"
+    "start":            "node server.js",
+    "start:dev":        "NODE_ENV=development node server.js",
+    "start:test":       "NODE_ENV=test node server.js",
+    "start:prod":       "NODE_ENV=production node server.js",
+    "api":              "node server.js --api-only",
+    "sim":              "node server.js --sim-only",
+    "test":             "node --test --test-force-exit tests/*.test.js",
+    "test:unit":        "NODE_ENV=development node --test --test-force-exit tests/*.test.js",
+    "test:integration": "NODE_ENV=test node --test --test-force-exit tests/integration/*.test.js"
   },
   "dependencies": {
+    "@googlemaps/google-maps-services-js": "^3.4.0",
+    "dotenv": "^17.3.1",
     "firebase-admin": "^12.1.0",
-    "@googlemaps/google-maps-services-js": "^3.4.0"
+    "pg": "^8.20.0",
+    "redis": "^5.11.0"
   }
 }

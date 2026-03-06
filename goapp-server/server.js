@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// MUST be the first require() — loads .env.<NODE_ENV> before any module reads process.env
+require('./config/env-loader');
+
 const http = require('http');
 const crypto = require('crypto');
 const config = require('./config');
@@ -23,7 +26,7 @@ const ticketService = require('./services/ticket-service');
 const rideSessionService = require('./services/ride-session-service');
 const sosService = require('./services/sos-service');
 const smsService = require('./services/sms-service');
-const redis = require('./services/redis-mock');
+const redis = require('./services/redis-client');
 const mockDb = require('./services/mock-db');
 const zoneService = require('./services/zone-service');
 const notificationService = require('./services/notification-service');

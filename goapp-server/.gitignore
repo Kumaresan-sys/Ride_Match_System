@@ -1,2 +1,9 @@
 node_modules/
+
+# Real env files — never commit secrets.
+# Only .env.example (the template) is committed.
 .env
+.env.development
+.env.test
+.env.production
+.env.local
