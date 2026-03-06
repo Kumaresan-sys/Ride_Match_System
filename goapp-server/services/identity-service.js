@@ -111,10 +111,15 @@ class IdentityService {
 
     logger.info('IDENTITY', `OTP generated for ${normalizedPhone} (${request.requestId})`);
 
-    // Deliver OTP via SMS (smsService handles real delivery or logs in dev)
+    // Deliver OTP via SMS (smsService handles real delivery or logs in dev).
+    // requestOtp is intentionally synchronous, so handle async failures explicitly
+    // to prevent unhandled promise rejections when provider calls fail.
     try {
       const smsService = require('./sms-service');
-      smsService.sendOtp(normalizedPhone, otpCode, request.requestId);
+      Promise.resolve(smsService.sendOtp(normalizedPhone, otpCode, request.requestId))
+        .catch((error) => {
+          logger.warn('IDENTITY', `SMS delivery failed asynchronously: ${error.message}`);
+        });
     } catch (e) {
       logger.warn('IDENTITY', `SMS delivery skipped: ${e.message}`);
     }
