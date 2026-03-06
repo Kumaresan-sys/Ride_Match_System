@@ -28,6 +28,11 @@ class MatchingEngine {
     if (driver) driver.status = status;
   }
 
+  updateDriverRating(driverId, newRating) {
+    const driver = this.driverPool.get(driverId);
+    if (driver) driver.rating = newRating;
+  }
+
   // ═══════════════════════════════════════════
   // MAIN MATCHING FLOW
   // ═══════════════════════════════════════════

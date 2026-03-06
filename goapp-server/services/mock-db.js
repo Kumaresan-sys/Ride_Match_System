@@ -43,6 +43,15 @@ class MockDb {
     return [...this.riders.values()];
   }
 
+  getRider(riderId) {
+    return this.riders.get(riderId) || null;
+  }
+
+  updateRiderRating(riderId, newRating) {
+    const rider = this.riders.get(riderId);
+    if (rider) rider.rating = newRating;
+  }
+
   getStats() {
     return {
       driverRecords: this.drivers.size,

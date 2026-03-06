@@ -14,6 +14,7 @@ const rideService = require('./services/ride-service');
 const identityService = require('./services/identity-service');
 const walletService = require('./services/wallet-service');
 const driverWalletService = require('./services/driver-wallet-service');
+const feedbackService = require('./services/feedback-service');
 const demandAggregationService = require('./services/demand-aggregation-service');
 const demandLogService = require('./services/demand-log-service');
 const incentiveService = require('./services/incentive-service');
@@ -89,6 +90,7 @@ function startAPIServer(port) {
       zoneService,
       demandLogService,
       walletService,
+      feedbackService,
     },
   }, handleLegacyRoute);
 
