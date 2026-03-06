@@ -12,12 +12,18 @@ const matchingEngine = require('./services/matching-engine');
 const pricingService = require('./services/pricing-service');
 const rideService = require('./services/ride-service');
 const identityService = require('./services/identity-service');
+const walletService = require('./services/wallet-service');
+const sosService = require('./services/sos-service');
+const smsService = require('./services/sms-service');
 const redis = require('./services/redis-mock');
 const mockDb = require('./services/mock-db');
 const zoneService = require('./services/zone-service');
 const notificationService = require('./services/notification-service');
 const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
+
+// Max request body size: 256 KB (prevents memory exhaustion)
+const MAX_BODY_BYTES = 256 * 1024;
 
 // Test Data
 const { generateIdentityUsers } = require('./data/test-data');
@@ -28,7 +34,22 @@ function requireAdmin(headers) {
   if (!token || token !== config.admin.token) {
     return { status: 401, data: { error: 'Admin authentication required. Provide X-Admin-Token header.' } };
   }
-  return null; // no error
+  return null;
+}
+
+// ─── Session auth helper ──────────────────────────────────────────────────
+// Returns session object or an error response to return immediately
+function requireAuth(headers) {
+  const authHeader = headers['authorization'] || '';
+  const sessionToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : headers['x-session-token'];
+  if (!sessionToken) {
+    return { error: { status: 401, data: { error: 'Authentication required. Provide Authorization: Bearer <token> header.' } } };
+  }
+  const session = identityService.validateSession(sessionToken);
+  if (!session) {
+    return { error: { status: 401, data: { error: 'Invalid or expired session token.' } } };
+  }
+  return { session };
 }
 
 function startAPIServer(port) {
@@ -38,9 +59,11 @@ function startAPIServer(port) {
     const method = req.method;
     const headers = req.headers;
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    const allowedOrigin = process.env.CORS_ORIGIN || '*';
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Session-Token, X-Admin-Token');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Content-Type', 'application/json');
 
     if (method === 'OPTIONS') {
@@ -51,11 +74,21 @@ function startAPIServer(port) {
 
     try {
       let body = '';
-      if (method === 'POST' || method === 'PUT') {
-        body = await new Promise((resolve) => {
+      if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+        body = await new Promise((resolve, reject) => {
           let data = '';
-          req.on('data', chunk => { data += chunk; });
+          let size = 0;
+          req.on('data', chunk => {
+            size += chunk.length;
+            if (size > MAX_BODY_BYTES) {
+              req.destroy();
+              reject(Object.assign(new Error('Request body too large'), { statusCode: 413 }));
+              return;
+            }
+            data += chunk;
+          });
           req.on('end', () => resolve(data));
+          req.on('error', reject);
         });
       }
 
@@ -71,7 +104,8 @@ function startAPIServer(port) {
       res.writeHead(response.status || 200);
       res.end(JSON.stringify(response.data, null, 2));
     } catch (err) {
-      res.writeHead(500);
+      const status = err.statusCode || 500;
+      res.writeHead(status);
       res.end(JSON.stringify({ error: err.message }));
     }
   });
@@ -108,6 +142,15 @@ function startAPIServer(port) {
     console.log('  GET  /api/v1/formulas/bearing?lat1=X&lng1=Y&lat2=X&lng2=Y');
     console.log('  POST /api/v1/users/:id/device-token');
     console.log('  DELETE /api/v1/users/:id/device-token');
+    console.log('  --- Wallet / Coins ---');
+    console.log('  GET  /api/v1/wallet/:userId/balance');
+    console.log('  GET  /api/v1/wallet/:userId/transactions');
+    console.log('  POST /api/v1/wallet/:userId/redeem          { fareInr, coinsToUse? }');
+    console.log('  --- SOS / Safety ---');
+    console.log('  POST /api/v1/sos                            { userId, userType, rideId?, lat, lng, sosType? }');
+    console.log('  GET  /api/v1/sos/:sosId');
+    console.log('  POST /api/v1/sos/:sosId/location            { lat, lng }');
+    console.log('  GET  /api/v1/users/:userId/sos/active');
     console.log('  --- Admin (requires X-Admin-Token header) ---');
     console.log('  GET    /api/v1/admin/zones');
     console.log('  POST   /api/v1/admin/zones');
@@ -115,6 +158,12 @@ function startAPIServer(port) {
     console.log('  PUT    /api/v1/admin/zones/:id/disable');
     console.log('  DELETE /api/v1/admin/zones/:id');
     console.log('  GET    /api/v1/admin/notifications/stats');
+    console.log('  GET    /api/v1/admin/sos');
+    console.log('  PUT    /api/v1/admin/sos/:sosId/status      { status, resolvedBy?, resolutionNote? }');
+    console.log('  GET    /api/v1/admin/sos/stats');
+    console.log('  POST   /api/v1/admin/wallet/:userId/adjust  { coins, reason }');
+    console.log('  GET    /api/v1/admin/wallet/stats');
+    console.log('  GET    /api/v1/admin/sms/stats');
     console.log('');
   });
 
@@ -127,7 +176,7 @@ async function handleRoute(method, path, body, params, headers = {}) {
       data: {
         status: 'ok',
         service: 'GoApp Ride Matching Platform',
-        version: '2.1',
+        version: '2.2',
         uptime: process.uptime(),
         runtime: enterpriseConfig.runtime,
         redis: redis.getStats(),
@@ -137,6 +186,9 @@ async function handleRoute(method, path, body, params, headers = {}) {
         rides: rideService.getStats(),
         mockDb: mockDb.getStats(),
         notifications: notificationService.getStats(),
+        wallet: walletService.getStats(),
+        sos: sosService.getStats(),
+        sms: smsService.getStats(),
       },
     };
   }
@@ -212,10 +264,27 @@ async function handleRoute(method, path, body, params, headers = {}) {
       }
     }
 
+    // Optional: preview coin redemption discount before creating ride
+    let coinRedemptionPreview = null;
+    if (body.useCoins && body.riderId) {
+      const estimates = pricingService.getEstimates(pickupLat, pickupLng, parseFloat(body.destLat), parseFloat(body.destLng));
+      const rideType = body.rideType || 'sedan';
+      const estimatedFare = estimates.estimates[rideType]?.finalFare;
+      if (estimatedFare) {
+        const balance = walletService.getBalance(body.riderId);
+        coinRedemptionPreview = {
+          coinsAvailable: balance.balance,
+          maxDiscountInr: Math.round(Math.min(balance.balance, Math.floor(estimatedFare * 0.20 / 0.10)) * 0.10 * 100) / 100,
+        };
+      }
+    }
+
     const result = await rideService.createRide({
       ...body,
       idempotencyKey: body.idempotencyKey || crypto.randomUUID(),
     });
+
+    if (coinRedemptionPreview) result.coinRedemptionPreview = coinRedemptionPreview;
     return { data: result };
   }
 
@@ -244,7 +313,32 @@ async function handleRoute(method, path, body, params, headers = {}) {
   if (path.match(/^\/api\/v1\/rides\/(.+)\/complete$/) && method === 'POST') {
     const rideId = path.split('/')[4];
     const result = rideService.completeTrip(rideId, body.distanceKm, body.durationMin);
-    return { data: result || { error: 'Invalid state' } };
+    if (!result) return { data: { error: 'Invalid state' } };
+
+    // Optional coin redemption (deduct coins from rider's balance for discount)
+    let coinRedemption = null;
+    const ride = rideService.getRide(rideId);
+    if (ride && body.useCoins && ride.riderId) {
+      const fareInr = result.fare?.finalFare;
+      if (fareInr) {
+        const redemption = walletService.redeemCoins(ride.riderId, fareInr, body.coinsToUse);
+        if (redemption.success) {
+          result.fare.finalFareAfterCoins = redemption.finalFare;
+          result.fare.coinDiscount = redemption.discountInr;
+          coinRedemption = redemption;
+        }
+      }
+    }
+
+    // Earn coins for this ride (always — on the original fare)
+    if (ride && ride.riderId) {
+      const earnFare = result.fare?.finalFare;
+      const earnResult = walletService.earnCoins(ride.riderId, earnFare, rideId);
+      if (earnResult) result.coinsEarned = earnResult.coins;
+    }
+
+    if (coinRedemption) result.coinRedemption = coinRedemption;
+    return { data: result };
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)$/) && method === 'GET') {
@@ -391,6 +485,117 @@ async function handleRoute(method, path, body, params, headers = {}) {
     if (path === '/api/v1/admin/notifications/stats' && method === 'GET') {
       return { data: notificationService.getStats() };
     }
+  }
+
+  // ═══════════════════════════════════════════
+  // WALLET / COINS
+  // ═══════════════════════════════════════════
+
+  // GET /api/v1/wallet/:userId — get coin balance
+  const walletBalanceMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/balance$/);
+  if (walletBalanceMatch && method === 'GET') {
+    const userId = walletBalanceMatch[1];
+    return { data: walletService.getBalance(userId) };
+  }
+
+  // GET /api/v1/wallet/:userId/transactions — transaction history
+  const walletTxnMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/transactions$/);
+  if (walletTxnMatch && method === 'GET') {
+    const userId = walletTxnMatch[1];
+    const limit = parseInt(params.get('limit') || '20', 10);
+    return { data: walletService.getTransactions(userId, Math.min(limit, 100)) };
+  }
+
+  // POST /api/v1/wallet/:userId/redeem — redeem coins for discount
+  const walletRedeemMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/redeem$/);
+  if (walletRedeemMatch && method === 'POST') {
+    const userId = walletRedeemMatch[1];
+    const { fareInr, coinsToUse } = body;
+    if (!fareInr || fareInr <= 0) return { status: 400, data: { error: 'fareInr required' } };
+    const result = walletService.redeemCoins(userId, fareInr, coinsToUse);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // POST /api/v1/admin/wallet/:userId/adjust — admin coin adjustment
+  if (path.match(/^\/api\/v1\/admin\/wallet\/(.+)\/adjust$/) && method === 'POST') {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+    const userId = path.split('/')[5];
+    const { coins, reason } = body;
+    if (typeof coins !== 'number') return { status: 400, data: { error: 'coins (number) required' } };
+    return { data: walletService.adjustCoins(userId, coins, reason || 'admin adjustment') };
+  }
+
+  // GET /api/v1/admin/wallet/stats
+  if (path === '/api/v1/admin/wallet/stats' && method === 'GET') {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+    return { data: walletService.getStats() };
+  }
+
+  // ═══════════════════════════════════════════
+  // SOS / SAFETY
+  // ═══════════════════════════════════════════
+
+  // POST /api/v1/sos — trigger SOS
+  if (path === '/api/v1/sos' && method === 'POST') {
+    const result = sosService.triggerSos(body);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // GET /api/v1/sos/:sosId — get SOS details
+  const sosGetMatch = path.match(/^\/api\/v1\/sos\/([^/]+)$/);
+  if (sosGetMatch && method === 'GET') {
+    const sos = sosService.getSos(sosGetMatch[1]);
+    return { data: sos || { error: 'SOS not found' } };
+  }
+
+  // POST /api/v1/sos/:sosId/location — update live location during SOS
+  const sosLocationMatch = path.match(/^\/api\/v1\/sos\/(.+)\/location$/);
+  if (sosLocationMatch && method === 'POST') {
+    const result = sosService.updateLocation(sosLocationMatch[1], body);
+    return { status: result.success ? 200 : 400, data: result };
+  }
+
+  // GET /api/v1/users/:userId/sos/active — get active SOS for a user
+  const userActiveSosMatch = path.match(/^\/api\/v1\/users\/(.+)\/sos\/active$/);
+  if (userActiveSosMatch && method === 'GET') {
+    const sos = sosService.getActiveSos(userActiveSosMatch[1]);
+    return { data: sos || { active: false } };
+  }
+
+  // Admin SOS routes
+  if (path.startsWith('/api/v1/admin/sos')) {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+
+    // GET /api/v1/admin/sos — list all SOS logs
+    if (path === '/api/v1/admin/sos' && method === 'GET') {
+      const status = params.get('status') || undefined;
+      const limit = parseInt(params.get('limit') || '50', 10);
+      return { data: { sosList: sosService.getAllSos({ status, limit: Math.min(limit, 200) }) } };
+    }
+
+    // PUT /api/v1/admin/sos/:sosId/status — update SOS status
+    const sosStatusMatch = path.match(/^\/api\/v1\/admin\/sos\/(.+)\/status$/);
+    if (sosStatusMatch && method === 'PUT') {
+      const result = sosService.updateStatus(sosStatusMatch[1], body);
+      return { status: result.success ? 200 : 400, data: result };
+    }
+
+    // GET /api/v1/admin/sos/stats
+    if (path === '/api/v1/admin/sos/stats' && method === 'GET') {
+      return { data: sosService.getStats() };
+    }
+  }
+
+  // ═══════════════════════════════════════════
+  // SMS SERVICE STATS (Admin)
+  // ═══════════════════════════════════════════
+  if (path === '/api/v1/admin/sms/stats' && method === 'GET') {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+    return { data: smsService.getStats() };
   }
 
   return { status: 404, data: { error: 'Not found', path, method } };

@@ -4,6 +4,10 @@
 const crypto = require('crypto');
 const { logger, eventBus } = require('../utils/logger');
 
+// Per-phone OTP rate limiting: max 5 requests per 10 minutes
+const OTP_RATE_WINDOW_MS = 10 * 60 * 1000;
+const OTP_RATE_MAX = 5;
+
 class IdentityService {
   constructor() {
     this.usersByPhone = new Map();
@@ -12,6 +16,8 @@ class IdentityService {
     this.otpIndexByPhone = new Map();
     this.sessions = new Map();
     this.seedMeta = null;
+    // Rate limiting: phone -> { count, windowStart }
+    this.otpRateByPhone = new Map();
   }
 
   seedUsers(users = []) {
@@ -43,26 +49,41 @@ class IdentityService {
 
   requestOtp({ phoneNumber, otpType = 'login', channel = 'sms' }) {
     const normalizedPhone = this._normalizePhone(phoneNumber);
-    if (!normalizedPhone) {
+    if (!normalizedPhone || normalizedPhone.replace(/\D/g, '').length < 7) {
       return { success: false, error: 'valid phoneNumber required' };
+    }
+
+    // ─── Rate Limiting ───
+    const now = Date.now();
+    const rateRecord = this.otpRateByPhone.get(normalizedPhone);
+    if (rateRecord && (now - rateRecord.windowStart) < OTP_RATE_WINDOW_MS) {
+      if (rateRecord.count >= OTP_RATE_MAX) {
+        const retryAfterSec = Math.ceil((rateRecord.windowStart + OTP_RATE_WINDOW_MS - now) / 1000);
+        logger.warn('IDENTITY', `OTP rate limit hit for ${normalizedPhone}`);
+        return { success: false, error: 'Too many OTP requests. Try again later.', retryAfterSec };
+      }
+      rateRecord.count += 1;
+    } else {
+      this.otpRateByPhone.set(normalizedPhone, { count: 1, windowStart: now });
     }
 
     const existingRequestId = this.otpIndexByPhone.get(normalizedPhone);
     if (existingRequestId) {
       const existing = this.otpByRequestId.get(existingRequestId);
-      if (existing && existing.status === 'pending' && existing.expiresAt > Date.now()) {
-        return {
-          success: true,
-          requestId: existing.requestId,
-          expiresAt: existing.expiresAt,
-          resendAfterSec: Math.ceil((existing.resendAt - Date.now()) / 1000),
-          otpCode: existing.otpCode,
-        };
+      if (existing && existing.status === 'pending' && existing.expiresAt > now) {
+        if (existing.resendAt > now) {
+          return {
+            success: true,
+            requestId: existing.requestId,
+            expiresAt: existing.expiresAt,
+            resendAfterSec: Math.ceil((existing.resendAt - now) / 1000),
+            // OTP NOT returned in response — delivered via SMS
+          };
+        }
       }
     }
 
     const otpCode = this._generateOtp();
-    const now = Date.now();
     const request = {
       requestId: `OTP-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
       phoneNumber: normalizedPhone,
@@ -90,11 +111,19 @@ class IdentityService {
 
     logger.info('IDENTITY', `OTP generated for ${normalizedPhone} (${request.requestId})`);
 
+    // Deliver OTP via SMS (smsService handles real delivery or logs in dev)
+    try {
+      const smsService = require('./sms-service');
+      smsService.sendOtp(normalizedPhone, otpCode, request.requestId);
+    } catch (e) {
+      logger.warn('IDENTITY', `SMS delivery skipped: ${e.message}`);
+    }
+
     return {
       success: true,
       requestId: request.requestId,
       expiresAt: request.expiresAt,
-      otpCode,
+      // OTP NOT included in response — delivered only via SMS channel
     };
   }
 
@@ -189,8 +218,21 @@ class IdentityService {
     return String(phoneNumber).replace(/[^\d+]/g, '');
   }
 
+  // Cryptographically secure OTP generation
   _generateOtp() {
-    return String(Math.floor(100000 + Math.random() * 900000));
+    return String(crypto.randomInt(100000, 999999));
+  }
+
+  // Validate session token — returns session or null
+  validateSession(sessionToken) {
+    if (!sessionToken) return null;
+    const session = this.sessions.get(sessionToken);
+    if (!session) return null;
+    if (Date.now() > session.expiresAt) {
+      this.sessions.delete(sessionToken);
+      return null;
+    }
+    return session;
   }
 }
 

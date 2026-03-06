@@ -94,6 +94,40 @@ module.exports = {
     token: process.env.GOAPP_ADMIN_TOKEN || 'goapp-admin-secret',
   },
 
+  // ─── SMS / OTP Delivery ─────────────────────────────────────────────────
+  sms: {
+    // Provider: 'twilio' | 'msg91' | '2factor' | 'console' (dev)
+    provider: process.env.SMS_PROVIDER || 'console',
+    twilio: {
+      accountSid:  process.env.TWILIO_ACCOUNT_SID  || '',
+      authToken:   process.env.TWILIO_AUTH_TOKEN   || '',
+      fromNumber:  process.env.TWILIO_FROM_NUMBER  || '',
+    },
+    msg91: {
+      authKey:    process.env.MSG91_AUTH_KEY    || '',
+      senderId:   process.env.MSG91_SENDER_ID   || 'GOAPP',
+      templateId: process.env.MSG91_TEMPLATE_ID || '',
+    },
+    twofactor: {
+      apiKey: process.env.TWOFACTOR_API_KEY || '',
+    },
+  },
+
+  // ─── Coins / Wallet ──────────────────────────────────────────────────────
+  coins: {
+    coinInrValue:     parseFloat(process.env.COIN_INR_VALUE     || '0.10'),  // ₹ per coin
+    coinsPerInrEarn:  parseFloat(process.env.COINS_PER_INR_EARN || '10'),    // earn 1 coin per ₹10
+    minRedeemCoins:   parseInt(process.env.MIN_REDEEM_COINS     || '10', 10),
+    maxRedeemPct:     parseFloat(process.env.MAX_REDEEM_PCT      || '0.20'), // max 20% of fare
+  },
+
+  // ─── Security ────────────────────────────────────────────────────────────
+  security: {
+    corsOrigin:   process.env.CORS_ORIGIN    || '*',
+    maxBodyBytes: parseInt(process.env.MAX_BODY_BYTES || String(256 * 1024), 10),
+    sessionTtlMs: parseInt(process.env.SESSION_TTL_MS || String(24 * 3600 * 1000), 10),
+  },
+
   firebase: {
     // Firebase service account credentials (required for FCM push notifications).
     // Download from: Firebase Console → Project Settings → Service Accounts → Generate new private key
