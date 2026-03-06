@@ -14,6 +14,7 @@ class RedisMock extends EventEmitter {
 
     // TTL cleanup every second
     this._cleanupInterval = setInterval(() => this._cleanExpired(), 1000);
+    this._cleanupInterval.unref();
   }
 
   // ─── Basic Key-Value ───

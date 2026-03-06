@@ -18,3 +18,8 @@
 - Move identity/ride state from in-memory maps to Aurora PostgreSQL + ElastiCache Redis.
 - Replace local event bus with MSK/Kinesis producers/consumers.
 - Split service processes by `SERVICE_NAME` for ECS/Fargate deployment.
+
+## Extraction Sequencing (Bounded Contexts)
+1. Extract **Identity** bounded context first (OTP/session contracts + repository swap).
+2. Extract **Ride** bounded context second (ride aggregate + lifecycle events).
+3. Extract supporting contexts after Identity/Ride contract stability (Matching, Wallet, Notification, Safety).

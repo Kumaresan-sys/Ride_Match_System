@@ -1,0 +1,9 @@
+class IdentityRepository {
+  requestOtp() { throw new Error('Not implemented'); }
+  verifyOtp() { throw new Error('Not implemented'); }
+  validateSession() { throw new Error('Not implemented'); }
+  getUsers() { throw new Error('Not implemented'); }
+  getStats() { throw new Error('Not implemented'); }
+}
+
+module.exports = IdentityRepository;

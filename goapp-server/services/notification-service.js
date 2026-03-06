@@ -4,7 +4,6 @@
 // Requires FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY env vars.
 // If not configured, notifications are silently skipped (service degrades gracefully).
 
-const admin = require('firebase-admin');
 const config = require('../config');
 const { logger } = require('../utils/logger');
 
@@ -13,12 +12,20 @@ class NotificationService {
     // userId -> { token, platform, updatedAt }
     this.deviceTokens = new Map();
     this.initialized = false;
+    this.admin = null;
     this._init();
   }
 
   // ─── Initialise Firebase Admin SDK ───────────────────────────────────────
   _init() {
     const { projectId, privateKey, clientEmail } = config.firebase;
+
+    try {
+      this.admin = require('firebase-admin');
+    } catch {
+      logger.warn('FCM', 'firebase-admin package not installed — push notifications disabled.');
+      return;
+    }
 
     if (!projectId || !privateKey || !clientEmail) {
       logger.warn('FCM', 'Firebase not configured — push notifications disabled.');
@@ -27,8 +34,8 @@ class NotificationService {
     }
 
     try {
-      admin.initializeApp({
-        credential: admin.credential.cert({
+      this.admin.initializeApp({
+        credential: this.admin.credential.cert({
           projectId,
           privateKey: privateKey.replace(/\\n/g, '\n'), // handle escaped newlines in env
           clientEmail,
@@ -85,7 +92,7 @@ class NotificationService {
     };
 
     try {
-      const messageId = await admin.messaging().send(message);
+      const messageId = await this.admin.messaging().send(message);
       logger.info('FCM', `✓ Sent to ${userId} (${device.platform}): "${title}" [${messageId}]`);
       return { sent: true, messageId };
     } catch (err) {
@@ -252,7 +259,7 @@ class NotificationService {
     };
 
     try {
-      const messageId = await admin.messaging().send(message);
+      const messageId = await this.admin.messaging().send(message);
       logger.info('FCM', `✓ Silent push to ${userId} (${device.platform}) [${messageId}]`);
       return { sent: true, messageId };
     } catch (err) {

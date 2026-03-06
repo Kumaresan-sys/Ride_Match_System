@@ -40,7 +40,8 @@ All containers should show healthy status.
 
 ### 3) Schema bootstrap (automatic)
 
-On first startup, PostgreSQL auto-loads all 20 SQL migration files from `./sql/` in alphabetical order, creating all 248 tables.
+On first startup, PostgreSQL auto-loads all SQL migration files from `./sql/` in alphabetical order.
+The base enterprise schema remains 20 core migrations / 248 tables, plus extension migrations (`021+`) for feature expansions.
 
 If you need to re-run migrations (reset database):
 
@@ -112,7 +113,21 @@ curl -X POST http://localhost:3000/api/v1/auth/otp/request \
 | `018_saga_orchestration.sql` | Saga Orchestration | 4 |
 | `019_event_system.sql` | Event System | 4 |
 | `020_analytics_warehouse.sql` | Analytics/DW | 22 |
-| **Total** | **20 domains** | **248** |
+| **Total (core)** | **20 domains** | **248** |
+
+### Extension Migration Files (present in repository)
+
+| File | Purpose |
+|------|---------|
+| `021_coins_rewards.sql` | Coins/reward ledger extensions |
+| `022_sos_logs.sql` | SOS event and audit expansion |
+| `023_driver_wallet.sql` | Driver wallet accounting extensions |
+| `024_demand_aggregation.sql` | Demand aggregation read models |
+| `025_incentive_tasks.sql` | Incentive campaign/task expansion |
+| `026_chat_tickets.sql` | Support chat/ticket detail tables |
+| `027_rider_wallet_cash.sql` | Rider cash wallet extensions |
+| `028_demand_analytics.sql` | Demand analytics rollups |
+| `029_ride_session_recovery.sql` | Ride session recovery persistence |
 
 ## Current Implementation Status
 

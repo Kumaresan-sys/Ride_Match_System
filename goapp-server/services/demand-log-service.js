@@ -71,6 +71,7 @@ class DemandLogService {
 
     // Periodic snapshot every 5 minutes
     this._snapshotInterval = setInterval(() => this._takeDemandSnapshot(), 5 * 60 * 1000);
+    this._snapshotInterval.unref();
 
     // Daily reset of area totals at midnight
     this._scheduleDaily();

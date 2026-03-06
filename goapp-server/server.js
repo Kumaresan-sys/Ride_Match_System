@@ -28,6 +28,15 @@ const notificationService = require('./services/notification-service');
 const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
 const googleMapsService = require('./services/google-maps-service');
+const { applySecurityHeaders, parseJsonBody } = require('./middleware/http-middleware');
+const buildRouteDispatcher = require('./routes');
+const validateConfig = require('./config/validate-config');
+const {
+  ServiceIdentityRepository,
+  ServiceRideRepository,
+  ServiceMatchingStateRepository,
+  ServiceWalletRepository,
+} = require('./repositories/adapters/service-repositories');
 
 // Max request body size: 256 KB (prevents memory exhaustion)
 const MAX_BODY_BYTES = 256 * 1024;
@@ -60,18 +69,36 @@ function requireAuth(headers) {
 }
 
 function startAPIServer(port) {
+  const repositories = {
+    identity: new ServiceIdentityRepository(identityService),
+    ride: new ServiceRideRepository(rideService),
+    matchingState: new ServiceMatchingStateRepository(matchingEngine),
+    wallet: new ServiceWalletRepository(walletService),
+  };
+
+  const dispatchRoute = buildRouteDispatcher({
+    enterpriseConfig,
+    repositories,
+    eventBus,
+    services: {
+      redis,
+      mockDb,
+      locationService,
+      pricingService,
+      rideService,
+      zoneService,
+      demandLogService,
+      walletService,
+    },
+  }, handleLegacyRoute);
+
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${port}`);
     const path = url.pathname;
     const method = req.method;
     const headers = req.headers;
 
-    const allowedOrigin = process.env.CORS_ORIGIN || '*';
-    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Session-Token, X-Admin-Token');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Type', 'application/json');
+    applySecurityHeaders(req, res);
 
     if (method === 'OPTIONS') {
       res.writeHead(200);
@@ -80,37 +107,16 @@ function startAPIServer(port) {
     }
 
     try {
-      let body = '';
-      if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
-        body = await new Promise((resolve, reject) => {
-          let data = '';
-          let size = 0;
-          req.on('data', chunk => {
-            size += chunk.length;
-            if (size > MAX_BODY_BYTES) {
-              req.destroy();
-              reject(Object.assign(new Error('Request body too large'), { statusCode: 413 }));
-              return;
-            }
-            data += chunk;
-          });
-          req.on('end', () => resolve(data));
-          req.on('error', reject);
-        });
-      }
-
-      let json;
-      try {
-        json = body ? JSON.parse(body) : {};
-      } catch {
+      const json = await parseJsonBody(req, MAX_BODY_BYTES);
+      const response = await dispatchRoute(method, path, json, url.searchParams, headers);
+      res.writeHead(response.status || 200);
+      res.end(JSON.stringify(response.data, null, 2));
+    } catch (err) {
+      if (err instanceof SyntaxError) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: 'Invalid JSON body' }));
         return;
       }
-      const response = await handleRoute(method, path, json, url.searchParams, headers);
-      res.writeHead(response.status || 200);
-      res.end(JSON.stringify(response.data, null, 2));
-    } catch (err) {
       const status = err.statusCode || 500;
       res.writeHead(status);
       res.end(JSON.stringify({ error: err.message }));
@@ -247,7 +253,7 @@ function startAPIServer(port) {
   return server;
 }
 
-async function handleRoute(method, path, body, params, headers = {}) {
+async function handleLegacyRoute(method, path, body, params, headers = {}) {
   if (path === '/api/v1/health') {
     return {
       data: {
@@ -1338,6 +1344,12 @@ function bootstrapTestData() {
 }
 
 async function main() {
+  const configCheck = validateConfig({ strict: process.env.CONFIG_STRICT === 'true' });
+  configCheck.warnings.forEach(msg => logger.warn('CONFIG', msg));
+  if (!configCheck.ok) {
+    throw new Error(`Config validation failed: ${configCheck.errors.join(' | ')}`);
+  }
+
   const args = process.argv.slice(2);
   const simOnly = args.includes('--sim-only');
   const apiOnly = args.includes('--api-only');
@@ -1376,7 +1388,15 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  startAPIServer,
+  bootstrapTestData,
+  main,
+};

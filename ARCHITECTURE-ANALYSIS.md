@@ -252,4 +252,6 @@ enterprise-setup/sql/
 └── run-migrations.sh               (Execution script)
 ```
 
-Total: **248 tables** across **20 migration files**
+Total: **248 core tables** across **20 core migration files**.
+
+> Repository reality: additional extension migrations currently exist (`021`–`029`) for wallet, SOS, demand analytics, incentives, ticketing, and ride-session recovery expansions.

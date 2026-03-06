@@ -31,6 +31,7 @@ class DemandAggregationService {
     this.pools = new Map();
     // Clean expired pools every 2 minutes
     this._cleanupInterval = setInterval(() => this._cleanExpiredPools(), 2 * 60 * 1000);
+    this._cleanupInterval.unref();
   }
 
   // ─── Create a new pool ────────────────────────────────────────────────────
