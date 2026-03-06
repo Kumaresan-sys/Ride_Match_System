@@ -50,6 +50,10 @@ function registerSystemRoutes(router, ctx) {
     },
   }));
 
+  router.register('GET', '/api/v1/performance', async () => ({
+    data: services.perfMonitor.getSnapshot(services),
+  }));
+
   router.register('GET', '/api/v1/formulas/haversine', async ({ params }) => {
     const lat1 = parseFloat(params.get('lat1'));
     const lng1 = parseFloat(params.get('lng1'));

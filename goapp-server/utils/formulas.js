@@ -53,13 +53,17 @@ function predictLocation(lastLat, lastLng, speedMs, headingDeg, elapsedSec) {
 // ═══════════════════════════════════════════
 // FORMULA 02: Composite Driver Scoring
 // ═══════════════════════════════════════════
-function calculateCompositeScore(driver, riderLat, riderLng, maxETAInPool) {
+function calculateCompositeScore(driver, riderLat, riderLng, maxETAInPool, precomputedEtaMin) {
   const W = config.scoring.weights;
   const F = config.scoring.freshness;
 
-  // A. ETA Score (using Haversine-based quick ETA)
-  const distKm = haversine(driver.lat, driver.lng, riderLat, riderLng);
-  const etaMin = (distKm / config.scoring.avgCitySpeedKmh) * 60;
+  // A. ETA Score — use precomputed ETA if available (avoids redundant haversine call)
+  const distKm = precomputedEtaMin !== undefined
+    ? (precomputedEtaMin / 60) * config.scoring.avgCitySpeedKmh
+    : haversine(driver.lat, driver.lng, riderLat, riderLng);
+  const etaMin = precomputedEtaMin !== undefined
+    ? precomputedEtaMin
+    : (distKm / config.scoring.avgCitySpeedKmh) * 60;
   const etaScore = maxETAInPool > 0 ? 1 - (etaMin / maxETAInPool) : 1;
 
   // B. Idle Score

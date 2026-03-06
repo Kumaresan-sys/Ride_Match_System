@@ -216,6 +216,8 @@ class RideService {
       driverEarnings: finalFare.driverEarnings,
     });
 
+    this._pruneOldRides();
+
     return {
       rideId,
       status: S.TRIP_COMPLETED,
@@ -332,6 +334,8 @@ class RideService {
     if (ride.riderId) redis.del(`active_ride:${ride.riderId}`);
     rideSessionService.onRideEnded(ride.riderId);
 
+    this._pruneOldRides();
+
     return {
       success: true,
       rideId,
@@ -339,6 +343,16 @@ class RideService {
       cancelFee,
       penalty,
     };
+  }
+
+  // ─── Ride Pruning (prevents unbounded Map growth) ───
+  _pruneOldRides() {
+    if (this.rides.size < 10000) return;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [rideId, ride] of this.rides) {
+      const terminal = ride.completedAt || ride.cancelledAt;
+      if (terminal && terminal < cutoff) this.rides.delete(rideId);
+    }
   }
 
   // ─── Cancellation Tracking ───

@@ -7,6 +7,7 @@ const locationService = require('./location-service');
 const { calculateCompositeScore, haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
 const driverWalletService = require('./driver-wallet-service');
+const perfMonitor = require('./perf-monitor');
 
 class MatchingEngine {
   constructor() {
@@ -87,6 +88,8 @@ class MatchingEngine {
       if (broadcastResult.accepted) {
         matchState.result = broadcastResult;
         this.activeMatches.delete(rideId);
+        this.excludedDrivers.delete(rideId);
+        perfMonitor.recordMatch(true, Date.now() - matchState.startTime);
         return broadcastResult;
       }
 
@@ -101,6 +104,8 @@ class MatchingEngine {
     // All stages exhausted
     logger.error('MATCHING', `Ride ${rideId}: No drivers available after all stages`);
     this.activeMatches.delete(rideId);
+    this.excludedDrivers.delete(rideId);
+    perfMonitor.recordMatch(false, Date.now() - matchState.startTime);
 
     eventBus.publish('ride_no_drivers', { rideId });
 
@@ -125,6 +130,11 @@ class MatchingEngine {
       pickupLat, pickupLng, stage.radiusKm, stage.maxDrivers * 3 // get extra for filtering
     );
 
+    // Batch wallet eligibility check before filter to avoid N+1 service calls
+    const eligibilityMap = new Map(
+      nearby.map(loc => [loc.driverId, driverWalletService.canReceiveRide(loc.driverId)])
+    );
+
     // Filter: available, correct vehicle type, not excluded
     const candidates = nearby.filter(loc => {
       const driver = this.driverPool.get(loc.driverId);
@@ -132,10 +142,7 @@ class MatchingEngine {
       if (driver.status !== 'online') return false;
       if (rideType && driver.vehicleType !== rideType) return false;
       if (excluded.has(loc.driverId)) return false;
-      // Enforce ₹300 minimum wallet balance gate
-      const walletEligible = driverWalletService.canReceiveRide(loc.driverId);
-      if (!walletEligible.eligible) return false;
-      return true;
+      return eligibilityMap.get(loc.driverId)?.eligible ?? false;
     });
 
     logger.info('MATCHING', `  │  Found ${nearby.length} nearby → ${candidates.length} eligible candidates`);
@@ -148,15 +155,15 @@ class MatchingEngine {
   _scoreAndRank(candidates, ride, stage) {
     const { pickupLat, pickupLng } = ride;
 
-    // Calculate max ETA for normalization
-    const etas = candidates.map(c => {
+    // Pre-compute ETA once per candidate (eliminates duplicate haversine in scoring)
+    const candidatesWithETA = candidates.map(c => {
       const distKm = haversine(c.lat, c.lng, pickupLat, pickupLng);
-      return (distKm / config.scoring.avgCitySpeedKmh) * 60;
+      return { ...c, _etaMin: (distKm / config.scoring.avgCitySpeedKmh) * 60 };
     });
-    const maxETA = Math.max(...etas, 1);
+    const maxETA = Math.max(...candidatesWithETA.map(c => c._etaMin), 1);
 
-    // Score each driver
-    const scored = candidates.map(candidate => {
+    // Score each driver — pass precomputed etaMin to avoid second haversine call
+    const scored = candidatesWithETA.map(candidate => {
       const driver = this.driverPool.get(candidate.driverId);
       const driverData = {
         ...driver,
@@ -166,7 +173,7 @@ class MatchingEngine {
         lastLocationUpdate: Date.now() - (candidate.ageSec * 1000),
       };
 
-      const scoreResult = calculateCompositeScore(driverData, pickupLat, pickupLng, maxETA);
+      const scoreResult = calculateCompositeScore(driverData, pickupLat, pickupLng, maxETA, candidate._etaMin);
 
       return {
         driverId: candidate.driverId,

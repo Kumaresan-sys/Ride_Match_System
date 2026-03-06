@@ -15,6 +15,7 @@ const identityService = require('./services/identity-service');
 const walletService = require('./services/wallet-service');
 const driverWalletService = require('./services/driver-wallet-service');
 const feedbackService = require('./services/feedback-service');
+const perfMonitor = require('./services/perf-monitor');
 const demandAggregationService = require('./services/demand-aggregation-service');
 const demandLogService = require('./services/demand-log-service');
 const incentiveService = require('./services/incentive-service');
@@ -90,7 +91,10 @@ function startAPIServer(port) {
       zoneService,
       demandLogService,
       walletService,
+      driverWalletService,
       feedbackService,
+      matchingEngine,
+      perfMonitor,
     },
   }, handleLegacyRoute);
 
@@ -108,12 +112,15 @@ function startAPIServer(port) {
       return;
     }
 
+    const doneRequest = perfMonitor.startRequest();
     try {
       const json = await parseJsonBody(req, MAX_BODY_BYTES);
       const response = await dispatchRoute(method, path, json, url.searchParams, headers);
       res.writeHead(response.status || 200);
       res.end(JSON.stringify(response.data, null, 2));
+      doneRequest();
     } catch (err) {
+      doneRequest();
       if (err instanceof SyntaxError) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: 'Invalid JSON body' }));
