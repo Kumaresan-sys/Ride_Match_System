@@ -3,6 +3,7 @@ const registerSystemRoutes = require('./system-routes');
 const registerAuthRoutes = require('./auth-routes');
 const registerRideRoutes = require('./ride-routes');
 const registerWalletRoutes = require('./wallet-routes');
+const registerFeedbackRoutes = require('./feedback-routes');
 
 function buildRouteDispatcher(context, legacyHandler) {
   const router = new SimpleRouter();
@@ -10,6 +11,7 @@ function buildRouteDispatcher(context, legacyHandler) {
   registerAuthRoutes(router, context);
   registerRideRoutes(router, context);
   registerWalletRoutes(router, context);
+  registerFeedbackRoutes(router, context);
 
   return async (method, path, body, params, headers) => {
     const routed = await router.dispatch({ method, path, body, params, headers });
