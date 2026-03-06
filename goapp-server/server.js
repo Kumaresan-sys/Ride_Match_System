@@ -15,6 +15,7 @@ const identityService = require('./services/identity-service');
 const walletService = require('./services/wallet-service');
 const driverWalletService = require('./services/driver-wallet-service');
 const demandAggregationService = require('./services/demand-aggregation-service');
+const demandLogService = require('./services/demand-log-service');
 const incentiveService = require('./services/incentive-service');
 const ticketService = require('./services/ticket-service');
 const sosService = require('./services/sos-service');
@@ -165,6 +166,11 @@ function startAPIServer(port) {
     console.log('  POST /api/v1/pool/:poolId/join              { riderId, pickupLat, pickupLng }');
     console.log('  POST /api/v1/pool/:poolId/leave             { riderId }');
     console.log('  GET  /api/v1/riders/:riderId/pools');
+    console.log('  --- Demand Analytics (Heatmap + Timeline + Logs) ---');
+    console.log('  GET  /api/v1/demand/heatmap                 Current area demand map (HOT zones)');
+    console.log('  GET  /api/v1/demand/areas/hot?limit=10      Top N high-demand areas right now');
+    console.log('  GET  /api/v1/demand/timeline?hours=6        15-min bucket demand for last N hours');
+    console.log('  GET  /api/v1/demand/stats                   Real-time supply vs demand summary');
     console.log('  --- Driver Incentives ---');
     console.log('  GET  /api/v1/incentives?activeOnly=true');
     console.log('  GET  /api/v1/incentives/:taskId');
@@ -198,6 +204,13 @@ function startAPIServer(port) {
     console.log('  GET    /api/v1/admin/wallet/stats');
     console.log('  POST   /api/v1/admin/driver-wallet/:driverId/adjust { amount, reason }');
     console.log('  GET    /api/v1/admin/driver-wallet/stats');
+    console.log('  GET    /api/v1/admin/demand/logs?type=no_match_found&limit=100');
+    console.log('  GET    /api/v1/admin/demand/logs/summary    Count by scenario type');
+    console.log('  GET    /api/v1/admin/demand/areas           All areas with full metrics');
+    console.log('  GET    /api/v1/admin/demand/peak-hours      Time slots sorted by demand');
+    console.log('  GET    /api/v1/admin/demand/no-match-analysis  Why pool matches fail + recommendations');
+    console.log('  GET    /api/v1/admin/demand/timeline?hours=24');
+    console.log('  POST   /api/v1/admin/demand/snapshot        Trigger manual area snapshot');
     console.log('  GET    /api/v1/admin/pool?status=OPEN');
     console.log('  POST   /api/v1/admin/pool/:poolId/dispatch          { driverId }');
     console.log('  PUT    /api/v1/admin/pool/:poolId/status            { status }');
@@ -240,6 +253,7 @@ async function handleRoute(method, path, body, params, headers = {}) {
         wallet: walletService.getStats(),
         driverWallet: driverWalletService.getStats(),
         demandAggregation: demandAggregationService.getStats(),
+        demandLog: demandLogService.getStats(),
         incentives: incentiveService.getStats(),
         tickets: ticketService.getStats(),
         sos: sosService.getStats(),
@@ -334,6 +348,23 @@ async function handleRoute(method, path, body, params, headers = {}) {
       }
     }
 
+    // Record raw demand for area heatmap + time-series
+    if (Number.isFinite(pickupLat) && Number.isFinite(pickupLng)) {
+      demandLogService.recordDemand(pickupLat, pickupLng, 'ride_requested');
+      demandLogService.recordTimeslot('ride_requested');
+      demandLogService.logScenario('ride_requested', {
+        riderId:    body.riderId,
+        pickupLat,
+        pickupLng,
+        destLat:    parseFloat(body.destLat),
+        destLng:    parseFloat(body.destLng),
+        rideType:   body.rideType || 'sedan',
+        useCoins:   !!body.useCoins,
+        usedPool:   !!body.poolId,
+        outcome:    'requested',
+      });
+    }
+
     const result = await rideService.createRide({
       ...body,
       idempotencyKey: body.idempotencyKey || crypto.randomUUID(),
@@ -390,6 +421,27 @@ async function handleRoute(method, path, body, params, headers = {}) {
       const earnFare = result.fare?.finalFare;
       const earnResult = walletService.earnCoins(ride.riderId, earnFare, rideId);
       if (earnResult) result.coinsEarned = earnResult.coins;
+    }
+
+    // Release demand from area (ride fulfilled)
+    if (ride) {
+      const pLat = ride.pickupLat || body.pickupLat;
+      const pLng = ride.pickupLng || body.pickupLng;
+      if (pLat && pLng) {
+        demandLogService.releaseRequest(pLat, pLng);
+        demandLogService.recordTimeslot('ride_completed');
+        demandLogService.logScenario('ride_completed', {
+          rideId,
+          riderId:     ride.riderId,
+          driverId:    ride.driverId,
+          fareInr:     result.fare?.finalFare,
+          distanceKm:  body.distanceKm,
+          durationMin: body.durationMin,
+          pickupLat:   pLat,
+          pickupLng:   pLng,
+          outcome:     'completed',
+        });
+      }
     }
 
     // Update driver incentive progress on ride completion
@@ -983,6 +1035,101 @@ async function handleRoute(method, path, body, params, headers = {}) {
     const limit = parseInt(params.get('limit') || '20', 10);
     const status = params.get('status') || null;
     return { data: { tickets: ticketService.getUserTickets(userTicketsMatch[1], { limit: Math.min(limit, 100), status }) } };
+  }
+
+  // ═══════════════════════════════════════════
+  // DEMAND ANALYTICS — Heatmap, Timeline, Logs
+  // ═══════════════════════════════════════════
+
+  // GET /api/v1/demand/heatmap — current area demand map
+  if (path === '/api/v1/demand/heatmap' && method === 'GET') {
+    const areas    = demandLogService.getDemandMap();
+    const hotAreas = areas.filter(a => a.demandLevel === 'HIGH' || a.demandLevel === 'SURGE');
+    return {
+      data: {
+        snapshot:   new Date().toISOString(),
+        totalAreas: areas.length,
+        hotAreas:   hotAreas.length,
+        areas,
+      },
+    };
+  }
+
+  // GET /api/v1/demand/areas/hot?limit=10 — top high-demand areas
+  if (path === '/api/v1/demand/areas/hot' && method === 'GET') {
+    const limit = parseInt(params.get('limit') || '10', 10);
+    return { data: { hotAreas: demandLogService.getHotAreas(Math.min(limit, 50)) } };
+  }
+
+  // GET /api/v1/demand/timeline?hours=6 — demand by 15-min bucket
+  if (path === '/api/v1/demand/timeline' && method === 'GET') {
+    const hours = parseFloat(params.get('hours') || '6');
+    return { data: demandLogService.getTimeline(Math.min(hours, 72)) };
+  }
+
+  // GET /api/v1/demand/stats — real-time demand summary
+  if (path === '/api/v1/demand/stats' && method === 'GET') {
+    const stats   = demandLogService.getStats();
+    const current = demandLogService.getCurrentBucket();
+    const hot     = demandLogService.getHotAreas(5);
+    return {
+      data: {
+        ...stats,
+        currentBucket: current,
+        topHotAreas:   hot,
+        poolStats:     demandAggregationService.getStats(),
+      },
+    };
+  }
+
+  // Admin demand routes
+  if (path.startsWith('/api/v1/admin/demand')) {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+
+    // GET /api/v1/admin/demand/logs?type=no_match_found&limit=100&since=ISO&poolId=...&areaKey=...
+    if (path === '/api/v1/admin/demand/logs' && method === 'GET') {
+      const type    = params.get('type')    || null;
+      const limit   = parseInt(params.get('limit') || '100', 10);
+      const since   = params.get('since')   || null;
+      const poolId  = params.get('poolId')  || null;
+      const areaKey = params.get('areaKey') || null;
+      const logs    = demandLogService.getScenarioLogs({ type, limit: Math.min(limit, 500), since, poolId, areaKey });
+      return { data: { count: logs.length, logs } };
+    }
+
+    // GET /api/v1/admin/demand/logs/summary — count by scenario type
+    if (path === '/api/v1/admin/demand/logs/summary' && method === 'GET') {
+      return { data: demandLogService.getLogSummary() };
+    }
+
+    // GET /api/v1/admin/demand/areas — all areas with full metrics
+    if (path === '/api/v1/admin/demand/areas' && method === 'GET') {
+      return { data: { areas: demandLogService.getDemandMap() } };
+    }
+
+    // GET /api/v1/admin/demand/peak-hours?limit=20 — time buckets sorted by demand
+    if (path === '/api/v1/admin/demand/peak-hours' && method === 'GET') {
+      const limit = parseInt(params.get('limit') || '20', 10);
+      return { data: { peakHours: demandLogService.getPeakHours(Math.min(limit, 100)) } };
+    }
+
+    // GET /api/v1/admin/demand/no-match-analysis — why matches fail
+    if (path === '/api/v1/admin/demand/no-match-analysis' && method === 'GET') {
+      return { data: demandLogService.getNoMatchAnalysis() };
+    }
+
+    // POST /api/v1/admin/demand/snapshot — trigger manual snapshot
+    if (path === '/api/v1/admin/demand/snapshot' && method === 'POST') {
+      demandLogService._takeDemandSnapshot();
+      return { data: { success: true, message: 'Demand snapshot taken.', stats: demandLogService.getStats() } };
+    }
+
+    // GET /api/v1/admin/demand/timeline?hours=24
+    if (path === '/api/v1/admin/demand/timeline' && method === 'GET') {
+      const hours = parseFloat(params.get('hours') || '24');
+      return { data: demandLogService.getTimeline(Math.min(hours, 168)) }; // max 7 days
+    }
   }
 
   // Admin ticket routes
