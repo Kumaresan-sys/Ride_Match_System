@@ -18,6 +18,7 @@ const demandAggregationService = require('./services/demand-aggregation-service'
 const demandLogService = require('./services/demand-log-service');
 const incentiveService = require('./services/incentive-service');
 const ticketService = require('./services/ticket-service');
+const rideSessionService = require('./services/ride-session-service');
 const sosService = require('./services/sos-service');
 const smsService = require('./services/sms-service');
 const redis = require('./services/redis-mock');
@@ -184,6 +185,10 @@ function startAPIServer(port) {
     console.log('  POST /api/v1/tickets/:ticketId/messages     { senderId, senderRole, content }');
     console.log('  PUT  /api/v1/tickets/:ticketId/read         { readBy }');
     console.log('  GET  /api/v1/users/:userId/tickets');
+    console.log('  --- Ride Session Recovery (App Kill Resume) ---');
+    console.log('  GET  /api/v1/riders/:riderId/active-ride    Check if rider has an in-progress ride');
+    console.log('  POST /api/v1/riders/:riderId/restore        Full ride + driver snapshot for app recovery');
+    console.log('  POST /api/v1/riders/:riderId/heartbeat      { rideId? } Keepalive ping every 30s');
     console.log('  --- SOS / Safety ---');
     console.log('  POST /api/v1/sos                            { userId, userType, rideId?, lat, lng, sosType? }');
     console.log('  GET  /api/v1/sos/:sosId');
@@ -256,6 +261,7 @@ async function handleRoute(method, path, body, params, headers = {}) {
         demandLog: demandLogService.getStats(),
         incentives: incentiveService.getStats(),
         tickets: ticketService.getStats(),
+        rideSession: rideSessionService.getStats(),
         sos: sosService.getStats(),
         sms: smsService.getStats(),
       },
@@ -1176,6 +1182,55 @@ async function handleRoute(method, path, body, params, headers = {}) {
       const result = ticketService.addAgent(body);
       return { status: result.success ? 201 : 400, data: result };
     }
+  }
+
+  // ═══════════════════════════════════════════
+  // RIDE SESSION RECOVERY (app kill recovery)
+  // ═══════════════════════════════════════════
+
+  // GET /api/v1/riders/:riderId/active-ride  — lightweight check on app open
+  const activeRideMatch = path.match(/^\/api\/v1\/riders\/(.+)\/active-ride$/);
+  if (activeRideMatch && method === 'GET') {
+    const riderId = activeRideMatch[1];
+    const ride = rideService.getActiveRide(riderId);
+    if (!ride) {
+      return { data: { hasActiveRide: false } };
+    }
+    rideSessionService._logRecovery({ type: 'active_check', riderId, rideId: ride.rideId, rideStatus: ride.status });
+    return {
+      data: {
+        hasActiveRide: true,
+        rideId: ride.rideId,
+        status: ride.status,
+        wsChannel: `ride:${ride.rideId}`,
+      },
+    };
+  }
+
+  // POST /api/v1/riders/:riderId/restore  — full recovery payload (requires auth)
+  const restoreMatch = path.match(/^\/api\/v1\/riders\/(.+)\/restore$/);
+  if (restoreMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
+    const riderId = restoreMatch[1];
+    const result = rideSessionService.restoreSession(riderId, {
+      rideService,
+      locationService,
+      matchingEngine,
+    });
+    if (!result.hasActiveRide) {
+      return { data: { hasActiveRide: false } };
+    }
+    return { data: result };
+  }
+
+  // POST /api/v1/riders/:riderId/heartbeat  — keepalive ping every 30s
+  const heartbeatMatch = path.match(/^\/api\/v1\/riders\/(.+)\/heartbeat$/);
+  if (heartbeatMatch && method === 'POST') {
+    const riderId = heartbeatMatch[1];
+    const rideId = body.rideId || null;
+    const result = rideSessionService.heartbeat(riderId, rideId);
+    return { data: result };
   }
 
   return { status: 404, data: { error: 'Not found', path, method } };

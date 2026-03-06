@@ -62,6 +62,9 @@ class RideService {
 
     this.rides.set(rideId, ride);
 
+    // Index active ride in Redis for fast recovery lookup (4-hour TTL)
+    if (riderId) redis.set(`active_ride:${riderId}`, rideId, 4 * 3600);
+
     // Store idempotency
     if (idempotencyKey) {
       redis.setIdempotency(idempotencyKey, { rideId, status: S.REQUESTED }, 300);
@@ -181,8 +184,9 @@ class RideService {
       driver.status = 'online';
     }
 
-    // Release lock
+    // Release lock and clear active-ride index
     redis.releaseLock(rideId);
+    if (ride.riderId) redis.del(`active_ride:${ride.riderId}`);
 
     eventBus.publish('ride_completed', {
       rideId, driverId: ride.driverId, riderId: ride.riderId,
@@ -311,6 +315,7 @@ class RideService {
 
     ride.cancelledAt = now;
     ride.cancelledBy = cancelledBy;
+    if (ride.riderId) redis.del(`active_ride:${ride.riderId}`);
 
     return {
       success: true,
@@ -366,6 +371,26 @@ class RideService {
     ride.status = newStatus;
     ride.statusHistory.push({ status: newStatus, at: Date.now() });
     logger.info('RIDE', `Ride ${rideId}: ${ride.statusHistory[ride.statusHistory.length - 2]?.status || 'NEW'} → ${newStatus}`);
+  }
+
+  // ─── Active ride lookup by riderId (for app session recovery) ───
+  getActiveRide(riderId) {
+    const activeStatuses = new Set([
+      'MATCHING', 'BROADCAST', 'ACCEPTED',
+      'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'TRIP_STARTED',
+    ]);
+    // Fast path: Redis index
+    const cachedId = redis.get('active_ride:' + riderId);
+    if (cachedId) {
+      const r = this.rides.get(cachedId);
+      if (r && activeStatuses.has(r.status)) return r;
+      redis.del('active_ride:' + riderId);
+    }
+    // Fallback: linear scan
+    for (const ride of this.rides.values()) {
+      if (ride.riderId === riderId && activeStatuses.has(ride.status)) return ride;
+    }
+    return null;
   }
 
   getRide(rideId) {

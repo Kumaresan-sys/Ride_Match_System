@@ -179,6 +179,11 @@ class WebSocketServer {
         }
         break;
 
+      case 'reconnect':
+        // Rider app reopened after kill — re-subscribe and push current state
+        this._handleReconnect(socketId, message);
+        break;
+
       case 'chat:message':
         this._broadcastToChannel(message.channel, {
           type: 'chat:message',
@@ -234,6 +239,60 @@ class WebSocketServer {
 
     this.clients.delete(socketId);
     logger.info('WS-GATEWAY', `Client disconnected: ${socketId.substr(0, 8)}`);
+  }
+
+  // ─── Reconnect Handler ───
+
+  _handleReconnect(socketId, message) {
+    const { userId, userType, rideId } = message;
+    const client = this.clients.get(socketId);
+    if (!client || !rideId) return;
+
+    // Set identity
+    client.userId = userId;
+    client.userType = userType || 'rider';
+
+    // Subscribe to ride channel
+    const channel = `ride:${rideId}`;
+    this._subscribe(socketId, channel);
+
+    logger.info('WS-GATEWAY', `Reconnect: ${userType} ${userId} → channel ${channel}`);
+
+    // Acknowledge reconnect; full snapshot pushed by rideSessionService via HTTP /restore
+    this.sendToClient(socketId, {
+      type: 'reconnect:ack',
+      rideId,
+      channel,
+      message: 'Resubscribed to ride channel. Call POST /riders/:id/restore for full state.',
+    });
+
+    // Log to rideSessionService if injected
+    if (this.rideSessionService) {
+      this.rideSessionService.logWsReconnect(userId, rideId, null);
+    }
+  }
+
+  // Push a full ride state snapshot to a single socket (called after /restore)
+  sendRideSnapshot(socketId, ride, driverLocation) {
+    const now = Date.now();
+    const elapsedSec = ride.startedAt
+      ? Math.floor((now - new Date(ride.startedAt).getTime()) / 1000)
+      : 0;
+
+    this.sendToClient(socketId, {
+      type: 'ride:snapshot',
+      rideId: ride.rideId,
+      status: ride.status,
+      elapsedSec,
+      pickupLat: ride.pickupLat,
+      pickupLng: ride.pickupLng,
+      destLat: ride.destLat,
+      destLng: ride.destLng,
+      driver: driverLocation || null,
+      fareEstimate: ride.fareEstimate || null,
+      statusHistory: ride.statusHistory || [],
+      snapshotAt: new Date(now).toISOString(),
+    });
   }
 
   // ─── Public API ───
