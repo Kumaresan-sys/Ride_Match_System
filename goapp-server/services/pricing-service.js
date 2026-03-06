@@ -4,6 +4,7 @@
 const config = require('../config');
 const { haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
+const googleMapsService = require('./google-maps-service');
 
 class PricingService {
   constructor() {
@@ -44,9 +45,19 @@ class PricingService {
     };
   }
 
-  getEstimates(pickupLat, pickupLng, destLat, destLng) {
+  // Synchronous fallback used internally when async isn't available
+  _estimatesSync(pickupLat, pickupLng, destLat, destLng) {
     const distanceKm = haversine(pickupLat, pickupLng, destLat, destLng) * 1.25;
     const durationMin = (distanceKm / config.scoring.avgCitySpeedKmh) * 60;
+    return { distanceKm, durationMin, source: 'haversine' };
+  }
+
+  // Returns fare estimates using Google Maps road distance when available,
+  // otherwise falls back to Haversine straight-line × 1.25.
+  async getEstimates(pickupLat, pickupLng, destLat, destLng) {
+    const { distanceKm, durationMin, source } = await googleMapsService.getRoadDistance(
+      pickupLat, pickupLng, destLat, destLng,
+    );
 
     const zoneId = 'chennai:default';
     const surge = this.getSurgeMultiplier(zoneId);
@@ -63,6 +74,7 @@ class PricingService {
     return {
       zoneId,
       surgeMultiplier: surge.multiplier,
+      distanceSource: source,  // 'google' | 'haversine'
       estimates,
     };
   }

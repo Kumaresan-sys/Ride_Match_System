@@ -37,8 +37,8 @@ class RideService {
     const rideId = `RIDE-${crypto.randomUUID().substr(0, 8).toUpperCase()}`;
     const now = Date.now();
 
-    // Get fare estimates
-    const estimates = pricingService.getEstimates(pickupLat, pickupLng, destLat, destLng);
+    // Get fare estimates (async: uses Google Maps road distance when configured)
+    const estimates = await pricingService.getEstimates(pickupLat, pickupLng, destLat, destLng);
     const fareEstimate = estimates.estimates[rideType] || estimates.estimates.sedan;
 
     const ride = {

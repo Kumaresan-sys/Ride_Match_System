@@ -137,6 +137,18 @@ module.exports = {
     privateKey:  process.env.FIREBASE_PRIVATE_KEY  || '',
   },
 
+  // ─── Google Maps ─────────────────────────────────────────────────────────
+  googleMaps: {
+    // Enable: set GOOGLE_MAPS_API_KEY in environment. Falls back to Haversine if unset.
+    apiKey: process.env.GOOGLE_MAPS_API_KEY || '',
+    // Distance Matrix: use traffic-aware durations for fare/ETA accuracy
+    trafficModel: 'best_guess',  // 'best_guess' | 'pessimistic' | 'optimistic'
+    // Places Autocomplete: restrict results to India
+    autocompleteCountry: 'in',
+    // Timeout for Maps API calls (ms). Fallback to Haversine on timeout.
+    timeoutMs: 3000,
+  },
+
   rideStatuses: {
     REQUESTED: 'REQUESTED',
     MATCHING: 'MATCHING',

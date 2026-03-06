@@ -27,6 +27,7 @@ const zoneService = require('./services/zone-service');
 const notificationService = require('./services/notification-service');
 const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
+const googleMapsService = require('./services/google-maps-service');
 
 // Max request body size: 256 KB (prevents memory exhaustion)
 const MAX_BODY_BYTES = 256 * 1024;
@@ -146,6 +147,11 @@ function startAPIServer(port) {
     console.log('  GET  /api/v1/stats');
     console.log('  GET  /api/v1/formulas/haversine?lat1=X&lng1=Y&lat2=X&lng2=Y');
     console.log('  GET  /api/v1/formulas/bearing?lat1=X&lng1=Y&lat2=X&lng2=Y');
+    console.log('  --- Google Maps (requires GOOGLE_MAPS_API_KEY) ---');
+    console.log('  GET  /api/v1/maps/autocomplete?input=TEXT&lat=X&lng=Y&sessionToken=T');
+    console.log('  GET  /api/v1/maps/place?placeId=ID&sessionToken=T');
+    console.log('  GET  /api/v1/maps/reverse-geocode?lat=X&lng=Y');
+    console.log('  GET  /api/v1/maps/status');
     console.log('  POST /api/v1/users/:id/device-token');
     console.log('  DELETE /api/v1/users/:id/device-token');
     console.log('  --- Rider Wallet (Coins + Cash) ---');
@@ -344,7 +350,7 @@ async function handleRoute(method, path, body, params, headers = {}) {
     // Optional: preview coin redemption discount before creating ride
     let coinRedemptionPreview = null;
     if (body.useCoins && body.riderId) {
-      const estimates = pricingService.getEstimates(pickupLat, pickupLng, parseFloat(body.destLat), parseFloat(body.destLng));
+      const estimates = await pricingService.getEstimates(pickupLat, pickupLng, parseFloat(body.destLat), parseFloat(body.destLng));
       const rideType = body.rideType || 'sedan';
       const estimatedFare = estimates.estimates[rideType]?.finalFare;
       if (estimatedFare) {
@@ -476,7 +482,7 @@ async function handleRoute(method, path, body, params, headers = {}) {
   }
 
   if (path === '/api/v1/fare/estimate' && method === 'POST') {
-    const estimates = pricingService.getEstimates(body.pickupLat, body.pickupLng, body.destLat, body.destLng);
+    const estimates = await pricingService.getEstimates(body.pickupLat, body.pickupLng, body.destLat, body.destLng);
     return { data: estimates };
   }
 
@@ -541,6 +547,52 @@ async function handleRoute(method, path, body, params, headers = {}) {
     }
 
     return { data: { bearingDeg: Math.round(bearing(lat1, lng1, lat2, lng2) * 10) / 10 } };
+  }
+
+  // ═══════════════════════════════════════════
+  // GOOGLE MAPS — Places + Status
+  // ═══════════════════════════════════════════
+
+  // GET /api/v1/maps/status
+  if (path === '/api/v1/maps/status' && method === 'GET') {
+    return { data: googleMapsService.getStats() };
+  }
+
+  // GET /api/v1/maps/autocomplete?input=TEXT[&lat=X&lng=Y&sessionToken=T]
+  if (path === '/api/v1/maps/autocomplete' && method === 'GET') {
+    const input = params.get('input');
+    if (!input || input.trim().length < 2) {
+      return { status: 400, data: { error: 'input query param required (min 2 chars)' } };
+    }
+    const sessionToken = params.get('sessionToken') || undefined;
+    const lat = params.get('lat') ? parseFloat(params.get('lat')) : undefined;
+    const lng = params.get('lng') ? parseFloat(params.get('lng')) : undefined;
+    const result = await googleMapsService.autocomplete(input, sessionToken, lat, lng);
+    return { data: result };
+  }
+
+  // GET /api/v1/maps/place?placeId=ID[&sessionToken=T]
+  if (path === '/api/v1/maps/place' && method === 'GET') {
+    const placeId = params.get('placeId');
+    if (!placeId) {
+      return { status: 400, data: { error: 'placeId query param required' } };
+    }
+    const sessionToken = params.get('sessionToken') || undefined;
+    const result = await googleMapsService.getPlaceCoordinates(placeId, sessionToken);
+    if (result.error) return { status: 503, data: result };
+    return { data: result };
+  }
+
+  // GET /api/v1/maps/reverse-geocode?lat=X&lng=Y
+  if (path === '/api/v1/maps/reverse-geocode' && method === 'GET') {
+    const lat = parseFloat(params.get('lat'));
+    const lng = parseFloat(params.get('lng'));
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return { status: 400, data: { error: 'lat and lng query params required' } };
+    }
+    const result = await googleMapsService.reverseGeocode(lat, lng);
+    if (result.error) return { status: 503, data: result };
+    return { data: result };
   }
 
   // ═══════════════════════════════════════════

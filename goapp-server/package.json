@@ -9,6 +9,7 @@
     "sim": "node server.js --sim-only"
   },
   "dependencies": {
-    "firebase-admin": "^12.1.0"
+    "firebase-admin": "^12.1.0",
+    "@googlemaps/google-maps-services-js": "^3.4.0"
   }
 }
