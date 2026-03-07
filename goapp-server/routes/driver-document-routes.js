@@ -2,7 +2,7 @@
 // Endpoints for uploading, listing, verifying, and serving driver KYC documents.
 
 function registerDriverDocumentRoutes(router, ctx) {
-  const { services } = ctx;
+  const { services, requireAdmin } = ctx;
   const docService = services.driverDocumentService;
 
   // ─── Upload a document (multipart/form-data) ───
@@ -63,7 +63,10 @@ function registerDriverDocumentRoutes(router, ctx) {
 
   // ─── Admin: verify or reject a document ───
   // Body: { status: 'verified'|'rejected'|'expired', rejection_reason?, verified_by? }
-  router.register('PUT', '/api/v1/drivers/:driverId/documents/:docId/verify', async ({ pathParams, body }) => {
+  router.register('PUT', '/api/v1/drivers/:driverId/documents/:docId/verify', async ({ pathParams, body, headers }) => {
+    const adminCheck = requireAdmin(headers);
+    if (adminCheck) return adminCheck;
+
     const { docId } = pathParams;
     const { status, rejection_reason, verified_by } = body;
 

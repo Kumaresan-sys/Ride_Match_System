@@ -34,7 +34,6 @@ function parseMultipartBuffer(rawBody, boundary) {
   const files = [];
 
   const delimiter = Buffer.from(`--${boundary}`);
-  const CRLF = Buffer.from('\r\n');
   const CRLFCRLF = Buffer.from('\r\n\r\n');
 
   // Split the raw body on the boundary delimiter

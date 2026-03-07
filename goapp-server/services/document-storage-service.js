@@ -12,9 +12,23 @@ class DocumentStorageService {
     this.localPath = path.resolve(config.storage.localPath || './uploads/driver-docs');
   }
 
+  // Sanitize driverId to prevent path traversal (e.g. ../../../etc)
+  _safeDriverSegment(driverId) {
+    // Allow only alphanumeric, hyphens, underscores — matches UUID and D001-style IDs
+    const safe = driverId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (!safe || safe === '.' || safe === '..') throw Object.assign(new Error('Invalid driverId'), { statusCode: 400 });
+    return safe;
+  }
+
   // Ensure the directory for a driver exists
   async _ensureDriverDir(driverId) {
-    const dir = path.join(this.localPath, driverId);
+    const segment = this._safeDriverSegment(driverId);
+    const dir = path.join(this.localPath, segment);
+    // Verify resolved path stays inside localPath (double-check after resolution)
+    const resolved = path.resolve(dir);
+    if (!resolved.startsWith(path.resolve(this.localPath) + path.sep)) {
+      throw Object.assign(new Error('Invalid driverId'), { statusCode: 400 });
+    }
     await fs.promises.mkdir(dir, { recursive: true });
     return dir;
   }
@@ -40,8 +54,6 @@ class DocumentStorageService {
       const filename = `${documentType}_${this._uniqueFilename(originalFilename)}`;
       const storedPath = path.join(dir, filename);
       await fs.promises.writeFile(storedPath, buffer);
-      // URL is a relative path that the file-serve route will use
-      const url = `/api/v1/drivers/${driverId}/documents`;  // placeholder; docId appended after record creation
       return { storedPath, filename };
     }
     throw new Error(`Storage backend '${this.backend}' not implemented`);

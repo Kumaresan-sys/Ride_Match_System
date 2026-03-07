@@ -169,9 +169,10 @@ class DriverDocumentService {
     return { success: true, message: 'Document deleted' };
   }
 
-  // Remove internal fields before returning to client
+  // Remove internal fields and add convenience download URL before returning to client
   _sanitize(doc) {
     const { storedPath, ...rest } = doc;
+    rest.fileUrl = `/api/v1/drivers/${doc.driverId}/documents/${doc.id}/file`;
     return rest;
   }
 }
