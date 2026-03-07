@@ -180,6 +180,15 @@ module.exports = {
     ssl: process.env.POSTGRES_SSL === 'true',
   },
 
+  // ─── Razorpay Payment Gateway ─────────────────────────────────────────────
+  // Get credentials from: https://dashboard.razorpay.com/app/keys
+  // Set RAZORPAY_WEBHOOK_SECRET after creating a webhook in the dashboard.
+  razorpay: {
+    keyId:         process.env.RAZORPAY_KEY_ID         || '',
+    keySecret:     process.env.RAZORPAY_KEY_SECRET      || '',
+    webhookSecret: process.env.RAZORPAY_WEBHOOK_SECRET  || '',
+  },
+
   // ─── Redis ─────────────────────────────────────────────────────────────────
   // REDIS_BACKEND=mock  → in-memory RedisMock (default — zero setup for development)
   // REDIS_BACKEND=real  → real Redis client (required for test/production)

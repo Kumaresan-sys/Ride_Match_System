@@ -27,13 +27,14 @@ const rideSessionService = require('./services/ride-session-service');
 const sosService = require('./services/sos-service');
 const smsService = require('./services/sms-service');
 const redis = require('./services/redis-client');
+const razorpayService = require('./services/razorpay-service');
 const mockDb = require('./services/mock-db');
 const zoneService = require('./services/zone-service');
 const notificationService = require('./services/notification-service');
 const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
 const googleMapsService = require('./services/google-maps-service');
-const { applySecurityHeaders, parseJsonBody } = require('./middleware/http-middleware');
+const { applySecurityHeaders, parseJsonBody, readRawBody } = require('./middleware/http-middleware');
 const buildRouteDispatcher = require('./routes');
 const validateConfig = require('./config/validate-config');
 const {
@@ -113,6 +114,9 @@ function startAPIServer(port) {
     enterpriseConfig,
     repositories,
     eventBus,
+    // Auth helpers exposed to route modules so they don't need to import server.js
+    requireAuth,
+    requireAdmin,
     services: {
       redis,
       mockDb,
@@ -126,6 +130,7 @@ function startAPIServer(port) {
       feedbackService,
       matchingEngine,
       perfMonitor,
+      razorpayService,
     },
   }, handleLegacyRoute);
 
@@ -140,6 +145,58 @@ function startAPIServer(port) {
     if (method === 'OPTIONS') {
       res.writeHead(200);
       res.end();
+      return;
+    }
+
+    // ── Razorpay webhook — must read raw body BEFORE JSON.parse ──────────────
+    if (path === '/api/v1/payments/webhook' && method === 'POST') {
+      const doneWebhook = perfMonitor.startRequest();
+      try {
+        const rawBody  = await readRawBody(req, MAX_BODY_BYTES);
+        const sig      = headers['x-razorpay-signature'] || '';
+        const isValid  = razorpayService.verifyWebhookSignature(rawBody, sig);
+
+        if (!isValid) {
+          logger.warn('RAZORPAY', 'Webhook received with invalid signature — rejected');
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Invalid webhook signature' }));
+          doneWebhook();
+          return;
+        }
+
+        let event;
+        try { event = JSON.parse(rawBody.toString('utf8')); }
+        catch (_) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid JSON' })); doneWebhook(); return; }
+
+        // ── Webhook event processing ─────────────────────────────────────────
+        const eventName  = event.event || '';
+        const payment    = event.payload?.payment?.entity;
+        const orderId    = payment?.order_id;
+
+        logger.info('RAZORPAY', `Webhook received: ${eventName} | order: ${orderId || 'n/a'}`);
+
+        if ((eventName === 'payment.captured' || eventName === 'payment.authorized') && orderId) {
+          const order = razorpayService.getOrder(orderId);
+          if (order && order.status !== 'paid') {
+            // Credit the appropriate wallet
+            if (order.userType === 'rider') {
+              walletService.topupWallet(order.userId, order.amountInr, 'razorpay_webhook', payment.id);
+              logger.success('RAZORPAY', `Webhook: credited ₹${order.amountInr} to rider ${order.userId}`);
+            } else if (order.userType === 'driver') {
+              driverWalletService.rechargeWallet(order.userId, order.amountInr, 'razorpay_webhook', payment.id);
+              logger.success('RAZORPAY', `Webhook: credited ₹${order.amountInr} to driver ${order.userId}`);
+            }
+          }
+        }
+
+        res.writeHead(200);
+        res.end(JSON.stringify({ received: true, event: eventName }));
+        doneWebhook();
+      } catch (err) {
+        doneWebhook();
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: err.message }));
+      }
       return;
     }
 
@@ -288,6 +345,14 @@ function startAPIServer(port) {
     console.log('  GET    /api/v1/admin/tickets/agents');
     console.log('  POST   /api/v1/admin/tickets/agents                 { agentId, name, email }');
     console.log('  GET    /api/v1/admin/sms/stats');
+    console.log('  --- Razorpay Payments ---');
+    console.log('  POST /api/v1/payments/rider/create-order  { userId, amountInr }');
+    console.log('  POST /api/v1/payments/rider/verify        { razorpayOrderId, razorpayPaymentId, razorpaySignature }');
+    console.log('  POST /api/v1/payments/driver/create-order { driverId, amountInr }');
+    console.log('  POST /api/v1/payments/driver/verify       { razorpayOrderId, razorpayPaymentId, razorpaySignature }');
+    console.log('  GET  /api/v1/payments/orders/:orderId');
+    console.log('  POST /api/v1/payments/webhook             (Razorpay webhook — X-Razorpay-Signature header)');
+    console.log('  GET  /api/v1/admin/payments/stats');
     console.log('');
   });
 
