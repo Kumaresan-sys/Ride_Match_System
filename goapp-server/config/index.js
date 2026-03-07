@@ -137,6 +137,16 @@ module.exports = {
     privateKey:  process.env.FIREBASE_PRIVATE_KEY  || '',
   },
 
+  // ─── Document Storage ────────────────────────────────────────────────────
+  // STORAGE_BACKEND=local  → saves files to local filesystem (default — no cloud setup)
+  // STORAGE_BACKEND=s3     → AWS S3 (not yet implemented; set backend and extend service)
+  storage: {
+    backend:          process.env.STORAGE_BACKEND          || 'local',
+    localPath:        process.env.UPLOAD_DIR               || './uploads/driver-docs',
+    maxFileSizeBytes: parseInt(process.env.MAX_FILE_SIZE_BYTES || String(10 * 1024 * 1024), 10),
+    allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
+  },
+
   // ─── Google Maps ─────────────────────────────────────────────────────────
   googleMaps: {
     // Enable: set GOOGLE_MAPS_API_KEY in environment. Falls back to Haversine if unset.

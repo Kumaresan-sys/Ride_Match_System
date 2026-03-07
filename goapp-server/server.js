@@ -35,6 +35,9 @@ const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
 const googleMapsService = require('./services/google-maps-service');
 const { applySecurityHeaders, parseJsonBody, readRawBody } = require('./middleware/http-middleware');
+const { parseMultipart } = require('./middleware/multipart-parser');
+const DocumentStorageService = require('./services/document-storage-service');
+const DriverDocumentService = require('./services/driver-document-service');
 const buildRouteDispatcher = require('./routes');
 const validateConfig = require('./config/validate-config');
 const {
@@ -46,6 +49,12 @@ const {
 
 // Max request body size: 256 KB (prevents memory exhaustion)
 const MAX_BODY_BYTES = 256 * 1024;
+// Max upload size for driver document files: 10 MB
+const MAX_FILE_UPLOAD_BYTES = config.storage.maxFileSizeBytes || (10 * 1024 * 1024);
+
+// Instantiate document storage once at module load
+const documentStorageService = new DocumentStorageService(config);
+const driverDocumentService = new DriverDocumentService(documentStorageService);
 
 // ─── Coordinate validator ─────────────────────────────────────────────────
 function validCoords(lat, lng) {
@@ -131,6 +140,7 @@ function startAPIServer(port) {
       matchingEngine,
       perfMonitor,
       razorpayService,
+      driverDocumentService,
     },
   }, handleLegacyRoute);
 
@@ -202,8 +212,31 @@ function startAPIServer(port) {
 
     const doneRequest = perfMonitor.startRequest();
     try {
-      const json = await parseJsonBody(req, MAX_BODY_BYTES);
-      const response = await dispatchRoute(method, path, json, url.searchParams, headers);
+      let body, files = null;
+      const contentType = headers['content-type'] || '';
+      if (contentType.startsWith('multipart/form-data')) {
+        const parsed = await parseMultipart(req, MAX_FILE_UPLOAD_BYTES);
+        body = parsed.fields;
+        files = parsed.files;
+      } else {
+        body = await parseJsonBody(req, MAX_BODY_BYTES);
+      }
+
+      const response = await dispatchRoute(method, path, body, url.searchParams, headers, files);
+
+      // Binary file response (e.g. driver document file download)
+      if (response.raw) {
+        const disposition = `inline; filename="${response.filename || 'document'}"`;
+        res.writeHead(200, {
+          'Content-Type': response.contentType || 'application/octet-stream',
+          'Content-Disposition': disposition,
+          'Content-Length': response.buffer.length,
+        });
+        res.end(response.buffer);
+        doneRequest();
+        return;
+      }
+
       res.writeHead(response.status || 200);
       const indent = process.env.NODE_ENV === 'production' ? 0 : 2;
       res.end(JSON.stringify(response.data, null, indent));
