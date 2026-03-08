@@ -8,6 +8,8 @@ class ServiceIdentityRepository extends IdentityRepository {
   requestOtp(payload) { return this.identityService.requestOtp(payload); }
   verifyOtp(payload) { return this.identityService.verifyOtp(payload); }
   validateSession(token) { return this.identityService.validateSession(token); }
+  refreshSession(payload) { return this.identityService.refreshSession(payload); }
+  revokeSession(payload) { return this.identityService.revokeSession(payload); }
   getUsers(limit) { return this.identityService.getUsers(limit); }
   getStats() { return this.identityService.getStats(); }
 }

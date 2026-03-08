@@ -114,3 +114,60 @@ test('login sends welcome back push with profile name for existing user', async 
   assert.equal(sent[0].payload.data.route, 'home');
   assert.equal(response.data.data.user.name, 'Yogesh S');
 });
+
+test('logout revokes current session', async () => {
+  const router = buildRouter();
+  const revoked = [];
+
+  registerAuthRoutes(router, {
+    repositories: {
+      identity: {
+        revokeSession: async (payload) => {
+          revoked.push(payload);
+          return { success: true };
+        },
+      },
+    },
+    requireAuth: async () => ({
+      session: {
+        sessionToken: 'session-logout-1',
+      },
+    }),
+  });
+
+  const handler = router.handlers.get('POST /api/v1/auth/logout');
+  const response = await handler({
+    body: { refreshToken: 'refresh-logout-1' },
+    headers: { authorization: 'Bearer session-logout-1' },
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(revoked[0].sessionToken, 'session-logout-1');
+  assert.equal(revoked[0].refreshToken, 'refresh-logout-1');
+  assert.equal(revoked[0].logoutType, 'voluntary');
+});
+
+test('refresh token endpoint rate limits excessive attempts by IP', async () => {
+  const router = buildRouter();
+
+  registerAuthRoutes(router, {
+    repositories: {
+      identity: {
+        refreshSession: async () => ({ success: true, sessionToken: 'access-1', refreshToken: 'refresh-2', expiresInSec: 1800 }),
+      },
+    },
+  });
+
+  const handler = router.handlers.get('POST /api/v1/auth/refresh-token');
+  let response;
+  for (let i = 0; i < 21; i++) {
+    response = await handler({
+      body: { refreshToken: `refresh-${i}` },
+      headers: {},
+      ip: '203.0.113.10',
+    });
+  }
+
+  assert.equal(response.status, 429);
+  assert.equal(response.data.errorCode, 'REFRESH_RATE_LIMITED');
+});

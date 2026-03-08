@@ -120,6 +120,151 @@ test('contract: rider auth API shape request-otp -> login', async () => {
   assert.equal(loginRes.json.data?.user?.phone, combinedPhone.replace(/^\+/, ''));
 });
 
+test('contract: refresh token rotates tokens without forcing OTP login again', async () => {
+  const phone = '9000000001';
+  const countryCode = '+91';
+  const requestRes = await api('/api/v1/auth/request-otp', {
+    method: 'POST',
+    body: { phone, countryCode, channel: 'sms' },
+  });
+  const requestId = requestRes.json.data?.requestId;
+  const pending = identityService.otpByRequestId.get(requestId);
+  const otp = pending?.otpCode;
+
+  const loginRes = await api('/api/v1/auth/login', {
+    method: 'POST',
+    body: {
+      phone,
+      countryCode,
+      otp,
+      deviceId: 'android-refresh-1',
+      platform: 'android',
+      fcmToken: 'fcm_refresh_token',
+    },
+  });
+
+  assert.equal(loginRes.status, 200);
+  assert.ok(loginRes.json.data?.accessToken);
+  assert.ok(loginRes.json.data?.refreshToken);
+
+  const refreshRes = await api('/api/v1/auth/refresh-token', {
+    method: 'POST',
+    body: {
+      refreshToken: loginRes.json.data.refreshToken,
+      deviceId: 'android-refresh-1',
+      platform: 'android',
+    },
+  });
+
+  assert.equal(refreshRes.status, 200);
+  assert.ok(refreshRes.json.data?.accessToken);
+  assert.ok(refreshRes.json.data?.refreshToken);
+  assert.notEqual(
+    refreshRes.json.data.accessToken,
+    loginRes.json.data.accessToken,
+  );
+  assert.notEqual(
+    refreshRes.json.data.refreshToken,
+    loginRes.json.data.refreshToken,
+  );
+});
+
+test('contract: refresh token is rejected from a different device', async () => {
+  const phone = '9000000002';
+  const countryCode = '+91';
+  const requestRes = await api('/api/v1/auth/request-otp', {
+    method: 'POST',
+    body: { phone, countryCode, channel: 'sms' },
+  });
+  const requestId = requestRes.json.data?.requestId;
+  const pending = identityService.otpByRequestId.get(requestId);
+  const otp = pending?.otpCode;
+
+  const loginRes = await api('/api/v1/auth/login', {
+    method: 'POST',
+    body: {
+      phone,
+      countryCode,
+      otp,
+      deviceId: 'android-bound-1',
+      platform: 'android',
+      fcmToken: 'fcm_bound_token',
+    },
+  });
+
+  const refreshRes = await api('/api/v1/auth/refresh-token', {
+    method: 'POST',
+    body: {
+      refreshToken: loginRes.json.data.refreshToken,
+      deviceId: 'android-other-device',
+      platform: 'android',
+    },
+  });
+
+  assert.equal(refreshRes.status, 401);
+  assert.equal(refreshRes.json.success, false);
+  assert.equal(refreshRes.json.errorCode, 'INVALID_REFRESH_TOKEN');
+});
+
+test('contract: repeated suspicious refresh attempts revoke the refresh session', async () => {
+  const phone = '9000000003';
+  const countryCode = '+91';
+  const requestRes = await api('/api/v1/auth/request-otp', {
+    method: 'POST',
+    body: { phone, countryCode, channel: 'sms' },
+  });
+  const requestId = requestRes.json.data?.requestId;
+  const pending = identityService.otpByRequestId.get(requestId);
+  const otp = pending?.otpCode;
+
+  const loginRes = await api('/api/v1/auth/login', {
+    method: 'POST',
+    body: {
+      phone,
+      countryCode,
+      otp,
+      deviceId: 'android-bound-3',
+      platform: 'android',
+      fcmToken: 'fcm_bound_token_3',
+    },
+  });
+
+  for (let i = 0; i < 2; i++) {
+    const suspiciousRes = await api('/api/v1/auth/refresh-token', {
+      method: 'POST',
+      body: {
+        refreshToken: loginRes.json.data.refreshToken,
+        deviceId: 'android-attacker-device',
+        platform: 'android',
+      },
+    });
+    assert.equal(suspiciousRes.status, 401);
+    assert.equal(suspiciousRes.json.errorCode, 'INVALID_REFRESH_TOKEN');
+  }
+
+  const revokedRes = await api('/api/v1/auth/refresh-token', {
+    method: 'POST',
+    body: {
+      refreshToken: loginRes.json.data.refreshToken,
+      deviceId: 'android-attacker-device',
+      platform: 'android',
+    },
+  });
+  assert.equal(revokedRes.status, 401);
+  assert.equal(revokedRes.json.errorCode, 'REFRESH_TOKEN_REVOKED');
+
+  const legitimateRes = await api('/api/v1/auth/refresh-token', {
+    method: 'POST',
+    body: {
+      refreshToken: loginRes.json.data.refreshToken,
+      deviceId: 'android-bound-3',
+      platform: 'android',
+    },
+  });
+  assert.equal(legitimateRes.status, 401);
+  assert.equal(legitimateRes.json.errorCode, 'INVALID_REFRESH_TOKEN');
+});
+
 test('contract: ride request -> matched/driver arriving', async () => {
   const { verifyRes } = await createSessionToken('+919222222222');
   const sessionToken = verifyRes.json.sessionToken;

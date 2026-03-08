@@ -16,9 +16,13 @@ const pgRepo = USE_PG ? require('../repositories/pg/pg-identity-repository') : n
 // OTP rate limit constants (used in both modes)
 const OTP_RATE_WINDOW_MS = 10 * 60 * 1000;
 const OTP_RATE_MAX       = 5;
+const SUSPICIOUS_REFRESH_MAX = 3;
 
 // HMAC secret for OTP hashing. Must be non-empty in production.
 const OTP_SECRET = config.otp?.secret || '';
+const ACCESS_TOKEN_TTL_MS = config.security.sessionTtlMs;
+const REFRESH_TOKEN_TTL_MS = config.security.refreshTokenTtlMs;
+const TOKEN_HASH_SECRET = config.security.tokenHashSecret || OTP_SECRET;
 
 class IdentityService {
   constructor() {
@@ -28,7 +32,9 @@ class IdentityService {
     this.otpByRequestId  = new Map();
     this.otpIndexByPhone = new Map();
     this.sessions        = new Map();
+    this.refreshSessions = new Map();
     this.otpRateByPhone  = new Map();
+    this.suspiciousRefreshAttempts = new Map();
     this.seedMeta        = null;
   }
 
@@ -146,7 +152,7 @@ class IdentityService {
       await pgRepo.createOtpRequest({ requestId, phoneNumber: phone, otpCode: otpHash, otpType, channel, expiresAt });
     } else {
       const request = {
-        requestId, phoneNumber: phone, otpCode: otpHash, otpType, channel,
+        requestId, phoneNumber: phone, otpCode, otpHash, otpType, channel,
         status: 'pending', attempts: 0, maxAttempts: 3,
         createdAt: now, resendAt, expiresAt, verifiedAt: null,
       };
@@ -207,7 +213,6 @@ class IdentityService {
       }
       if (now > request.expiresAt) {
         await pgRepo.recordOtpAttempt(effectiveRequestId, 'expired', {
-          enteredCode: String(otpCode || ''),
           isCorrect: false,
           ipAddress,
         });
@@ -217,7 +222,6 @@ class IdentityService {
       if (request.otp_code !== this._hashOtp(String(otpCode || ''))) {
         const newStatus = (request.attempts + 1) >= request.max_attempts ? 'failed' : null;
         const updated   = await pgRepo.recordOtpAttempt(effectiveRequestId, newStatus, {
-          enteredCode: String(otpCode || ''),
           isCorrect: false,
           ipAddress,
         });
@@ -229,7 +233,9 @@ class IdentityService {
       const userId   = existing ? existing.id : crypto.randomUUID();
       const isNewUser = !existing;
       const sessionToken    = crypto.randomUUID();
-      const sessionExpiresAt = now + 24 * 3600 * 1000;
+      const refreshToken = this._generateToken();
+      const refreshTokenHash = this._hashToken(refreshToken);
+      const sessionExpiresAt = now + ACCESS_TOKEN_TTL_MS;
       const { user, deviceRecord } = await pgRepo.completeSuccessfulOtpLogin({
         requestId: effectiveRequestId,
         userId,
@@ -242,16 +248,19 @@ class IdentityService {
         osVersion,
         appVersion,
         ipAddress,
+        userAgent,
         sessionToken,
+        refreshTokenHash,
         sessionExpiresAt,
-        enteredCode: String(otpCode || ''),
       });
-      this.sessions.set(sessionToken, {
+      this._storeSession({
         sessionToken,
+        refreshToken,
         userId: user.id,
         phoneNumber: phone,
         createdAt: now,
         expiresAt: sessionExpiresAt,
+        refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
         deviceId: deviceRecord?.id || null,
       });
 
@@ -269,6 +278,8 @@ class IdentityService {
           createdAt:     user.createdAt,
         },
         sessionToken,
+        refreshToken,
+        expiresInSec: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
         deviceRecordId: deviceRecord?.id || null,
       };
     }
@@ -288,7 +299,7 @@ class IdentityService {
 
     request.attempts++;
     // Compare against stored hash, not plaintext
-    if (request.otpCode !== this._hashOtp(String(otpCode || ''))) {
+    if ((request.otpHash || this._hashOtp(String(request.otpCode || ''))) !== this._hashOtp(String(otpCode || ''))) {
       if (request.attempts >= request.maxAttempts) request.status = 'failed';
       return { success: false, error: 'invalid otp', attempts: request.attempts };
     }
@@ -316,16 +327,27 @@ class IdentityService {
     }
 
     const sessionToken = crypto.randomUUID();
-    this.sessions.set(sessionToken, {
+    const refreshToken = this._generateToken();
+    this._storeSession({
       sessionToken,
-      userId:      user.userId,
+      refreshToken,
+      userId: user.userId,
       phoneNumber: phone,
-      createdAt:   now,
-      expiresAt:   now + 24 * 3600 * 1000,
+      createdAt: now,
+      expiresAt: now + ACCESS_TOKEN_TTL_MS,
+      refreshExpiresAt: now + REFRESH_TOKEN_TTL_MS,
+      deviceId: deviceId || null,
     });
 
     eventBus.publish('otp_verified', { requestId: effectiveRequestId, userId: user.userId, phoneNumber: phone });
-    return { success: true, isNewUser, user, sessionToken };
+    return {
+      success: true,
+      isNewUser,
+      user,
+      sessionToken,
+      refreshToken,
+      expiresInSec: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+    };
   }
 
   // ─── Validate Session ─────────────────────────────────────────────────────
@@ -336,22 +358,245 @@ class IdentityService {
       const pgSession = await pgRepo.getSession(sessionToken);
       if (!pgSession) return null;
       const session = {
+        id: pgSession.id,
         sessionToken: pgSession.session_token,
+        refreshToken: null,
+        deviceId: pgSession.device_id || null,
         userId: pgSession.user_id,
         createdAt: pgSession.createdAt,
         expiresAt: pgSession.expiresAt,
+        refreshExpiresAt: pgSession.createdAt + REFRESH_TOKEN_TTL_MS,
       };
-      this.sessions.set(sessionToken, session);
+      this._storeSession(session);
       return session;
     }
 
     const session = this.sessions.get(sessionToken);
     if (!session) return null;
     if (Date.now() > session.expiresAt) {
-      this.sessions.delete(sessionToken);
+      this._deleteSession(session);
       return null;
     }
     return session;
+  }
+
+  async refreshSession({ refreshToken, deviceId = null, platform = null, ipAddress = null, userAgent = null }) {
+    if (!refreshToken) {
+      return { success: false, error: 'refresh token required' };
+    }
+
+    if (USE_PG) {
+      const currentSession = await pgRepo.getSessionByRefreshToken(
+        this._hashToken(refreshToken),
+        REFRESH_TOKEN_TTL_MS
+      );
+      if (!currentSession) {
+        return { success: false, error: 'invalid refresh token' };
+      }
+
+      const hasBoundDevice = Boolean(currentSession.deviceIdentifier);
+      const hasProvidedDevice = Boolean(deviceId);
+      const deviceMismatch =
+        hasBoundDevice && hasProvidedDevice && currentSession.deviceIdentifier !== deviceId;
+      const platformMismatch =
+        Boolean(currentSession.deviceType) &&
+        Boolean(platform) &&
+        currentSession.deviceType !== platform;
+      const ipChanged =
+        Boolean(currentSession.ipAddress) &&
+        Boolean(ipAddress) &&
+        currentSession.ipAddress !== ipAddress;
+      const userAgentChanged =
+        Boolean(currentSession.userAgent) &&
+        Boolean(userAgent) &&
+        currentSession.userAgent !== userAgent;
+
+      if (deviceMismatch || platformMismatch) {
+        const revoked = await this._recordSuspiciousRefreshAttempt({
+          refreshTokenHash: this._hashToken(refreshToken),
+          currentSession,
+          ipAddress,
+          deviceId,
+          platform,
+          reason: deviceMismatch ? 'device_mismatch' : 'platform_mismatch',
+        });
+        await pgRepo.logSecurityEvent({
+          userId: currentSession.user_id,
+          eventType: 'refresh_token_rejected',
+          eventDetail: {
+            reason: deviceMismatch ? 'device_mismatch' : 'platform_mismatch',
+            expectedDeviceId: currentSession.deviceIdentifier || null,
+            providedDeviceId: deviceId || null,
+            expectedPlatform: currentSession.deviceType || null,
+            providedPlatform: platform || null,
+            suspiciousAttempts: revoked.attempts,
+            sessionRevoked: revoked.revoked,
+          },
+          ipAddress,
+          deviceRecordId: currentSession.device_id || null,
+          riskLevel: 'high',
+        });
+        return {
+          success: false,
+          error: revoked.revoked
+            ? 'refresh token revoked due to suspicious activity'
+            : 'refresh token rejected for this device',
+        };
+      }
+
+      if (ipChanged || userAgentChanged) {
+        await pgRepo.logSecurityEvent({
+          userId: currentSession.user_id,
+          eventType: 'refresh_token_suspicious',
+          eventDetail: {
+            ipChanged,
+            userAgentChanged,
+            previousIpAddress: currentSession.ipAddress || null,
+            nextIpAddress: ipAddress || null,
+            previousUserAgent: currentSession.userAgent || null,
+            nextUserAgent: userAgent || null,
+          },
+          ipAddress,
+          deviceRecordId: currentSession.device_id || null,
+          riskLevel: 'medium',
+        });
+      }
+
+      const nextSessionToken = crypto.randomUUID();
+      const nextRefreshToken = this._generateToken();
+      const nextRefreshTokenHash = this._hashToken(nextRefreshToken);
+      const rotatedSession = await pgRepo.rotateSessionTokens({
+        currentRefreshTokenHash: this._hashToken(refreshToken),
+        nextSessionToken,
+        nextRefreshTokenHash,
+        accessExpiresAt: Date.now() + ACCESS_TOKEN_TTL_MS,
+        ipAddress,
+        userAgent,
+      });
+      if (!rotatedSession) {
+        return { success: false, error: 'invalid refresh token' };
+      }
+
+      await pgRepo.clearSuspiciousRefreshAttempts(this._hashToken(refreshToken));
+      await pgRepo.clearSuspiciousRefreshAttempts(nextRefreshTokenHash);
+      this._deleteSession(this.refreshSessions.get(refreshToken) || currentSession);
+      const session = {
+        id: rotatedSession.id,
+        sessionToken: rotatedSession.session_token,
+        refreshToken: nextRefreshToken,
+        deviceId: rotatedSession.device_id || null,
+        userId: rotatedSession.user_id,
+        createdAt: rotatedSession.createdAt,
+        expiresAt: rotatedSession.expiresAt,
+        refreshExpiresAt: rotatedSession.createdAt + REFRESH_TOKEN_TTL_MS,
+      };
+      this._storeSession(session);
+      return {
+        success: true,
+        sessionToken: session.sessionToken,
+        refreshToken: session.refreshToken,
+        expiresInSec: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+      };
+    }
+
+    const existingSession = this.refreshSessions.get(refreshToken);
+    if (!existingSession) {
+      return { success: false, error: 'invalid refresh token' };
+    }
+    if (Date.now() > existingSession.refreshExpiresAt) {
+      this._deleteSession(existingSession);
+      return { success: false, error: 'refresh token expired' };
+    }
+    if (existingSession.deviceId && deviceId && existingSession.deviceId !== deviceId) {
+      const refreshTokenHash = this._hashToken(refreshToken);
+      const attempts = (this.suspiciousRefreshAttempts.get(refreshTokenHash) || 0) + 1;
+      const revoked = attempts >= SUSPICIOUS_REFRESH_MAX;
+      this.suspiciousRefreshAttempts.set(refreshTokenHash, attempts);
+      if (revoked) {
+        this._deleteSession(existingSession);
+      }
+      return {
+        success: false,
+        error: revoked
+          ? 'refresh token revoked due to suspicious activity'
+          : 'refresh token rejected for this device',
+      };
+    }
+
+    this._deleteSession(existingSession);
+    const nextSession = {
+      ...existingSession,
+      sessionToken: crypto.randomUUID(),
+      refreshToken: this._generateToken(),
+      createdAt: Date.now(),
+      expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS,
+      refreshExpiresAt: Date.now() + REFRESH_TOKEN_TTL_MS,
+    };
+    this._storeSession(nextSession);
+    this.suspiciousRefreshAttempts.delete(this._hashToken(refreshToken));
+    this.suspiciousRefreshAttempts.delete(this._hashToken(nextSession.refreshToken));
+    return {
+      success: true,
+      sessionToken: nextSession.sessionToken,
+      refreshToken: nextSession.refreshToken,
+      expiresInSec: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+    };
+  }
+
+  async revokeSession({
+    sessionToken  = null,
+    refreshToken  = null,
+    ipAddress     = null,
+    userAgent     = null,
+    logoutType    = 'voluntary',
+  } = {}) {
+    if (USE_PG) {
+      if (sessionToken) {
+        const revoked = await pgRepo.revokeSession(sessionToken);
+        this._deleteSession(this.sessions.get(sessionToken));
+        if (revoked?.user_id) {
+          pgRepo.recordLogout({
+            userId:          revoked.user_id,
+            sessionId:       revoked.id,
+            sessionStartedAt: revoked.created_at,
+            deviceId:        revoked.device_id,
+            ipAddress,
+            userAgent,
+            logoutType,
+          }).catch(() => {});  // fire-and-forget — never block the response
+        }
+        return { success: true };
+      }
+      if (refreshToken) {
+        const revoked = await pgRepo.revokeSessionByRefreshToken(this._hashToken(refreshToken));
+        this._deleteSession(this.refreshSessions.get(refreshToken));
+        if (revoked?.user_id) {
+          pgRepo.recordLogout({
+            userId:          revoked.user_id,
+            sessionId:       revoked.id,
+            sessionStartedAt: revoked.created_at,
+            deviceId:        revoked.device_id,
+            ipAddress,
+            userAgent,
+            logoutType:      'token_revoked',
+          }).catch(() => {});
+        }
+        return { success: true };
+      }
+      return { success: false, error: 'session token or refresh token required' };
+    }
+
+    if (sessionToken) {
+      const session = this.sessions.get(sessionToken);
+      this._deleteSession(session);
+      return { success: true };
+    }
+    if (refreshToken) {
+      const session = this.refreshSessions.get(refreshToken);
+      this._deleteSession(session);
+      return { success: true };
+    }
+    return { success: false, error: 'session token or refresh token required' };
   }
 
   // ─── Read Methods ─────────────────────────────────────────────────────────
@@ -368,6 +613,7 @@ class IdentityService {
     return {
       users:    this.usersById.size,
       sessions: this.sessions.size,
+      refreshSessions: this.refreshSessions.size,
       otp: {
         total:    otpRows.length,
         pending:  otpRows.filter(r => r.status === 'pending').length,
@@ -390,6 +636,27 @@ class IdentityService {
     return String(crypto.randomInt(100000, 999999));
   }
 
+  _generateToken() {
+    return crypto.randomBytes(48).toString('base64url');
+  }
+
+  _storeSession(session) {
+    this.sessions.set(session.sessionToken, session);
+    if (session.refreshToken) {
+      this.refreshSessions.set(session.refreshToken, session);
+    }
+  }
+
+  _deleteSession(session) {
+    if (!session) return;
+    if (session.sessionToken) {
+      this.sessions.delete(session.sessionToken);
+    }
+    if (session.refreshToken) {
+      this.refreshSessions.delete(session.refreshToken);
+    }
+  }
+
   // HMAC-SHA256 hash of the OTP code using the server secret.
   // Stored in DB instead of plaintext so a DB dump doesn't expose live codes.
   _hashOtp(otpCode) {
@@ -398,6 +665,75 @@ class IdentityService {
       return String(otpCode);
     }
     return crypto.createHmac('sha256', OTP_SECRET).update(String(otpCode)).digest('hex');
+  }
+
+  _hashToken(token) {
+    if (!TOKEN_HASH_SECRET) {
+      return String(token || '');
+    }
+    return crypto
+      .createHmac('sha256', TOKEN_HASH_SECRET)
+      .update(String(token || ''))
+      .digest('hex');
+  }
+
+  async _recordSuspiciousRefreshAttempt({
+    refreshTokenHash,
+    currentSession,
+    ipAddress,
+    deviceId,
+    platform,
+    reason,
+  }) {
+    if (USE_PG) {
+      const result = await pgRepo.recordSuspiciousRefreshAttempt({
+        refreshTokenHash,
+        userId: currentSession.user_id,
+        deviceRecordId: currentSession.device_id || null,
+        reason,
+        maxAttempts: SUSPICIOUS_REFRESH_MAX,
+      });
+      if (result.revoked) {
+        await pgRepo.revokeSessionByRefreshToken(refreshTokenHash);
+        this._deleteSession(currentSession);
+        await pgRepo.logSecurityEvent({
+          userId: currentSession.user_id,
+          eventType: 'refresh_token_revoked',
+          eventDetail: {
+            reason,
+            suspiciousAttempts: result.attempts,
+            providedDeviceId: deviceId || null,
+            providedPlatform: platform || null,
+          },
+          ipAddress,
+          deviceRecordId: currentSession.device_id || null,
+          riskLevel: 'high',
+        });
+      }
+      return result;
+    }
+
+    const attempts = (this.suspiciousRefreshAttempts.get(refreshTokenHash) || 0) + 1;
+    const revoked = attempts >= SUSPICIOUS_REFRESH_MAX;
+    this.suspiciousRefreshAttempts.set(refreshTokenHash, attempts);
+    if (revoked) {
+      await pgRepo.revokeSessionByRefreshToken(refreshTokenHash);
+      this._deleteSession(this.refreshSessions.get(refreshTokenHash) || currentSession);
+      await pgRepo.logSecurityEvent({
+        userId: currentSession.user_id,
+        eventType: 'refresh_token_revoked',
+        eventDetail: {
+          reason,
+          suspiciousAttempts: attempts,
+          providedDeviceId: deviceId || null,
+          providedPlatform: platform || null,
+        },
+        ipAddress,
+        deviceRecordId: currentSession.device_id || null,
+        riskLevel: 'high',
+      });
+    }
+    return { attempts, revoked };
   }
 
   // Mask phone for logs: +91987***89

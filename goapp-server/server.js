@@ -460,12 +460,12 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path === '/api/v1/auth/otp/request' && method === 'POST') {
-    const result = identityService.requestOtp(body);
+    const result = await identityService.requestOtp(body);
     return { status: result.success ? 200 : 400, data: result };
   }
 
   if (path === '/api/v1/auth/otp/verify' && method === 'POST') {
-    const result = identityService.verifyOtp(body);
+    const result = await identityService.verifyOtp(body);
     return { status: result.success ? 200 : 400, data: result };
   }
 

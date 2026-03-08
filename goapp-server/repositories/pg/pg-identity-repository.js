@@ -1,7 +1,7 @@
 // PostgreSQL-backed Identity Repository
 // Tables: users, user_profiles, user_roles, user_status_history, user_security_logs,
 //         user_devices, user_sessions, user_login_history, user_preferences,
-//         otp_requests, otp_attempts, otp_rate_limits, push_tokens,
+//         refresh_token_security, otp_requests, otp_attempts, otp_rate_limits, push_tokens,
 //         riders, rider_profiles, rider_loyalty_points
 // Used by identity-service.js when DB_BACKEND=pg
 
@@ -92,7 +92,7 @@ class PgIdentityRepository {
 
   // Atomically increment attempts and optionally set a new status.
   // Also writes a row to otp_attempts for per-attempt audit trail.
-  async recordOtpAttempt(requestId, newStatus, { enteredCode = null, isCorrect = false, ipAddress = null } = {}) {
+  async recordOtpAttempt(requestId, newStatus, { isCorrect = false, ipAddress = null } = {}) {
     const client = await db.getClient();
     try {
       await client.query('BEGIN');
@@ -111,7 +111,7 @@ class PgIdentityRepository {
       await client.query(
         `INSERT INTO otp_attempts (otp_request_id, entered_code, is_correct, ip_address)
          VALUES ($1, $2, $3, $4)`,
-        [requestId, enteredCode || '***', isCorrect, ipAddress || null]
+        [requestId, '***', isCorrect, ipAddress || null]
       );
 
       await client.query('COMMIT');
@@ -349,9 +349,10 @@ class PgIdentityRepository {
     osVersion = null,
     appVersion = null,
     ipAddress,
+    userAgent = null,
     sessionToken,
+    refreshTokenHash,
     sessionExpiresAt,
-    enteredCode = null,
   }) {
     const client = await db.getClient();
     try {
@@ -370,7 +371,7 @@ class PgIdentityRepository {
       await client.query(
         `INSERT INTO otp_attempts (otp_request_id, entered_code, is_correct, ip_address)
          VALUES ($1, $2, true, $3)`,
-        [requestId, enteredCode || '***', ipAddress || null]
+        [requestId, '***', ipAddress || null]
       );
 
       const { rows: userRows } = await client.query(
@@ -497,10 +498,21 @@ class PgIdentityRepository {
       }
 
       await client.query(
-        `INSERT INTO user_sessions (user_id, device_id, session_token, is_active, expires_at)
-         VALUES ($1, $2, $3, true, $4)
+        `INSERT INTO user_sessions (
+           user_id, device_id, session_token, refresh_token,
+           ip_address, user_agent, is_active, expires_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, true, $7)
          ON CONFLICT (session_token) DO NOTHING`,
-        [user.id, deviceRecord?.id || null, sessionToken, new Date(sessionExpiresAt)]
+        [
+          user.id,
+          deviceRecord?.id || null,
+          sessionToken,
+          refreshTokenHash,
+          ipAddress || null,
+          userAgent || null,
+          new Date(sessionExpiresAt),
+        ]
       );
 
       await client.query(
@@ -554,12 +566,31 @@ class PgIdentityRepository {
 
   // ─── Sessions ─────────────────────────────────────────────────────────────
 
-  async createSession({ sessionToken, userId, expiresAt, deviceRecordId = null }) {
+  async createSession({
+    sessionToken,
+    refreshTokenHash = null,
+    userId,
+    expiresAt,
+    deviceRecordId = null,
+    ipAddress = null,
+    userAgent = null,
+  }) {
     await db.query(
-      `INSERT INTO user_sessions (user_id, device_id, session_token, is_active, expires_at)
-       VALUES ($1, $2, $3, true, $4)
+      `INSERT INTO user_sessions (
+         user_id, device_id, session_token, refresh_token,
+         ip_address, user_agent, is_active, expires_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, true, $7)
        ON CONFLICT (session_token) DO NOTHING`,
-      [userId, deviceRecordId, sessionToken, new Date(expiresAt)]
+      [
+        userId,
+        deviceRecordId,
+        sessionToken,
+        refreshTokenHash,
+        ipAddress,
+        userAgent,
+        new Date(expiresAt),
+      ]
     );
   }
 
@@ -625,24 +656,243 @@ class PgIdentityRepository {
 
   async getSession(sessionToken) {
     const { rows } = await db.query(
-      `SELECT session_token, user_id,
-              EXTRACT(EPOCH FROM expires_at) * 1000 AS "expiresAt",
-              EXTRACT(EPOCH FROM created_at) * 1000 AS "createdAt"
-       FROM user_sessions
-       WHERE session_token = $1
-         AND is_active = true
-         AND expires_at > NOW()`,
+      `SELECT us.id, us.session_token, us.refresh_token, us.device_id, us.user_id,
+              ud.device_id AS "deviceIdentifier",
+              ud.device_type AS "deviceType",
+              us.ip_address AS "ipAddress",
+              us.user_agent AS "userAgent",
+              EXTRACT(EPOCH FROM us.expires_at) * 1000 AS "expiresAt",
+              EXTRACT(EPOCH FROM us.created_at) * 1000 AS "createdAt"
+       FROM user_sessions us
+       LEFT JOIN user_devices ud ON ud.id = us.device_id
+       WHERE us.session_token = $1
+         AND us.is_active = true
+         AND us.expires_at > NOW()`,
       [sessionToken]
     );
     return rows[0] || null;
   }
 
+  async getSessionByRefreshToken(refreshTokenHash, refreshTokenTtlMs) {
+    const { rows } = await db.query(
+      `SELECT us.id, us.session_token, us.refresh_token, us.device_id, us.user_id,
+              ud.device_id AS "deviceIdentifier",
+              ud.device_type AS "deviceType",
+              us.ip_address AS "ipAddress",
+              us.user_agent AS "userAgent",
+              EXTRACT(EPOCH FROM us.expires_at) * 1000 AS "expiresAt",
+              EXTRACT(EPOCH FROM us.created_at) * 1000 AS "createdAt"
+       FROM user_sessions us
+       LEFT JOIN user_devices ud ON ud.id = us.device_id
+       WHERE us.refresh_token = $1
+         AND us.is_active = true
+         AND us.created_at > NOW() - ($2 * INTERVAL '1 millisecond')
+       LIMIT 1`,
+      [refreshTokenHash, refreshTokenTtlMs]
+    );
+    return rows[0] || null;
+  }
+
+  async rotateSessionTokens({
+    currentRefreshTokenHash,
+    nextSessionToken,
+    nextRefreshTokenHash,
+    accessExpiresAt,
+    ipAddress = null,
+    userAgent = null,
+  }) {
+    const { rows } = await db.query(
+      `UPDATE user_sessions
+       SET session_token = $2,
+           refresh_token = $3,
+           expires_at = $4,
+           ip_address = COALESCE($5, ip_address),
+           user_agent = COALESCE($6, user_agent),
+           created_at = NOW(),
+           revoked_at = NULL,
+           is_active = true
+       WHERE refresh_token = $1
+         AND is_active = true
+       RETURNING id, session_token, refresh_token, device_id, user_id,
+                 EXTRACT(EPOCH FROM expires_at) * 1000 AS "expiresAt",
+                 EXTRACT(EPOCH FROM created_at) * 1000 AS "createdAt"`,
+      [
+        currentRefreshTokenHash,
+        nextSessionToken,
+        nextRefreshTokenHash,
+        new Date(accessExpiresAt),
+        ipAddress,
+        userAgent,
+      ]
+    );
+    return rows[0] || null;
+  }
+
   async revokeSession(sessionToken) {
-    await db.query(
+    const { rows } = await db.query(
       `UPDATE user_sessions
        SET is_active = false, revoked_at = NOW()
-       WHERE session_token = $1`,
+       WHERE session_token = $1
+       RETURNING id, user_id, device_id, created_at`,
       [sessionToken]
+    );
+    return rows[0] || null;   // { id, user_id, device_id, created_at }
+  }
+
+  async revokeSessionByRefreshToken(refreshTokenHash) {
+    const { rows } = await db.query(
+      `UPDATE user_sessions
+       SET is_active = false, revoked_at = NOW()
+       WHERE refresh_token = $1
+       RETURNING id, user_id, device_id, created_at`,
+      [refreshTokenHash]
+    );
+    return rows[0] || null;
+  }
+
+  /**
+   * Writes one row to user_logout_logs.
+   * Checks for active rides / pending payments to record in the audit row.
+   */
+  async recordLogout({
+    userId,
+    sessionId      = null,
+    sessionStartedAt = null,
+    ipAddress      = null,
+    userAgent      = null,
+    deviceId       = null,
+    logoutType     = 'voluntary',
+  }) {
+    if (!userId) return;
+
+    // Duration in seconds
+    const durationSec = sessionStartedAt
+      ? Math.round((Date.now() - new Date(sessionStartedAt).getTime()) / 1000)
+      : null;
+
+    // Check for active ride
+    const { rows: rideRows } = await db.query(
+      `SELECT id FROM rides
+       WHERE rider_id = $1
+         AND status IN ('requested','accepted','in_progress','driver_assigned')
+       LIMIT 1`,
+      [userId]
+    ).catch(() => ({ rows: [] }));
+
+    // Check for pending wallet payment (hold transactions indicate an in-progress ride payment)
+    const { rows: payRows } = await db.query(
+      `SELECT wt.id FROM wallet_transactions wt
+       JOIN wallets w ON w.id = wt.wallet_id
+       WHERE w.user_id = $1 AND wt.transaction_type = 'hold'
+       LIMIT 1`,
+      [userId]
+    ).catch(() => ({ rows: [] }));
+
+    await db.query(
+      `INSERT INTO user_logout_logs
+         (user_id, session_id, logout_type, ip_address, user_agent,
+          device_id, session_started_at, session_duration_sec,
+          had_active_ride, had_pending_payment)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        userId,
+        sessionId,
+        logoutType,
+        ipAddress,
+        userAgent,
+        deviceId,
+        sessionStartedAt,
+        durationSec,
+        rideRows.length > 0,
+        payRows.length > 0,
+      ]
+    );
+
+    // Also write to user_security_logs for unified security audit trail
+    await db.query(
+      `INSERT INTO user_security_logs
+         (user_id, event_type, event_detail, ip_address, device_id, risk_level)
+       VALUES ($1, 'logout', $2, $3, $4, 'low')`,
+      [
+        userId,
+        JSON.stringify({
+          logout_type:          logoutType,
+          session_duration_sec: durationSec,
+          had_active_ride:      rideRows.length > 0,
+          had_pending_payment:  payRows.length > 0,
+        }),
+        ipAddress,
+        deviceId,
+      ]
+    );
+  }
+
+  async recordSuspiciousRefreshAttempt({
+    refreshTokenHash,
+    userId,
+    deviceRecordId = null,
+    reason = null,
+    maxAttempts = 3,
+  }) {
+    const { rows } = await db.query(
+      `INSERT INTO refresh_token_security (
+         refresh_token_hash, user_id, device_id, suspicious_attempt_count,
+         first_suspicious_at, last_suspicious_at, last_reason, revoked_at
+       )
+       VALUES ($1, $2, $3, 1, NOW(), NOW(), $4, NULL)
+       ON CONFLICT (refresh_token_hash)
+       DO UPDATE SET
+         suspicious_attempt_count = refresh_token_security.suspicious_attempt_count + 1,
+         last_suspicious_at = NOW(),
+         last_reason = EXCLUDED.last_reason
+       RETURNING suspicious_attempt_count AS attempts,
+                 revoked_at IS NOT NULL AS revoked`,
+      [refreshTokenHash, userId, deviceRecordId, reason]
+    );
+
+    const attempts = rows[0]?.attempts || 1;
+    const alreadyRevoked = Boolean(rows[0]?.revoked);
+    const shouldRevoke = alreadyRevoked || attempts >= maxAttempts;
+
+    if (shouldRevoke && !alreadyRevoked) {
+      await db.query(
+        `UPDATE refresh_token_security
+         SET revoked_at = NOW()
+         WHERE refresh_token_hash = $1`,
+        [refreshTokenHash]
+      );
+    }
+
+    return { attempts, revoked: shouldRevoke };
+  }
+
+  async clearSuspiciousRefreshAttempts(refreshTokenHash) {
+    await db.query(
+      `DELETE FROM refresh_token_security
+       WHERE refresh_token_hash = $1`,
+      [refreshTokenHash]
+    );
+  }
+
+  async logSecurityEvent({
+    userId,
+    eventType,
+    eventDetail = {},
+    ipAddress = null,
+    deviceRecordId = null,
+    riskLevel = 'medium',
+  }) {
+    await db.query(
+      `INSERT INTO user_security_logs (user_id, event_type, event_detail, ip_address, device_id, risk_level)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        userId,
+        eventType,
+        JSON.stringify(eventDetail || {}),
+        ipAddress,
+        deviceRecordId,
+        riskLevel,
+      ]
     );
   }
 
