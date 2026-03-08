@@ -3,6 +3,9 @@
 const IP_RATE_WINDOW_MS = 10 * 60 * 1000;
 const IP_RATE_MAX = 10;
 const ipRateMap = new Map();
+const REFRESH_RATE_WINDOW_MS = 10 * 60 * 1000;
+const REFRESH_RATE_MAX = 20;
+const refreshRateMap = new Map();
 
 function checkIpRateLimit(ip) {
   const key = ip || 'unknown';
@@ -17,10 +20,23 @@ function checkIpRateLimit(ip) {
   return true;
 }
 
+function checkRefreshRateLimit(ip) {
+  const key = ip || 'unknown';
+  const now = Date.now();
+  const record = refreshRateMap.get(key);
+  if (record && (now - record.windowStart) < REFRESH_RATE_WINDOW_MS) {
+    if (record.count >= REFRESH_RATE_MAX) return false;
+    record.count++;
+  } else {
+    refreshRateMap.set(key, { count: 1, windowStart: now });
+  }
+  return true;
+}
+
 const ALLOWED_CHANNELS = new Set(['sms', 'whatsapp', 'voice']);
 
 function registerAuthRoutes(router, ctx) {
-  const { repositories } = ctx;
+  const { repositories, requireAuth } = ctx;
   const notificationService = ctx.services?.notificationService;
   const OTP_EXPIRES_IN_SEC = 120;
 
@@ -64,13 +80,10 @@ function registerAuthRoutes(router, ctx) {
     profileName,
   }) {
     if (!notificationService || !userId) return;
-    // Delay gives the client time to receive the login response, request
-    // notification permission, and get it granted before the push arrives.
-    await new Promise((resolve) => setTimeout(resolve, 4000));
 
     if (isNewUser || !profileComplete) {
       await notificationService.send(userId, {
-        title: 'Welcome to GoApp! 🎉',
+        title: 'Welcome to GoApp',
         body: 'Complete your profile setup to get started.',
         data: {
           type: 'WELCOME_NEW_USER',
@@ -84,8 +97,8 @@ function registerAuthRoutes(router, ctx) {
 
     const displayName = profileName || 'there';
     await notificationService.send(userId, {
-      title: `Welcome back, ${displayName}! 👋`,
-      body: 'Welcome back to GoApp. Enjoy your journey!',
+      title: 'Welcome back to GoApp',
+      body: `Welcome back, ${displayName}.`,
       data: {
         type: 'WELCOME_BACK_USER',
         route: 'home',
@@ -171,16 +184,12 @@ function registerAuthRoutes(router, ctx) {
     const profile = await pgRepo.getUserProfile(userId).catch(() => null);
     const profileName = profile?.name || result.user.name || '';
 
-    // Fire-and-forget — do not block the login response on FCM latency
-    sendLoginWelcomeNotification({
+    await sendLoginWelcomeNotification({
       userId,
       isNewUser: result.isNewUser || false,
       profileComplete,
       profileName,
-    }).catch((err) => {
-      const { logger } = require('../utils/logger');
-      logger.error('FCM', `Welcome notification failed for ${userId}: ${err.message}`);
-    });
+    }).catch(() => {});
 
     return {
       status: 200,
@@ -189,6 +198,8 @@ function registerAuthRoutes(router, ctx) {
         message: 'Login successful',
         data: {
           accessToken: result.sessionToken,
+          refreshToken: result.refreshToken || '',
+          expiresInSec: result.expiresInSec || null,
           isNewUser: result.isNewUser || false,
           profileComplete,
           user: mapUserPayload(
@@ -196,6 +207,97 @@ function registerAuthRoutes(router, ctx) {
             phoneNumber,
           ),
         },
+      },
+    };
+  };
+
+  const refreshTokenHandler = async ({ body, headers, ip }) => {
+    if (!checkRefreshRateLimit(ip)) {
+      return {
+        status: 429,
+        data: {
+          success: false,
+          message: 'Too many refresh attempts from this IP. Please login again shortly.',
+          errorCode: 'REFRESH_RATE_LIMITED',
+        },
+      };
+    }
+
+    const refreshToken =
+      String(body?.refreshToken || headers?.['x-refresh-token'] || '').trim();
+    const result = await repositories.identity.refreshSession({
+      refreshToken,
+      deviceId: body?.deviceId || null,
+      platform: body?.platform || null,
+      ipAddress: headers?.['x-forwarded-for']?.split(',')[0]?.trim() || ip || null,
+      userAgent: headers?.['user-agent'] || null,
+    });
+
+    if (!result.success) {
+      const error = String(result.error || '').toLowerCase();
+      return {
+        status: error.includes('too many') ? 429 : 401,
+        data: {
+          success: false,
+          message: error.includes('suspicious')
+            ? 'Refresh token was revoked after repeated suspicious attempts. Please login again.'
+            : 'Refresh token is invalid, expired, or rejected for this device. Please login again.',
+          errorCode: error.includes('suspicious')
+            ? 'REFRESH_TOKEN_REVOKED'
+            : 'INVALID_REFRESH_TOKEN',
+        },
+      };
+    }
+
+    return {
+      status: 200,
+      data: {
+        success: true,
+        message: 'Token refreshed successfully',
+        data: {
+          accessToken: result.sessionToken,
+          refreshToken: result.refreshToken,
+          expiresInSec: result.expiresInSec,
+        },
+      },
+    };
+  };
+
+  const logoutHandler = async ({ body, headers, ip }) => {
+    const auth = requireAuth ? await requireAuth(headers || {}) : null;
+    const refreshToken =
+      String(body?.refreshToken || headers?.['x-refresh-token'] || '').trim();
+
+    if (auth?.error && !refreshToken) {
+      return auth.error;
+    }
+
+    const userAgent = String(headers?.['user-agent'] || '').slice(0, 512);
+
+    const result = await repositories.identity.revokeSession({
+      sessionToken: auth?.session?.sessionToken || null,
+      refreshToken: refreshToken || null,
+      ipAddress:    ip   || null,
+      userAgent:    userAgent || null,
+      logoutType:   'voluntary',
+    });
+
+    if (!result.success) {
+      return {
+        status: 400,
+        data: {
+          success: false,
+          message: 'Unable to logout session.',
+          errorCode: 'LOGOUT_FAILED',
+        },
+      };
+    }
+
+    return {
+      status: 200,
+      data: {
+        success: true,
+        message: 'Logout successful',
       },
     };
   };
@@ -255,10 +357,14 @@ function registerAuthRoutes(router, ctx) {
 
   router.register('POST', '/api/v1/auth/request-otp', requestOtpHandler);
   router.register('POST', '/api/v1/auth/login', loginHandler);
+  router.register('POST', '/api/v1/auth/refresh-token', refreshTokenHandler);
+  router.register('POST', '/api/v1/auth/logout', logoutHandler);
   router.register('POST', '/api/v1/auth/resend-otp', resendOtpHandler);
 
   router.register('POST', '/auth/request-otp', requestOtpHandler);
   router.register('POST', '/auth/login', loginHandler);
+  router.register('POST', '/auth/refresh-token', refreshTokenHandler);
+  router.register('POST', '/auth/logout', logoutHandler);
   router.register('POST', '/auth/resend-otp', resendOtpHandler);
 }
 

@@ -143,6 +143,19 @@ CREATE TABLE IF NOT EXISTS user_security_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_security_logs_user ON user_security_logs(user_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS refresh_token_security (
+    refresh_token_hash          VARCHAR(512) PRIMARY KEY,
+    user_id                     UUID NOT NULL REFERENCES users(id),
+    device_id                   UUID REFERENCES user_devices(id),
+    suspicious_attempt_count    INTEGER NOT NULL DEFAULT 0,
+    first_suspicious_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_suspicious_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_reason                 VARCHAR(50),
+    revoked_at                  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_refresh_token_security_user
+    ON refresh_token_security(user_id, last_suspicious_at DESC);
+
 -- ──────────────────────────────────────────────────────
 -- OTP Authentication Tables
 -- ──────────────────────────────────────────────────────

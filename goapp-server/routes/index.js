@@ -7,12 +7,14 @@ const registerFeedbackRoutes = require('./feedback-routes');
 const registerPaymentRoutes = require('./payment-routes');
 const registerDriverDocumentRoutes = require('./driver-document-routes');
 const registerProfileRoutes = require('./profile-routes');
+const registerSafetyRoutes  = require('./safety-routes');
 
 function buildRouteDispatcher(context, legacyHandler) {
   const router = new SimpleRouter();
   registerSystemRoutes(router, context);
   registerAuthRoutes(router, context);
   registerProfileRoutes(router, context);
+  registerSafetyRoutes(router, context);
   registerRideRoutes(router, context);
   registerWalletRoutes(router, context);
   registerFeedbackRoutes(router, context);

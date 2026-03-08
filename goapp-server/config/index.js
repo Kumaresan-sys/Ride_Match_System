@@ -135,7 +135,9 @@ module.exports = {
   security: {
     corsOrigin:   process.env.CORS_ORIGIN    || (IS_DEVELOPMENT ? '*' : ''),
     maxBodyBytes: parseInt(process.env.MAX_BODY_BYTES || String(256 * 1024), 10),
-    sessionTtlMs: parseInt(process.env.SESSION_TTL_MS || String(24 * 3600 * 1000), 10),
+    sessionTtlMs: parseInt(process.env.SESSION_TTL_MS || String(30 * 60 * 1000), 10),
+    refreshTokenTtlMs: parseInt(process.env.REFRESH_TOKEN_TTL_MS || String(60 * 24 * 3600 * 1000), 10),
+    tokenHashSecret: process.env.TOKEN_HASH_SECRET || (IS_DEVELOPMENT ? 'dev-token-hash-secret-change-me-in-prod' : ''),
   },
 
   firebase: {

@@ -1,6 +1,7 @@
 'use strict';
 
 const pgRepo = require('../repositories/pg/pg-identity-repository');
+const safetyRepo = require('../repositories/pg/pg-safety-repository');
 
 function formatMemberSince(createdAt) {
   if (createdAt === null || createdAt === undefined || createdAt === '') {
@@ -26,7 +27,10 @@ function formatMemberSince(createdAt) {
     return '';
   }
 
-  return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+  const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+  const month = months[date.getMonth()];
+  const year  = date.getFullYear();
+  return `${month} ${year}`;
 }
 
 function registerProfileRoutes(router, ctx) {
@@ -71,6 +75,7 @@ function registerProfileRoutes(router, ctx) {
     const [bonusResult, referralResult] = await Promise.all([
       pgRepo.awardWelcomeBonus(userId),
       pgRepo.generateOrGetReferralCode(userId),
+      safetyRepo.seedProfileEmergencyContact(userId, emergencyContact),
     ]);
 
     if (bonusResult.coinsAwarded > 0 && notificationService) {
