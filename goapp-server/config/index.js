@@ -138,6 +138,16 @@ module.exports = {
     sessionTtlMs: parseInt(process.env.SESSION_TTL_MS || String(30 * 60 * 1000), 10),
     refreshTokenTtlMs: parseInt(process.env.REFRESH_TOKEN_TTL_MS || String(60 * 24 * 3600 * 1000), 10),
     tokenHashSecret: process.env.TOKEN_HASH_SECRET || (IS_DEVELOPMENT ? 'dev-token-hash-secret-change-me-in-prod' : ''),
+    jwt: {
+      secret: process.env.JWT_SECRET || (IS_DEVELOPMENT ? 'dev-jwt-secret-change-me-in-prod' : ''),
+      issuer: process.env.JWT_ISSUER || 'goapp-server',
+      audience: process.env.JWT_AUDIENCE || 'goapp-mobile',
+    },
+    legacyAuth: {
+      deprecationDate: process.env.LEGACY_AUTH_DEPRECATION_DATE || '2026-04-01T00:00:00.000Z',
+      disableDate: process.env.LEGACY_AUTH_DISABLE_DATE || '2026-06-01T00:00:00.000Z',
+    },
+    wsAuthTimeoutMs: parseInt(process.env.WS_AUTH_TIMEOUT_MS || '10000', 10),
   },
 
   firebase: {

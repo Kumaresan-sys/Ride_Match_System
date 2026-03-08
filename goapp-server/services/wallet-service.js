@@ -83,6 +83,7 @@ class WalletService {
       await pgRepo._ensureWallet(userId);
       const balances = await pgRepo.adjustAndRecord(userId, { coinDelta: earned }, tx);
       eventBus.publish('coins_earned', { userId, coins: earned, rideId, balance: balances.coinBalance });
+      eventBus.publish('wallet_updated', { userId, reason: 'coins_earned' });
       logger.info('WALLET', `User ${userId} earned ${earned} coins (ride ${rideId})`);
       return { ...tx, txId: `TXN-EARN-${Date.now()}`, coinBalanceAfter: balances.coinBalance };
     }
@@ -92,6 +93,7 @@ class WalletService {
     const fullTx = { txId: `TXN-EARN-${Date.now()}`, ...tx, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance };
     this._recordTx(wallet, fullTx);
     eventBus.publish('coins_earned', { userId, coins: earned, rideId, balance: wallet.coinBalance });
+    eventBus.publish('wallet_updated', { userId, reason: 'coins_earned' });
     logger.info('WALLET', `User ${userId} earned ${earned} coins (ride ${rideId}). Coin balance: ${wallet.coinBalance}`);
     return fullTx;
   }
@@ -124,6 +126,7 @@ class WalletService {
     if (USE_PG) {
       const balances = await pgRepo.adjustAndRecord(userId, { coinDelta: -maxAllowed }, tx);
       eventBus.publish('coins_redeemed', { userId, coinsRedeemed: maxAllowed, discountInr, finalFare });
+      eventBus.publish('wallet_updated', { userId, reason: 'coins_redeemed' });
       logger.info('WALLET', `User ${userId} redeemed ${maxAllowed} coins → ₹${discountInr} off`);
       return { success: true, coinsRedeemed: maxAllowed, discountInr, originalFare: originalFareInr, finalFare, coinBalanceAfter: balances.coinBalance };
     }
@@ -132,6 +135,7 @@ class WalletService {
     const fullTx = { txId: `TXN-REDEEM-${Date.now()}`, ...tx, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance };
     this._recordTx(wallet, fullTx);
     eventBus.publish('coins_redeemed', { userId, coinsRedeemed: maxAllowed, discountInr, finalFare });
+    eventBus.publish('wallet_updated', { userId, reason: 'coins_redeemed' });
     logger.info('WALLET', `User ${userId} redeemed ${maxAllowed} coins → ₹${discountInr} off. Final fare: ₹${finalFare}`);
     return { success: true, coinsRedeemed: maxAllowed, discountInr, originalFare: originalFareInr, finalFare, coinBalanceAfter: wallet.coinBalance };
   }
@@ -147,6 +151,7 @@ class WalletService {
       await pgRepo._ensureWallet(userId);
       const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: amount }, tx);
       eventBus.publish('wallet_topup', { userId, amount, method, cashBalance: balances.cashBalance });
+      eventBus.publish('wallet_updated', { userId, reason: 'wallet_topup' });
       logger.info('WALLET', `User ${userId} topped up ₹${amount} via ${method}`);
       return { success: true, transaction: { txId: `TXN-TOPUP-${Date.now()}`, ...tx }, cashBalance: balances.cashBalance };
     }
@@ -156,6 +161,7 @@ class WalletService {
     const fullTx = { txId: `TXN-TOPUP-${Date.now()}`, ...tx, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance };
     this._recordTx(wallet, fullTx);
     eventBus.publish('wallet_topup', { userId, amount, method, cashBalance: wallet.cashBalance });
+    eventBus.publish('wallet_updated', { userId, reason: 'wallet_topup' });
     logger.info('WALLET', `User ${userId} topped up ₹${amount} via ${method}. Cash balance: ₹${wallet.cashBalance}`);
     return { success: true, transaction: fullTx, cashBalance: wallet.cashBalance };
   }
@@ -172,6 +178,7 @@ class WalletService {
       const tx = { type: 'ride_payment', amountInr: fareInr, rideId, createdAt: new Date().toISOString() };
       const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: -fareInr }, tx);
       eventBus.publish('wallet_payment', { userId, fareInr, rideId, cashBalance: balances.cashBalance });
+      eventBus.publish('wallet_updated', { userId, reason: 'wallet_payment' });
       logger.info('WALLET', `User ${userId} paid ₹${fareInr} for ride ${rideId}`);
       return { success: true, transaction: { txId: `TXN-PAY-${Date.now()}`, ...tx }, cashBalance: balances.cashBalance, amountPaid: fareInr };
     }
@@ -184,6 +191,7 @@ class WalletService {
     const fullTx = { txId: `TXN-PAY-${Date.now()}`, type: 'ride_payment', amountInr: fareInr, rideId, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance, createdAt: new Date().toISOString() };
     this._recordTx(wallet, fullTx);
     eventBus.publish('wallet_payment', { userId, fareInr, rideId, cashBalance: wallet.cashBalance });
+    eventBus.publish('wallet_updated', { userId, reason: 'wallet_payment' });
     logger.info('WALLET', `User ${userId} paid ₹${fareInr} for ride ${rideId} via wallet. Cash balance: ₹${wallet.cashBalance}`);
     return { success: true, transaction: fullTx, cashBalance: wallet.cashBalance, amountPaid: fareInr };
   }
@@ -198,6 +206,7 @@ class WalletService {
       await pgRepo._ensureWallet(userId);
       const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: amount }, tx);
       eventBus.publish('wallet_refund', { userId, amount, rideId, reason });
+      eventBus.publish('wallet_updated', { userId, reason: 'wallet_refund' });
       logger.info('WALLET', `Refunded ₹${amount} to user ${userId} wallet (${reason})`);
       return { success: true, transaction: { txId: `TXN-REFUND-${Date.now()}`, ...tx }, cashBalance: balances.cashBalance };
     }
@@ -207,6 +216,7 @@ class WalletService {
     const fullTx = { txId: `TXN-REFUND-${Date.now()}`, ...tx, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance };
     this._recordTx(wallet, fullTx);
     eventBus.publish('wallet_refund', { userId, amount, rideId, reason });
+    eventBus.publish('wallet_updated', { userId, reason: 'wallet_refund' });
     logger.info('WALLET', `Refunded ₹${amount} to user ${userId} wallet (${reason}). Cash balance: ₹${wallet.cashBalance}`);
     return { success: true, transaction: fullTx, cashBalance: wallet.cashBalance };
   }

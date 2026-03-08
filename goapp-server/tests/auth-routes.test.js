@@ -2,7 +2,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const registerAuthRoutes = require('../routes/auth-routes');
-const pgRepo = require('../repositories/pg/pg-identity-repository');
 
 function buildRouter() {
   const handlers = new Map();
@@ -17,11 +16,6 @@ function buildRouter() {
 test('login registers device token and sends profile setup push for new user', async () => {
   const router = buildRouter();
   const sent = [];
-  const originalIsProfileComplete = pgRepo.isProfileComplete;
-  const originalGetUserProfile = pgRepo.getUserProfile;
-
-  pgRepo.isProfileComplete = async () => false;
-  pgRepo.getUserProfile = async () => null;
 
   registerAuthRoutes(router, {
     repositories: {
@@ -33,6 +27,8 @@ test('login registers device token and sends profile setup push for new user', a
           deviceRecordId: 'device-row-1',
           user: { userId: 'user-1', phoneNumber: '+919876543210' },
         }),
+        isProfileComplete: async () => false,
+        getUserProfile: async () => null,
       },
     },
     services: {
@@ -55,9 +51,6 @@ test('login registers device token and sends profile setup push for new user', a
     },
   });
 
-  pgRepo.isProfileComplete = originalIsProfileComplete;
-  pgRepo.getUserProfile = originalGetUserProfile;
-
   assert.equal(response.status, 200);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].payload.title, 'Welcome to GoApp');
@@ -68,11 +61,6 @@ test('login registers device token and sends profile setup push for new user', a
 test('login sends welcome back push with profile name for existing user', async () => {
   const router = buildRouter();
   const sent = [];
-  const originalIsProfileComplete = pgRepo.isProfileComplete;
-  const originalGetUserProfile = pgRepo.getUserProfile;
-
-  pgRepo.isProfileComplete = async () => true;
-  pgRepo.getUserProfile = async () => ({ name: 'Yogesh S' });
 
   registerAuthRoutes(router, {
     repositories: {
@@ -83,6 +71,8 @@ test('login sends welcome back push with profile name for existing user', async 
           sessionToken: 'session-2',
           user: { userId: 'user-2', phoneNumber: '+919111111111' },
         }),
+        isProfileComplete: async () => true,
+        getUserProfile: async () => ({ name: 'Yogesh S' }),
       },
     },
     services: {
@@ -103,9 +93,6 @@ test('login sends welcome back push with profile name for existing user', async 
       otp: '123456',
     },
   });
-
-  pgRepo.isProfileComplete = originalIsProfileComplete;
-  pgRepo.getUserProfile = originalGetUserProfile;
 
   assert.equal(response.status, 200);
   assert.equal(sent.length, 1);
@@ -154,6 +141,7 @@ test('refresh token endpoint rate limits excessive attempts by IP', async () => 
     repositories: {
       identity: {
         refreshSession: async () => ({ success: true, sessionToken: 'access-1', refreshToken: 'refresh-2', expiresInSec: 1800 }),
+        validateSession: async () => ({ userId: 'user-1' }),
       },
     },
   });

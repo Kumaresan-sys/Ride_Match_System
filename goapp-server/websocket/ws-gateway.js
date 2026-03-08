@@ -8,10 +8,21 @@ const { logger } = require('../utils/logger');
 const MAGIC_STRING = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 class WebSocketServer {
-  constructor() {
+  constructor({ authenticateToken = null, canAccessRide = null, authTimeoutMs = 10000 } = {}) {
     this.clients = new Map();       // socketId -> { socket, channels, userId, userType }
     this.channels = new Map();      // channelName -> Set of socketIds
     this.server = null;
+    this.authenticateToken = authenticateToken;
+    this.canAccessRide = canAccessRide;
+    this.authTimeoutMs = Number.isFinite(authTimeoutMs) ? authTimeoutMs : 10000;
+    this.securityStats = {
+      authTimeoutDisconnects: 0,
+      unauthenticatedSubscribeDenied: 0,
+      channelDeniedTotal: 0,
+      channelDeniedByPattern: { rider: 0, driver: 0, ride: 0, other: 0 },
+      subscriptionsAccepted: 0,
+      subscriptionsDenied: 0,
+    };
   }
 
   start(port) {
@@ -60,17 +71,27 @@ class WebSocketServer {
       userId: null,
       userType: null,
       connectedAt: Date.now(),
+      authenticatedAt: null,
+      authTimeout: null,
     };
 
     this.clients.set(socketId, clientInfo);
     logger.info('WS-GATEWAY', `Client connected: ${socketId.substr(0, 8)}`);
+    clientInfo.authTimeout = setTimeout(() => {
+      const activeClient = this.clients.get(socketId);
+      if (!activeClient || activeClient.userId) return;
+      this.securityStats.authTimeoutDisconnects += 1;
+      logger.warn('WS-GATEWAY', `Auth timeout disconnect for socket ${socketId.substr(0, 8)} (${this.authTimeoutMs}ms)`);
+      this.sendToClient(socketId, { type: 'auth:error', error: 'Authentication timeout.', code: 'AUTH_TIMEOUT' });
+      try { activeClient.socket.destroy(); } catch (_) {}
+    }, this.authTimeoutMs);
 
     // Handle incoming frames
     socket.on('data', (buffer) => {
       try {
         const message = this._decodeFrame(buffer);
         if (message) {
-          this._handleMessage(socketId, message);
+          Promise.resolve(this._handleMessage(socketId, message)).catch(() => {});
         }
       } catch (e) {
         // ignore malformed frames
@@ -153,19 +174,37 @@ class WebSocketServer {
     return Buffer.concat([header, payload]);
   }
 
-  _handleMessage(socketId, message) {
+  async _handleMessage(socketId, message) {
     const client = this.clients.get(socketId);
     if (!client) return;
 
     switch (message.action) {
       case 'auth':
-        client.userId = message.userId;
-        client.userType = message.userType; // 'rider' or 'driver'
-        logger.info('WS-GATEWAY', `Authenticated: ${message.userType} ${message.userId}`);
+        {
+          const token = String(message.token || '').trim();
+          if (!token || !this.authenticateToken) {
+            this.sendToClient(socketId, { type: 'auth:error', error: 'Authentication token is required.' });
+            return;
+          }
+          const identity = await this.authenticateToken(token);
+          if (!identity?.userId) {
+            this.sendToClient(socketId, { type: 'auth:error', error: 'Invalid or expired auth token.' });
+            return;
+          }
+          client.userId = identity.userId;
+          client.userType = message.userType || 'rider';
+          client.authenticatedAt = Date.now();
+          if (client.authTimeout) {
+            clearTimeout(client.authTimeout);
+            client.authTimeout = null;
+          }
+          logger.info('WS-GATEWAY', `Authenticated socket ${socketId.substr(0, 8)} for user ${client.userId}`);
+          this.sendToClient(socketId, { type: 'auth:ok', userId: client.userId });
+        }
         break;
 
       case 'subscribe':
-        this._subscribe(socketId, message.channel);
+        this._subscribe(socketId, String(message.channel || '').trim());
         break;
 
       case 'unsubscribe':
@@ -174,6 +213,10 @@ class WebSocketServer {
 
       case 'driver:location':
         // Forward to location service via event
+        if (!client.userId) {
+          this.sendToClient(socketId, { type: 'auth:error', error: 'Authenticate before sending location updates.' });
+          return;
+        }
         if (this.onLocationUpdate) {
           this.onLocationUpdate(client.userId, message.data);
         }
@@ -203,30 +246,51 @@ class WebSocketServer {
   _subscribe(socketId, channel) {
     const client = this.clients.get(socketId);
     if (!client) return;
-
-    client.channels.add(channel);
-    if (!this.channels.has(channel)) {
-      this.channels.set(channel, new Set());
+    const normalizedChannel = this._normalizeChannelName(channel);
+    if (!client.userId) {
+      this.securityStats.unauthenticatedSubscribeDenied += 1;
+      this.securityStats.subscriptionsDenied += 1;
+      this.sendToClient(socketId, { type: 'subscribe:error', error: 'Authenticate before subscribing.', code: 'AUTH_REQUIRED' });
+      return;
     }
-    this.channels.get(channel).add(socketId);
-    logger.info('WS-GATEWAY', `${socketId.substr(0, 8)} subscribed to ${channel}`);
+    if (!this._isAuthorizedForChannel(client, normalizedChannel)) {
+      this._recordDeniedChannel(normalizedChannel);
+      this.securityStats.subscriptionsDenied += 1;
+      this._recordSubscriptionAudit(client, normalizedChannel, false);
+      this.sendToClient(socketId, { type: 'subscribe:error', error: `Forbidden channel subscription: ${normalizedChannel}`, code: 'FORBIDDEN_CHANNEL' });
+      return;
+    }
+
+    client.channels.add(normalizedChannel);
+    if (!this.channels.has(normalizedChannel)) {
+      this.channels.set(normalizedChannel, new Set());
+    }
+    this.channels.get(normalizedChannel).add(socketId);
+    this.securityStats.subscriptionsAccepted += 1;
+    this._recordSubscriptionAudit(client, normalizedChannel, true);
+    logger.info('WS-GATEWAY', `${socketId.substr(0, 8)} subscribed to ${normalizedChannel}`);
   }
 
   _unsubscribe(socketId, channel) {
     const client = this.clients.get(socketId);
     if (!client) return;
+    const normalizedChannel = this._normalizeChannelName(channel);
 
-    client.channels.delete(channel);
-    const ch = this.channels.get(channel);
+    client.channels.delete(normalizedChannel);
+    const ch = this.channels.get(normalizedChannel);
     if (ch) {
       ch.delete(socketId);
-      if (ch.size === 0) this.channels.delete(channel);
+      if (ch.size === 0) this.channels.delete(normalizedChannel);
     }
   }
 
   _handleDisconnect(socketId) {
     const client = this.clients.get(socketId);
     if (!client) return;
+    if (client.authTimeout) {
+      clearTimeout(client.authTimeout);
+      client.authTimeout = null;
+    }
 
     // Clean up channel subscriptions
     for (const channel of client.channels) {
@@ -244,19 +308,19 @@ class WebSocketServer {
   // ─── Reconnect Handler ───
 
   _handleReconnect(socketId, message) {
-    const { userId, userType, rideId } = message;
+    const { rideId } = message;
     const client = this.clients.get(socketId);
     if (!client || !rideId) return;
-
-    // Set identity
-    client.userId = userId;
-    client.userType = userType || 'rider';
+    if (!client.userId) {
+      this.sendToClient(socketId, { type: 'reconnect:error', error: 'Authenticate before reconnect.' });
+      return;
+    }
 
     // Subscribe to ride channel
-    const channel = `ride:${rideId}`;
+    const channel = `ride_${rideId}`;
     this._subscribe(socketId, channel);
 
-    logger.info('WS-GATEWAY', `Reconnect: ${userType} ${userId} → channel ${channel}`);
+    logger.info('WS-GATEWAY', `Reconnect: ${client.userId} → channel ${channel}`);
 
     // Acknowledge reconnect; full snapshot pushed by rideSessionService via HTTP /restore
     this.sendToClient(socketId, {
@@ -268,8 +332,53 @@ class WebSocketServer {
 
     // Log to rideSessionService if injected
     if (this.rideSessionService) {
-      this.rideSessionService.logWsReconnect(userId, rideId, null);
+      this.rideSessionService.logWsReconnect(client.userId, rideId, null);
     }
+  }
+
+  _isAuthorizedForChannel(client, channel) {
+    if (!channel) return false;
+    if (channel === `rider_${client.userId}`) return true;
+    if (channel === `driver_${client.userId}`) return true;
+    if (channel.startsWith('ride_')) {
+      const rideId = channel.slice('ride_'.length);
+      if (!rideId) return false;
+      if (typeof this.canAccessRide === 'function') {
+        return Boolean(this.canAccessRide(client.userId, rideId));
+      }
+      return false;
+    }
+    return false;
+  }
+
+  _normalizeChannelName(channel) {
+    const raw = String(channel || '').trim();
+    if (raw.startsWith('ride:')) {
+      const migrated = `ride_${raw.slice('ride:'.length)}`;
+      logger.warn('WS-GATEWAY', `Legacy WS channel "${raw}" normalized to "${migrated}"`);
+      return migrated;
+    }
+    return raw;
+  }
+
+  _recordDeniedChannel(channel) {
+    this.securityStats.channelDeniedTotal += 1;
+    const pattern = this._channelPattern(channel);
+    this.securityStats.channelDeniedByPattern[pattern] += 1;
+  }
+
+  _channelPattern(channel) {
+    if (String(channel).startsWith('rider_')) return 'rider';
+    if (String(channel).startsWith('driver_')) return 'driver';
+    if (String(channel).startsWith('ride_')) return 'ride';
+    return 'other';
+  }
+
+  _recordSubscriptionAudit(client, channel, allowed) {
+    logger.info(
+      'WS-AUDIT',
+      `subscribe user=${client.userId || 'anonymous'} type=${client.userType || 'unknown'} channel=${channel} allowed=${allowed ? 'true' : 'false'}`
+    );
   }
 
   // Push a full ride state snapshot to a single socket (called after /restore)
@@ -355,6 +464,7 @@ class WebSocketServer {
     return {
       totalClients: this.clients.size,
       totalChannels: this.channels.size,
+      security: this.securityStats,
       channels: Object.fromEntries(
         [...this.channels.entries()].map(([ch, subs]) => [ch, subs.size])
       ),

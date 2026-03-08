@@ -12,6 +12,8 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const rootDir = path.resolve(__dirname, '..');
 const envFile = path.resolve(rootDir, `.env.${NODE_ENV}`);
 const localEnvFile = path.resolve(rootDir, `.env.${NODE_ENV}.local`);
+const allowProdEnvFile = process.env.LOAD_ENV_FILE_IN_PROD === 'true';
+const shouldLoadEnvFile = NODE_ENV !== 'production' || allowProdEnvFile;
 
 function loadEnvFile(filePath, { override = false } = {}) {
   const result = dotenv.config({ path: filePath, override });
@@ -22,7 +24,9 @@ function loadEnvFile(filePath, { override = false } = {}) {
   console.log(`[env-loader] Loaded ${filePath}`);
 }
 
-if (!fs.existsSync(envFile)) {
+if (!shouldLoadEnvFile) {
+  console.log('[env-loader] Skipping env file load in production (LOAD_ENV_FILE_IN_PROD!=true).');
+} else if (!fs.existsSync(envFile)) {
   if (NODE_ENV !== 'development') {
     console.error(`[env-loader] FATAL: Required env file not found: ${envFile}`);
     console.error(`[env-loader] Copy .env.example to .env.${NODE_ENV} and fill in values.`);
@@ -33,7 +37,7 @@ if (!fs.existsSync(envFile)) {
   loadEnvFile(envFile);
 }
 
-if (fs.existsSync(localEnvFile)) {
+if (shouldLoadEnvFile && fs.existsSync(localEnvFile)) {
   loadEnvFile(localEnvFile, { override: true });
 }
 

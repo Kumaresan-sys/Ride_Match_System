@@ -12,6 +12,7 @@
 
 function registerPaymentRoutes(router, ctx) {
   const { services } = ctx;
+  const eventBus = ctx.eventBus;
   const razorpay       = services.razorpayService;
   const walletSvc      = services.walletService;
   const driverWalletSvc = services.driverWalletService;
@@ -81,6 +82,13 @@ function registerPaymentRoutes(router, ctx) {
       'razorpay',
       razorpayPaymentId,
     );
+    eventBus.publish('payment_processed', {
+      userId: verification.userId,
+      userType: 'rider',
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      amountInr: verification.amountInr,
+    });
 
     return {
       status: 200,
@@ -160,6 +168,13 @@ function registerPaymentRoutes(router, ctx) {
       'razorpay',
       razorpayPaymentId,
     );
+    eventBus.publish('payment_processed', {
+      userId: verification.userId,
+      userType: 'driver',
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      amountInr: verification.amountInr,
+    });
 
     // Check updated eligibility (driver needs ≥ ₹300 to receive rides)
     const eligibility = driverWalletSvc.canReceiveRide(verification.userId);

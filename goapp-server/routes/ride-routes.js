@@ -1,4 +1,9 @@
 const crypto = require('crypto');
+const { validateSchema } = require('./validation');
+
+const RIDE_RATE_WINDOW_MS = 60 * 1000;
+const RIDE_RATE_MAX = 20;
+const rideRateByKey = new Map();
 
 function registerRideRoutes(router, ctx) {
   const { services, repositories } = ctx;
@@ -20,16 +25,43 @@ function registerRideRoutes(router, ctx) {
     return !requireAdmin(headers);
   }
 
-  router.register('POST', '/api/v1/rides/request', async ({ body, headers }) => {
+  function checkRideRateLimit(key) {
+    const now = Date.now();
+    const k = key || 'unknown';
+    const rec = rideRateByKey.get(k);
+    if (rec && (now - rec.windowStart) < RIDE_RATE_WINDOW_MS) {
+      if (rec.count >= RIDE_RATE_MAX) return false;
+      rec.count += 1;
+      return true;
+    }
+    rideRateByKey.set(k, { count: 1, windowStart: now });
+    return true;
+  }
+
+  router.register('POST', '/api/v1/rides/request', async ({ body, headers, ip }) => {
     const auth = await authenticate(headers);
     if (auth.error) return auth.error;
-    if (!body.riderId) return { status: 400, data: { error: 'riderId is required' } };
-    if (body.riderId !== auth.session.userId) {
+    if (!checkRideRateLimit(`${ip || 'unknown'}:${auth.session.userId}`)) {
+      return { status: 429, data: { error: 'Rate limit exceeded for ride requests. Try again shortly.' } };
+    }
+
+    const parsed = validateSchema(body, [
+      { key: 'riderId', type: 'string', required: true },
+      { key: 'pickupLat', type: 'number', required: true, min: -90, max: 90 },
+      { key: 'pickupLng', type: 'number', required: true, min: -180, max: 180 },
+      { key: 'destLat', type: 'number', required: true, min: -90, max: 90 },
+      { key: 'destLng', type: 'number', required: true, min: -180, max: 180 },
+      { key: 'rideType', type: 'string', required: false, enum: ['mini', 'sedan', 'suv', 'premium', 'bike', 'auto'] },
+      { key: 'idempotencyKey', type: 'string', required: false, minLength: 8, maxLength: 128 },
+    ]);
+    if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
+
+    if (parsed.data.riderId !== auth.session.userId) {
       return { status: 403, data: { error: 'Forbidden: riderId must match authenticated user.' } };
     }
 
-    const pickupLat = parseFloat(body.pickupLat);
-    const pickupLng = parseFloat(body.pickupLng);
+    const pickupLat = parsed.data.pickupLat;
+    const pickupLng = parsed.data.pickupLng;
 
     if (Number.isFinite(pickupLat) && Number.isFinite(pickupLng)) {
       const zoneCheck = services.zoneService.checkPickup(pickupLat, pickupLng);
@@ -39,17 +71,17 @@ function registerRideRoutes(router, ctx) {
     }
 
     let coinRedemptionPreview = null;
-    if (body.useCoins && body.riderId) {
+    if (body.useCoins && parsed.data.riderId) {
       const estimates = await services.pricingService.getEstimates(
         pickupLat,
         pickupLng,
-        parseFloat(body.destLat),
-        parseFloat(body.destLng)
+        parsed.data.destLat,
+        parsed.data.destLng
       );
-      const rideType = body.rideType || 'sedan';
+      const rideType = parsed.data.rideType || 'sedan';
       const estimatedFare = estimates.estimates[rideType]?.finalFare;
       if (estimatedFare) {
-        const balance = await repositories.wallet.getBalance(body.riderId);
+        const balance = await repositories.wallet.getBalance(parsed.data.riderId);
         coinRedemptionPreview = {
           coinsAvailable: balance.coinBalance,
           maxDiscountInr: Math.round(Math.min(balance.coinBalance, Math.floor(estimatedFare * 0.20 / 0.10)) * 0.10 * 100) / 100,
@@ -64,7 +96,8 @@ function registerRideRoutes(router, ctx) {
 
     const result = await repositories.ride.createRide({
       ...body,
-      idempotencyKey: body.idempotencyKey || crypto.randomUUID(),
+      ...parsed.data,
+      idempotencyKey: parsed.data.idempotencyKey || crypto.randomUUID(),
     });
 
     if (coinRedemptionPreview) result.coinRedemptionPreview = coinRedemptionPreview;

@@ -12,6 +12,8 @@ class ServiceIdentityRepository extends IdentityRepository {
   revokeSession(payload) { return this.identityService.revokeSession(payload); }
   getUsers(limit) { return this.identityService.getUsers(limit); }
   getStats() { return this.identityService.getStats(); }
+  isProfileComplete(userId) { return this.identityService.isProfileComplete(userId); }
+  getUserProfile(userId) { return this.identityService.getUserProfile(userId); }
 }
 
 class ServiceRideRepository extends RideRepository {

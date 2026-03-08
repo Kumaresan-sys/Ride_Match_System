@@ -16,6 +16,24 @@ function validateConfig({ strict = false } = {}) {
     if (!isDevelopment || strict) errors.push(msg); else warnings.push(msg);
   }
 
+  if (!config.security?.jwt?.secret || config.security.jwt.secret === 'dev-jwt-secret-change-me-in-prod') {
+    const msg = 'JWT_SECRET is using the default dev value. Set a strong random secret for production.';
+    if (!isDevelopment || strict) errors.push(msg); else warnings.push(msg);
+  }
+
+  if (Number.isNaN(Date.parse(config.security?.legacyAuth?.deprecationDate || ''))) {
+    errors.push('LEGACY_AUTH_DEPRECATION_DATE must be a valid ISO-8601 date.');
+  }
+  if (Number.isNaN(Date.parse(config.security?.legacyAuth?.disableDate || ''))) {
+    errors.push('LEGACY_AUTH_DISABLE_DATE must be a valid ISO-8601 date.');
+  }
+  if (process.env.LEGACY_HANDLER_ENABLED != null) {
+    warnings.push('LEGACY_HANDLER_ENABLED is deprecated and has no effect.');
+  }
+  if (!Number.isFinite(config.security?.wsAuthTimeoutMs) || config.security.wsAuthTimeoutMs < 1000) {
+    errors.push('WS_AUTH_TIMEOUT_MS must be a number >= 1000.');
+  }
+
   if ((!isDevelopment || strict) && (!config.security.corsOrigin || config.security.corsOrigin === '*')) {
     errors.push('CORS_ORIGIN must be explicitly set outside development.');
   }
