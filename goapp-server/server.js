@@ -147,6 +147,7 @@ function startAPIServer(port) {
       perfMonitor,
       razorpayService,
       driverDocumentService,
+      notificationService,
     },
   }, handleLegacyRoute);
 
@@ -789,14 +790,29 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   const tokenRegMatch = path.match(/^\/api\/v1\/users\/(.+)\/device-token$/);
   if (tokenRegMatch && method === 'POST') {
     const userId = tokenRegMatch[1];
-    const result = notificationService.registerToken(userId, body.token, body.platform);
+    let deviceRecord = null;
+    if (config.db.backend === 'pg') {
+      const pgIdentityRepo = require('./repositories/pg/pg-identity-repository');
+      deviceRecord = await pgIdentityRepo.upsertUserDevice({
+        userId,
+        deviceId: body.deviceId,
+        platform: body.platform,
+        fcmToken: body.token,
+      });
+    }
+    const result = await notificationService.registerToken(
+      userId,
+      body.token,
+      body.platform,
+      deviceRecord?.id || null,
+    );
     return { status: result.success ? 200 : 400, data: result };
   }
 
   // DELETE /api/v1/users/:id/device-token
   const tokenDelMatch = path.match(/^\/api\/v1\/users\/(.+)\/device-token$/);
   if (tokenDelMatch && method === 'DELETE') {
-    notificationService.removeToken(tokenDelMatch[1]);
+    await notificationService.removeToken(tokenDelMatch[1]);
     return { data: { success: true } };
   }
 
@@ -1587,7 +1603,8 @@ async function assertPgSchemaReady() {
 }
 
 async function main() {
-  const configCheck = validateConfig({ strict: process.env.CONFIG_STRICT === 'true' });
+  const strictConfig = process.env.CONFIG_STRICT === 'true' || process.env.NODE_ENV !== 'development';
+  const configCheck = validateConfig({ strict: strictConfig });
   configCheck.warnings.forEach(msg => logger.warn('CONFIG', msg));
   if (!configCheck.ok) {
     throw new Error(`Config validation failed: ${configCheck.errors.join(' | ')}`);

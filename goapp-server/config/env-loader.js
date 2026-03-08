@@ -9,7 +9,18 @@ const fs     = require('fs');
 const dotenv = require('dotenv');
 
 const NODE_ENV = process.env.NODE_ENV || 'development';
-const envFile  = path.resolve(__dirname, '..', `.env.${NODE_ENV}`);
+const rootDir = path.resolve(__dirname, '..');
+const envFile = path.resolve(rootDir, `.env.${NODE_ENV}`);
+const localEnvFile = path.resolve(rootDir, `.env.${NODE_ENV}.local`);
+
+function loadEnvFile(filePath, { override = false } = {}) {
+  const result = dotenv.config({ path: filePath, override });
+  if (result.error) {
+    console.error('[env-loader] Failed to parse env file:', result.error.message);
+    process.exit(1);
+  }
+  console.log(`[env-loader] Loaded ${filePath}`);
+}
 
 if (!fs.existsSync(envFile)) {
   if (NODE_ENV !== 'development') {
@@ -19,12 +30,11 @@ if (!fs.existsSync(envFile)) {
   }
   console.warn(`[env-loader] WARNING: ${envFile} not found — booting with defaults (mock DB + mock Redis)`);
 } else {
-  const result = dotenv.config({ path: envFile });
-  if (result.error) {
-    console.error('[env-loader] Failed to parse env file:', result.error.message);
-    process.exit(1);
-  }
-  console.log(`[env-loader] Loaded ${envFile}`);
+  loadEnvFile(envFile);
+}
+
+if (fs.existsSync(localEnvFile)) {
+  loadEnvFile(localEnvFile, { override: true });
 }
 
 // Ensure NODE_ENV is always explicitly set for downstream modules

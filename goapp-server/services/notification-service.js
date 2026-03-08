@@ -5,12 +5,19 @@
 // If not configured, notifications are silently skipped (service degrades gracefully).
 
 const config = require('../config');
+const db = require('./db');
 const { logger } = require('../utils/logger');
+const USE_PG = config.db.backend === 'pg';
+const ALLOWED_PLATFORMS = new Set(['ios', 'android', 'web']);
+
+const TOKEN_CACHE_TTL_MS = 30_000; // re-fetch from DB at most every 30 s per user
 
 class NotificationService {
   constructor() {
-    // userId -> { token, platform, updatedAt }
+    // `${userId}:${token}` -> { userId, token, platform, updatedAt }
     this.deviceTokens = new Map();
+    // userId -> timestamp of last DB fetch
+    this._cacheTimestamps = new Map();
     this.initialized = false;
     this.admin = null;
     this._init();
@@ -49,65 +56,98 @@ class NotificationService {
   }
 
   // ─── Device Token Registry ────────────────────────────────────────────────
-  registerToken(userId, token, platform = 'unknown') {
+  async registerToken(userId, token, platform = 'unknown', deviceRecordId = null) {
     if (!token) return { success: false, error: 'token is required' };
-    this.deviceTokens.set(userId, { token, platform, updatedAt: Date.now() });
-    logger.info('FCM', `Registered token for user ${userId} (${platform})`);
-    return { success: true, userId, platform };
+    const normalizedPlatform = ALLOWED_PLATFORMS.has(platform) ? platform : 'web';
+
+    if (USE_PG) {
+      await db.query(
+        `INSERT INTO push_tokens (user_id, device_id, platform, token, is_active, updated_at)
+         VALUES ($1, $2, $3, $4, true, NOW())
+         ON CONFLICT (token)
+         DO UPDATE SET user_id = EXCLUDED.user_id,
+                       device_id = EXCLUDED.device_id,
+                       platform = EXCLUDED.platform,
+                       is_active = true,
+                       updated_at = NOW()`,
+        [userId, deviceRecordId, normalizedPlatform, token]
+      );
+    }
+
+    this.deviceTokens.set(`${userId}:${token}`, {
+      userId,
+      token,
+      platform: normalizedPlatform,
+      updatedAt: Date.now(),
+    });
+    // Invalidate TTL so next send re-reads the full device list from DB
+    this._cacheTimestamps.delete(userId);
+    logger.info('FCM', `Registered token for user ${userId} (${normalizedPlatform})`);
+    return { success: true, userId, platform: normalizedPlatform };
   }
 
-  removeToken(userId) {
-    this.deviceTokens.delete(userId);
+  async removeToken(userId) {
+    if (USE_PG) {
+      await db.query(
+        `UPDATE push_tokens
+         SET is_active = false, updated_at = NOW()
+         WHERE user_id = $1`,
+        [userId]
+      );
+    }
+
+    for (const key of [...this.deviceTokens.keys()]) {
+      if (key.startsWith(`${userId}:`)) {
+        this.deviceTokens.delete(key);
+      }
+    }
+    this._cacheTimestamps.delete(userId);
   }
 
   // ─── Core send ────────────────────────────────────────────────────────────
-  async send(userId, { title, body, data = {} }) {
+  async send(userId, { title, body, data = {}, channelId = 'goapp_rides' }) {
     if (!this.initialized) {
       logger.info('FCM', `[SKIP — not initialised] ${userId}: "${title}"`);
       return { sent: false, reason: 'not_initialized' };
     }
 
-    const device = this.deviceTokens.get(userId);
-    if (!device) {
+    const devices = await this._getDevicesForUser(userId);
+    if (devices.length === 0) {
       logger.info('FCM', `[SKIP — no token] ${userId}: "${title}"`);
       return { sent: false, reason: 'no_token' };
     }
 
-    // FCM requires all data values to be strings
-    const stringData = Object.fromEntries(
-      Object.entries(data).map(([k, v]) => [k, String(v)])
+    const stringData = this._stringifyData(data);
+
+    const results = await Promise.all(
+      devices.map(async (device) => {
+        try {
+          const resolvedChannelId = data.channelId || channelId;
+          const messageId = await this.admin.messaging().send({
+            token: device.token,
+            notification: { title, body },
+            data: stringData,
+            android: {
+              priority: 'high',
+              notification: { sound: 'default', channelId: resolvedChannelId },
+            },
+            apns: {
+              payload: { aps: { sound: 'default', badge: 1 } },
+            },
+          });
+          logger.info('FCM', `✓ Sent to ${userId} (${device.platform}): "${title}" [${messageId}]`);
+          return messageId;
+        } catch (err) {
+          await this._handleSendError(userId, device.token, err);
+          return null;
+        }
+      })
     );
 
-    const message = {
-      token: device.token,
-      notification: { title, body },
-      data: stringData,
-      android: {
-        priority: 'high',
-        notification: { sound: 'default', channelId: 'goapp_rides' },
-      },
-      apns: {
-        payload: { aps: { sound: 'default', badge: 1 } },
-      },
-    };
-
-    try {
-      const messageId = await this.admin.messaging().send(message);
-      logger.info('FCM', `✓ Sent to ${userId} (${device.platform}): "${title}" [${messageId}]`);
-      return { sent: true, messageId };
-    } catch (err) {
-      // Stale / unregistered token — clean up automatically
-      if (
-        err.code === 'messaging/registration-token-not-registered' ||
-        err.code === 'messaging/invalid-registration-token'
-      ) {
-        logger.warn('FCM', `Removed stale token for ${userId}`);
-        this.removeToken(userId);
-      } else {
-        logger.error('FCM', `Failed to send to ${userId}: ${err.message}`);
-      }
-      return { sent: false, reason: err.message };
-    }
+    const messageIds = results.filter(Boolean);
+    return messageIds.length > 0
+      ? { sent: true, messageIds, delivered: messageIds.length }
+      : { sent: false, reason: 'all_tokens_failed' };
   }
 
   // ─── Ride lifecycle notifications ─────────────────────────────────────────
@@ -154,7 +194,8 @@ class NotificationService {
       data: { type: 'TRIP_STARTED', rideId },
     });
     // Also send a silent/data-only push so the app can recover if killed during the trip
-    this.sendSilent(riderId, { type: 'TRIP_STARTED', rideId, silent: 'true' });
+    this.sendSilent(riderId, { type: 'TRIP_STARTED', rideId, silent: 'true' })
+      .catch((err) => logger.error('FCM', `Silent TRIP_STARTED failed for ${riderId}: ${err.message}`));
   }
 
   /** Trip completed — notify both rider and driver */
@@ -237,46 +278,123 @@ class NotificationService {
       return { sent: false, reason: 'not_initialized' };
     }
 
-    const device = this.deviceTokens.get(userId);
-    if (!device) {
+    const devices = await this._getDevicesForUser(userId);
+    if (devices.length === 0) {
       logger.info('FCM', `[SKIP — no token] silent push to ${userId}`);
       return { sent: false, reason: 'no_token' };
     }
 
-    const stringData = Object.fromEntries(
-      Object.entries(data).map(([k, v]) => [k, String(v)])
+    const stringData = this._stringifyData(data);
+
+    const results = await Promise.all(
+      devices.map(async (device) => {
+        try {
+          const messageId = await this.admin.messaging().send({
+            token: device.token,
+            data: stringData,
+            android: { priority: 'high' },
+            apns: {
+              headers: { 'apns-push-type': 'background', 'apns-priority': '5' },
+              payload: { aps: { 'content-available': 1 } },
+            },
+          });
+          logger.info('FCM', `✓ Silent push to ${userId} (${device.platform}) [${messageId}]`);
+          return messageId;
+        } catch (err) {
+          await this._handleSendError(userId, device.token, err);
+          return null;
+        }
+      })
     );
 
-    // No "notification" block — data-only message wakes app silently
-    const message = {
-      token: device.token,
-      data: stringData,
-      android: { priority: 'high' },
-      apns: {
-        headers: { 'apns-push-type': 'background', 'apns-priority': '5' },
-        payload: { aps: { 'content-available': 1 } },
-      },
-    };
-
-    try {
-      const messageId = await this.admin.messaging().send(message);
-      logger.info('FCM', `✓ Silent push to ${userId} (${device.platform}) [${messageId}]`);
-      return { sent: true, messageId };
-    } catch (err) {
-      logger.warn('FCM', `Silent push failed for ${userId}: ${err.message}`);
-      return { sent: false, error: err.message };
-    }
+    const messageIds = results.filter(Boolean);
+    return messageIds.length > 0
+      ? { sent: true, messageIds, delivered: messageIds.length }
+      : { sent: false, reason: 'all_tokens_failed' };
   }
 
   getStats() {
     return {
       initialized: this.initialized,
       registeredTokens: this.deviceTokens.size,
-      tokens: [...this.deviceTokens.entries()].map(([userId, d]) => ({
-        userId, platform: d.platform,
+      storage: USE_PG ? 'pg+memory-cache' : 'memory',
+      tokens: [...this.deviceTokens.values()].map((d) => ({
+        userId: d.userId, platform: d.platform,
         updatedAt: new Date(d.updatedAt).toISOString(),
       })),
     };
+  }
+
+  async _getDevicesForUser(userId) {
+    if (USE_PG) {
+      const lastFetch = this._cacheTimestamps.get(userId) || 0;
+      const cacheStale = (Date.now() - lastFetch) > TOKEN_CACHE_TTL_MS;
+
+      if (cacheStale) {
+        // Refresh from DB and populate the in-memory cache
+        const { rows } = await db.query(
+          `SELECT token, platform
+           FROM push_tokens
+           WHERE user_id = $1
+             AND is_active = true
+           ORDER BY updated_at DESC`,
+          [userId]
+        );
+
+        // Clear stale entries for this user before repopulating
+        for (const key of this.deviceTokens.keys()) {
+          if (key.startsWith(`${userId}:`)) this.deviceTokens.delete(key);
+        }
+        rows.forEach((row) => {
+          this.deviceTokens.set(`${userId}:${row.token}`, {
+            userId,
+            token: row.token,
+            platform: row.platform,
+            updatedAt: Date.now(),
+          });
+        });
+        this._cacheTimestamps.set(userId, Date.now());
+      }
+    }
+
+    // Serve from in-memory cache (for both PG and non-PG backends)
+    return [...this.deviceTokens.values()].filter((d) => d.userId === userId);
+  }
+
+  _stringifyData(data = {}) {
+    return Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [k, String(v)])
+    );
+  }
+
+  async _handleSendError(userId, token, err) {
+    if (
+      err.code === 'messaging/registration-token-not-registered' ||
+      err.code === 'messaging/invalid-registration-token'
+    ) {
+      logger.warn('FCM', `Removed stale token for ${userId}`);
+      await this._deactivateToken(token);
+      return;
+    }
+
+    logger.error('FCM', `Failed to send to ${userId}: ${err.message}`);
+  }
+
+  async _deactivateToken(token) {
+    if (USE_PG) {
+      await db.query(
+        `UPDATE push_tokens
+         SET is_active = false, updated_at = NOW()
+         WHERE token = $1`,
+        [token]
+      );
+    }
+
+    for (const [key, value] of this.deviceTokens.entries()) {
+      if (value.token === token) {
+        this.deviceTokens.delete(key);
+      }
+    }
   }
 }
 

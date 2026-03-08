@@ -21,6 +21,7 @@ const ALLOWED_CHANNELS = new Set(['sms', 'whatsapp', 'voice']);
 
 function registerAuthRoutes(router, ctx) {
   const { repositories } = ctx;
+  const notificationService = ctx.services?.notificationService;
   const OTP_EXPIRES_IN_SEC = 120;
 
   function normalizePhonePayload(body = {}) {
@@ -54,6 +55,45 @@ function registerAuthRoutes(router, ctx) {
       phone: (phone || user.phoneNumber || '').replace(/^\+/, ''),
       email: user.email || '',
     };
+  }
+
+  async function sendLoginWelcomeNotification({
+    userId,
+    isNewUser,
+    profileComplete,
+    profileName,
+  }) {
+    if (!notificationService || !userId) return;
+    // Delay gives the client time to receive the login response, request
+    // notification permission, and get it granted before the push arrives.
+    await new Promise((resolve) => setTimeout(resolve, 4000));
+
+    if (isNewUser || !profileComplete) {
+      await notificationService.send(userId, {
+        title: 'Welcome to GoApp! 🎉',
+        body: 'Complete your profile setup to get started.',
+        data: {
+          type: 'WELCOME_NEW_USER',
+          route: 'profile_setup',
+          userStatus: 'new',
+          channelId: 'goapp_auth',
+        },
+      });
+      return;
+    }
+
+    const displayName = profileName || 'there';
+    await notificationService.send(userId, {
+      title: `Welcome back, ${displayName}! 👋`,
+      body: 'Welcome back to GoApp. Enjoy your journey!',
+      data: {
+        type: 'WELCOME_BACK_USER',
+        route: 'home',
+        userStatus: 'existing',
+        name: displayName,
+        channelId: 'goapp_auth',
+      },
+    });
   }
 
   const requestOtpHandler = async ({ body, ip }) => {
@@ -98,12 +138,20 @@ function registerAuthRoutes(router, ctx) {
     };
   };
 
-  const loginHandler = async ({ body }) => {
+  const loginHandler = async ({ body, headers, ip }) => {
     const phoneNumber = normalizePhonePayload(body);
     const result = await repositories.identity.verifyOtp({
       phoneNumber,
       requestId: body?.requestId,
       otpCode: body?.otp,
+      deviceId: body?.deviceId,
+      platform: body?.platform,
+      fcmToken: body?.fcmToken,
+      deviceModel: body?.deviceModel || null,
+      osVersion: body?.osVersion || null,
+      appVersion: body?.appVersion || null,
+      ipAddress: ip || null,
+      userAgent: headers?.['user-agent'] || null,
     });
 
     if (!result.success) {
@@ -118,7 +166,21 @@ function registerAuthRoutes(router, ctx) {
     }
 
     const pgRepo = require('../repositories/pg/pg-identity-repository');
-    const profileComplete = await pgRepo.isProfileComplete(result.user.userId || result.user.id);
+    const userId = result.user.userId || result.user.id;
+    const profileComplete = await pgRepo.isProfileComplete(userId);
+    const profile = await pgRepo.getUserProfile(userId).catch(() => null);
+    const profileName = profile?.name || result.user.name || '';
+
+    // Fire-and-forget — do not block the login response on FCM latency
+    sendLoginWelcomeNotification({
+      userId,
+      isNewUser: result.isNewUser || false,
+      profileComplete,
+      profileName,
+    }).catch((err) => {
+      const { logger } = require('../utils/logger');
+      logger.error('FCM', `Welcome notification failed for ${userId}: ${err.message}`);
+    });
 
     return {
       status: 200,
@@ -129,7 +191,10 @@ function registerAuthRoutes(router, ctx) {
           accessToken: result.sessionToken,
           isNewUser: result.isNewUser || false,
           profileComplete,
-          user: mapUserPayload(result.user, phoneNumber),
+          user: mapUserPayload(
+            { ...result.user, name: profileName },
+            phoneNumber,
+          ),
         },
       },
     };

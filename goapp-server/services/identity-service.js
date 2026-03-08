@@ -171,7 +171,19 @@ class IdentityService {
 
   // ─── Verify OTP ───────────────────────────────────────────────────────────
 
-  async verifyOtp({ phoneNumber, requestId, otpCode }) {
+  async verifyOtp({
+    phoneNumber,
+    requestId,
+    otpCode,
+    deviceId = null,
+    platform = null,
+    fcmToken = null,
+    deviceModel = null,
+    osVersion = null,
+    appVersion = null,
+    ipAddress = null,
+    userAgent = null,
+  }) {
     const phone = this._normalizePhone(phoneNumber);
     const now   = Date.now();
     let effectiveRequestId = requestId;
@@ -194,32 +206,53 @@ class IdentityService {
         return { success: false, error: `otp status is ${request.status}` };
       }
       if (now > request.expiresAt) {
-        await pgRepo.recordOtpAttempt(effectiveRequestId, 'expired');
+        await pgRepo.recordOtpAttempt(effectiveRequestId, 'expired', {
+          enteredCode: String(otpCode || ''),
+          isCorrect: false,
+          ipAddress,
+        });
         return { success: false, error: 'otp expired' };
       }
       // Compare against stored hash, not plaintext
       if (request.otp_code !== this._hashOtp(String(otpCode || ''))) {
         const newStatus = (request.attempts + 1) >= request.max_attempts ? 'failed' : null;
-        const updated   = await pgRepo.recordOtpAttempt(effectiveRequestId, newStatus);
+        const updated   = await pgRepo.recordOtpAttempt(effectiveRequestId, newStatus, {
+          enteredCode: String(otpCode || ''),
+          isCorrect: false,
+          ipAddress,
+        });
         return { success: false, error: 'invalid otp', attempts: updated.attempts };
       }
 
-      // Correct OTP — mark verified, upsert user + session
-      await pgRepo.recordOtpAttempt(effectiveRequestId, 'verified');
+      // Correct OTP — commit user/device/session/login/token writes atomically
       const existing = await pgRepo.getUserByPhone(phone);
       const userId   = existing ? existing.id : crypto.randomUUID();
       const isNewUser = !existing;
-      const user     = await pgRepo.upsertUser({ userId, phoneNumber: phone, userType: 'rider' });
-
       const sessionToken    = crypto.randomUUID();
       const sessionExpiresAt = now + 24 * 3600 * 1000;
-      await pgRepo.createSession({ sessionToken, userId: user.id, expiresAt: sessionExpiresAt });
+      const { user, deviceRecord } = await pgRepo.completeSuccessfulOtpLogin({
+        requestId: effectiveRequestId,
+        userId,
+        phoneNumber: phone,
+        userType: 'rider',
+        deviceId,
+        platform,
+        fcmToken,
+        deviceModel,
+        osVersion,
+        appVersion,
+        ipAddress,
+        sessionToken,
+        sessionExpiresAt,
+        enteredCode: String(otpCode || ''),
+      });
       this.sessions.set(sessionToken, {
         sessionToken,
         userId: user.id,
         phoneNumber: phone,
         createdAt: now,
         expiresAt: sessionExpiresAt,
+        deviceId: deviceRecord?.id || null,
       });
 
       eventBus.publish('otp_verified', { requestId: effectiveRequestId, userId: user.id, phoneNumber: phone });
@@ -236,6 +269,7 @@ class IdentityService {
           createdAt:     user.createdAt,
         },
         sessionToken,
+        deviceRecordId: deviceRecord?.id || null,
       };
     }
 

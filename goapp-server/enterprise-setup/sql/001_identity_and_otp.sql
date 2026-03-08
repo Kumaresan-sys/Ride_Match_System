@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS user_profiles (
     avatar_url          TEXT,
     date_of_birth       DATE,
     gender              VARCHAR(20),
+    emergency_contact   VARCHAR(20),
     language            VARCHAR(10) DEFAULT 'en',
     country_code        VARCHAR(5),
     city                VARCHAR(100),

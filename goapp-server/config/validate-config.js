@@ -28,6 +28,20 @@ function validateConfig({ strict = false } = {}) {
     }
   }
 
+  if (!isDevelopment || strict) {
+    if (!config.firebase.projectId || config.firebase.projectId.startsWith('your_')) {
+      errors.push('FIREBASE_PROJECT_ID is required outside development.');
+    }
+    if (!config.firebase.clientEmail || config.firebase.clientEmail.startsWith('your_')) {
+      errors.push('FIREBASE_CLIENT_EMAIL is required outside development.');
+    }
+    if (!config.firebase.privateKey || config.firebase.privateKey.startsWith('your_')) {
+      errors.push('FIREBASE_PRIVATE_KEY is required outside development.');
+    } else if (!config.firebase.privateKey.includes('BEGIN PRIVATE KEY')) {
+      errors.push('FIREBASE_PRIVATE_KEY is malformed. Use the full service-account private key with \\n escapes.');
+    }
+  }
+
   // ─── Database validation ────────────────────────────────────────────────────
   const needsRealServices = !isDevelopment;
 
