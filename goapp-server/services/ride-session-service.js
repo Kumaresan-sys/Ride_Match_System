@@ -107,7 +107,7 @@ class RideSessionService {
     };
 
     // ── WS reconnect instructions ──
-    const wsChannel = `ride:${rideId}`;
+    const wsChannel = `ride_${rideId}`;
     const wsReconnectAction = {
       action:   'reconnect',
       rideId,

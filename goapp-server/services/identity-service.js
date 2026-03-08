@@ -625,6 +625,18 @@ class IdentityService {
     };
   }
 
+  async isProfileComplete(userId) {
+    if (!userId) return false;
+    if (!USE_PG) return false;
+    return pgRepo.isProfileComplete(userId);
+  }
+
+  async getUserProfile(userId) {
+    if (!userId) return null;
+    if (!USE_PG) return null;
+    return pgRepo.getUserProfile(userId);
+  }
+
   // ─── Private Helpers ──────────────────────────────────────────────────────
 
   _normalizePhone(phoneNumber) {

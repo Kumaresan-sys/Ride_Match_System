@@ -6,6 +6,8 @@ class IdentityRepository {
   revokeSession() { throw new Error('Not implemented'); }
   getUsers() { throw new Error('Not implemented'); }
   getStats() { throw new Error('Not implemented'); }
+  isProfileComplete() { throw new Error('Not implemented'); }
+  getUserProfile() { throw new Error('Not implemented'); }
 }
 
 module.exports = IdentityRepository;

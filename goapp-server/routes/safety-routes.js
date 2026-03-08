@@ -1,9 +1,8 @@
 'use strict';
 
-const safetyRepo = require('../repositories/pg/pg-safety-repository');
-
 function registerSafetyRoutes(router, ctx) {
   const { requireAuth } = ctx;
+  const safetyService = ctx.services?.safetyService || require('../services/safety-service');
 
   // ── GET /api/v1/safety/contacts ──────────────────────────────────────────
   router.register('GET', '/api/v1/safety/contacts', async ({ headers }) => {
@@ -11,7 +10,7 @@ function registerSafetyRoutes(router, ctx) {
     if (authResult.error) return authResult.error;
 
     const { userId } = authResult.session;
-    const contacts = await safetyRepo.getContacts(userId);
+    const contacts = await safetyService.getContacts(userId);
     return { status: 200, data: { success: true, contacts } };
   });
 
@@ -29,8 +28,8 @@ function registerSafetyRoutes(router, ctx) {
     }
 
     try {
-      const contact = await safetyRepo.addContact(userId, { name, phoneNumber });
-      const contacts = await safetyRepo.getContacts(userId);
+      const contact = await safetyService.addContact(userId, { name, phoneNumber });
+      const contacts = await safetyService.getContacts(userId);
       return { status: 200, data: { success: true, contact, contacts } };
     } catch (err) {
       if (err.code === 'CONTACTS_LIMIT') {
@@ -53,8 +52,8 @@ function registerSafetyRoutes(router, ctx) {
     }
 
     try {
-      await safetyRepo.deleteContact(userId, contactId);
-      const contacts = await safetyRepo.getContacts(userId);
+      await safetyService.deleteContact(userId, contactId);
+      const contacts = await safetyService.getContacts(userId);
       return { status: 200, data: { success: true, contacts } };
     } catch (err) {
       if (err.code === 'NOT_FOUND') {
@@ -79,8 +78,8 @@ function registerSafetyRoutes(router, ctx) {
     }
 
     try {
-      await safetyRepo.updateContact(userId, contactId, { name, phoneNumber });
-      const contacts = await safetyRepo.getContacts(userId);
+      await safetyService.updateContact(userId, contactId, { name, phoneNumber });
+      const contacts = await safetyService.getContacts(userId);
       return { status: 200, data: { success: true, contacts } };
     } catch (err) {
       if (err.code === 'NOT_FOUND') {
@@ -103,8 +102,8 @@ function registerSafetyRoutes(router, ctx) {
     }
 
     try {
-      await safetyRepo.makePrimary(userId, contactId);
-      const contacts = await safetyRepo.getContacts(userId);
+      await safetyService.makePrimary(userId, contactId);
+      const contacts = await safetyService.getContacts(userId);
       return { status: 200, data: { success: true, contacts } };
     } catch (err) {
       if (err.code === 'NOT_FOUND') {
@@ -120,7 +119,7 @@ function registerSafetyRoutes(router, ctx) {
     if (authResult.error) return authResult.error;
 
     const { userId } = authResult.session;
-    const prefs = await safetyRepo.getPreferences(userId);
+    const prefs = await safetyService.getPreferences(userId);
     return { status: 200, data: { success: true, ...prefs } };
   });
 
@@ -138,8 +137,8 @@ function registerSafetyRoutes(router, ctx) {
     }
 
     // Merge with existing prefs so caller can send partial updates
-    const current = await safetyRepo.getPreferences(userId);
-    const prefs = await safetyRepo.updatePreferences(userId, {
+    const current = await safetyService.getPreferences(userId);
+    const prefs = await safetyService.updatePreferences(userId, {
       autoShare:    autoShare    ?? current.autoShare,
       shareAtNight: shareAtNight ?? current.shareAtNight,
     });

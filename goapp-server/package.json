@@ -10,6 +10,9 @@
     "start:prod":       "NODE_ENV=production node server.js",
     "api":              "node server.js --api-only",
     "sim":              "node server.js --sim-only",
+    "check:architecture": "node scripts/check-architecture.js",
+    "check:secrets": "node scripts/check-secrets.js",
+    "check:ci": "npm run check:architecture && npm run check:secrets",
     "test":             "node --test --test-force-exit tests/*.test.js",
     "test:unit":        "NODE_ENV=development node --test --test-force-exit tests/*.test.js",
     "test:integration": "NODE_ENV=test node --test --test-force-exit tests/integration/*.test.js"

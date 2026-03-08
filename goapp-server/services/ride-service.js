@@ -77,7 +77,7 @@ class RideService {
         riderId,
         rideType: rideType || 'sedan',
         pickupLat, pickupLng,
-        destLat: destLng, destLng,
+        destLat, destLng,
         fareEstimate: fareEstimate.finalFare,
         surgeMultiplier: estimates.surgeMultiplier,
         idempotencyKey,
@@ -124,6 +124,12 @@ class RideService {
         vehicleNumber: matchResult.vehicleNumber,
         etaMin: matchResult.etaMin,
         score: matchResult.score,
+      });
+      eventBus.publish('ride_matched', {
+        rideId,
+        riderId,
+        driverId: matchResult.driverId,
+        etaMin: matchResult.etaMin,
       });
 
       return {

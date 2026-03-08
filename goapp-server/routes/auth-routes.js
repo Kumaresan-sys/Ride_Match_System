@@ -34,6 +34,7 @@ function checkRefreshRateLimit(ip) {
 }
 
 const ALLOWED_CHANNELS = new Set(['sms', 'whatsapp', 'voice']);
+const tokenService = require('../services/token-service');
 
 function registerAuthRoutes(router, ctx) {
   const { repositories, requireAuth } = ctx;
@@ -178,10 +179,9 @@ function registerAuthRoutes(router, ctx) {
       };
     }
 
-    const pgRepo = require('../repositories/pg/pg-identity-repository');
     const userId = result.user.userId || result.user.id;
-    const profileComplete = await pgRepo.isProfileComplete(userId);
-    const profile = await pgRepo.getUserProfile(userId).catch(() => null);
+    const profileComplete = await repositories.identity.isProfileComplete(userId);
+    const profile = await repositories.identity.getUserProfile(userId).catch(() => null);
     const profileName = profile?.name || result.user.name || '';
 
     await sendLoginWelcomeNotification({
@@ -197,7 +197,12 @@ function registerAuthRoutes(router, ctx) {
         success: true,
         message: 'Login successful',
         data: {
-          accessToken: result.sessionToken,
+          accessToken: tokenService.signAccessToken({
+            sessionToken: result.sessionToken,
+            userId,
+            expiresInSec: result.expiresInSec || 1800,
+          }),
+          legacySessionToken: result.sessionToken,
           refreshToken: result.refreshToken || '',
           expiresInSec: result.expiresInSec || null,
           isNewUser: result.isNewUser || false,
@@ -249,13 +254,25 @@ function registerAuthRoutes(router, ctx) {
       };
     }
 
+    const refreshedSession = typeof repositories.identity.validateSession === 'function'
+      ? await repositories.identity.validateSession(result.sessionToken)
+      : null;
+    const accessToken = refreshedSession?.userId
+      ? tokenService.signAccessToken({
+        sessionToken: result.sessionToken,
+        userId: refreshedSession.userId,
+        expiresInSec: result.expiresInSec || 1800,
+      })
+      : result.sessionToken;
+
     return {
       status: 200,
       data: {
         success: true,
         message: 'Token refreshed successfully',
         data: {
-          accessToken: result.sessionToken,
+          accessToken,
+          legacySessionToken: result.sessionToken,
           refreshToken: result.refreshToken,
           expiresInSec: result.expiresInSec,
         },
@@ -355,7 +372,38 @@ function registerAuthRoutes(router, ctx) {
     };
   };
 
+  const legacyOtpRequestHandler = async ({ body }) => {
+    const phoneNumber = normalizePhonePayload(body);
+    const channel = ALLOWED_CHANNELS.has(body?.channel) ? body.channel : 'sms';
+    const result = await repositories.identity.requestOtp({
+      phoneNumber,
+      channel,
+      otpType: body?.otpType || 'login',
+    });
+    return { status: result.success ? 200 : 400, data: result };
+  };
+
+  const legacyOtpVerifyHandler = async ({ body, headers, ip }) => {
+    const phoneNumber = normalizePhonePayload(body);
+    const result = await repositories.identity.verifyOtp({
+      phoneNumber,
+      requestId: body?.requestId,
+      otpCode: body?.otpCode || body?.otp,
+      deviceId: body?.deviceId,
+      platform: body?.platform,
+      fcmToken: body?.fcmToken,
+      deviceModel: body?.deviceModel || null,
+      osVersion: body?.osVersion || null,
+      appVersion: body?.appVersion || null,
+      ipAddress: ip || null,
+      userAgent: headers?.['user-agent'] || null,
+    });
+    return { status: result.success ? 200 : 400, data: result };
+  };
+
   router.register('POST', '/api/v1/auth/request-otp', requestOtpHandler);
+  router.register('POST', '/api/v1/auth/otp/request', legacyOtpRequestHandler);
+  router.register('POST', '/api/v1/auth/otp/verify', legacyOtpVerifyHandler);
   router.register('POST', '/api/v1/auth/login', loginHandler);
   router.register('POST', '/api/v1/auth/refresh-token', refreshTokenHandler);
   router.register('POST', '/api/v1/auth/logout', logoutHandler);

@@ -35,6 +35,8 @@ const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
 const googleMapsService = require('./services/google-maps-service');
 const db = require('./services/db');
+const profileService = require('./services/profile-service');
+const safetyService = require('./services/safety-service');
 const { applySecurityHeaders, parseJsonBody, readRawBody } = require('./middleware/http-middleware');
 const { parseMultipart } = require('./middleware/multipart-parser');
 const DocumentStorageService = require('./services/document-storage-service');
@@ -47,6 +49,7 @@ const {
   ServiceMatchingStateRepository,
   ServiceWalletRepository,
 } = require('./repositories/adapters/service-repositories');
+const tokenService = require('./services/token-service');
 
 // Max request body size: 256 KB (prevents memory exhaustion)
 const MAX_BODY_BYTES = 256 * 1024;
@@ -56,6 +59,12 @@ const MAX_FILE_UPLOAD_BYTES = config.storage.maxFileSizeBytes || (10 * 1024 * 10
 // Instantiate document storage once at module load
 const documentStorageService = new DocumentStorageService(config);
 const driverDocumentService = new DriverDocumentService(documentStorageService);
+const authRuntimeStats = {
+  legacyTokenAccepted: 0,
+  metrics: {
+    'auth.legacy_token.accepted': 0,
+  },
+};
 
 // ─── Coordinate validator ─────────────────────────────────────────────────
 function validCoords(lat, lng) {
@@ -106,13 +115,48 @@ function requireAdmin(headers) {
 // All callers: if (auth.error) return auth.error;
 async function requireAuth(headers) {
   const authHeader = headers['authorization'] || '';
-  const sessionToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : headers['x-session-token'];
-  if (!sessionToken) {
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  const legacySessionToken = headers['x-session-token'];
+  const rawToken = bearerToken || legacySessionToken;
+  if (!rawToken) {
     return { error: { status: 401, data: { error: 'Authentication required. Provide Authorization: Bearer <token> header.' } } };
   }
+
+  let sessionToken = rawToken;
+  const jwtPayload = tokenService.verifyAccessToken(rawToken);
+  const usingLegacyToken = !bearerToken && Boolean(legacySessionToken);
+  const disableDate = Date.parse(config.security.legacyAuth.disableDate);
+  if (usingLegacyToken && Number.isFinite(disableDate) && Date.now() >= disableDate) {
+    return {
+      error: {
+        status: 401,
+        data: {
+          error: 'Legacy session token is no longer accepted. Use Authorization: Bearer <JWT>.',
+          code: 'LEGACY_TOKEN_DISABLED',
+        },
+      },
+    };
+  }
+
+  if (usingLegacyToken) {
+    authRuntimeStats.legacyTokenAccepted += 1;
+    authRuntimeStats.metrics['auth.legacy_token.accepted'] += 1;
+    logger.warn(
+      'AUTH',
+      `metric=auth.legacy_token.accepted count=${authRuntimeStats.metrics['auth.legacy_token.accepted']} ua="${String(headers['user-agent'] || 'unknown').slice(0, 120)}"`
+    );
+  }
+
+  if (jwtPayload?.sessionToken) {
+    sessionToken = jwtPayload.sessionToken;
+  }
+
   const session = await identityService.validateSession(sessionToken);
   if (!session) {
     return { error: { status: 401, data: { error: 'Invalid or expired session token.' } } };
+  }
+  if (jwtPayload?.userId && String(jwtPayload.userId) !== String(session.userId)) {
+    return { error: { status: 401, data: { error: 'Invalid authentication token subject.' } } };
   }
   return { session };
 }
@@ -129,6 +173,7 @@ function startAPIServer(port) {
     enterpriseConfig,
     repositories,
     eventBus,
+    authRuntimeStats,
     // Auth helpers exposed to route modules so they don't need to import server.js
     requireAuth,
     requireAdmin,
@@ -138,30 +183,56 @@ function startAPIServer(port) {
       locationService,
       pricingService,
       rideService,
+      identityService,
       zoneService,
       demandLogService,
       walletService,
       driverWalletService,
       feedbackService,
+      ticketService,
+      sosService,
       matchingEngine,
       perfMonitor,
       razorpayService,
       driverDocumentService,
       notificationService,
+      profileService,
+      safetyService,
+      googleMapsService,
+      smsService,
     },
-  }, handleLegacyRoute);
+  });
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${port}`);
     const path = url.pathname;
     const method = req.method;
     const headers = req.headers;
+    const requestId = String(headers['x-request-id'] || crypto.randomUUID());
     // Prefer X-Forwarded-For (set by load balancers/proxies); fall back to socket address.
     const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
       || req.socket?.remoteAddress
       || '';
 
+    res.setHeader('X-Request-Id', requestId);
+    const hasLegacyToken = !String(headers['authorization'] || '').startsWith('Bearer ')
+      && Boolean(headers['x-session-token']);
+    if (hasLegacyToken) {
+      res.setHeader('X-Auth-Deprecation', 'legacy-token');
+    }
     applySecurityHeaders(req, res);
+
+    const writeJson = (status, data) => {
+      let payload = data;
+      if (payload && typeof payload === 'object' && !Buffer.isBuffer(payload) && !Array.isArray(payload)) {
+        if (payload.requestId == null) {
+          payload = { ...payload, requestId };
+        }
+      }
+      res.writeHead(status);
+      const indent = process.env.NODE_ENV === 'production' ? 0 : 2;
+      res.end(JSON.stringify(payload, null, indent));
+    };
 
     if (method === 'OPTIONS') {
       res.writeHead(200);
@@ -178,21 +249,28 @@ function startAPIServer(port) {
         const isValid  = razorpayService.verifyWebhookSignature(rawBody, sig);
 
         if (!isValid) {
-          logger.warn('RAZORPAY', 'Webhook received with invalid signature — rejected');
-          res.writeHead(400);
-          res.end(JSON.stringify({ error: 'Invalid webhook signature' }));
+          logger.warn('RAZORPAY', `Webhook received with invalid signature — rejected (requestId=${requestId})`);
+          writeJson(400, { error: 'Invalid webhook signature', requestId });
           doneWebhook();
           return;
         }
 
         let event;
         try { event = JSON.parse(rawBody.toString('utf8')); }
-        catch (_) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid JSON' })); doneWebhook(); return; }
+        catch (_) { writeJson(400, { error: 'Invalid JSON', requestId }); doneWebhook(); return; }
 
         // ── Webhook event processing ─────────────────────────────────────────
         const eventName  = event.event || '';
         const payment    = event.payload?.payment?.entity;
         const orderId    = payment?.order_id;
+        const webhookEventId = event?.payload?.payment?.entity?.id || event?.id || `${eventName}:${orderId || 'na'}`;
+
+        const idempotency = await redis.checkIdempotency(`payment_webhook:${webhookEventId}`);
+        if (idempotency.isDuplicate) {
+          writeJson(200, { received: true, duplicate: true, event: eventName, requestId });
+          doneWebhook();
+          return;
+        }
 
         logger.info('RAZORPAY', `Webhook received: ${eventName} | order: ${orderId || 'n/a'}`);
 
@@ -210,13 +288,14 @@ function startAPIServer(port) {
           }
         }
 
-        res.writeHead(200);
-        res.end(JSON.stringify({ received: true, event: eventName }));
+        await redis.setIdempotency(`payment_webhook:${webhookEventId}`, { event: eventName, orderId }, 24 * 3600);
+
+        writeJson(200, { received: true, event: eventName, requestId });
         doneWebhook();
       } catch (err) {
         doneWebhook();
-        res.writeHead(500);
-        res.end(JSON.stringify({ error: err.message }));
+        logger.error('API', `Webhook error (requestId=${requestId}): ${err.message}`);
+        writeJson(500, { error: err.message, requestId });
       }
       return;
     }
@@ -234,6 +313,9 @@ function startAPIServer(port) {
       }
 
       const response = await dispatchRoute(method, path, body, url.searchParams, headers, files, clientIp);
+      if (path.startsWith('/api/v1/admin/')) {
+        logger.info('AUDIT', `Admin API access ${method} ${path} status=${response.status || 200} requestId=${requestId} ip=${clientIp}`);
+      }
 
       // Binary file response (e.g. driver document file download)
       if (response.raw) {
@@ -248,20 +330,17 @@ function startAPIServer(port) {
         return;
       }
 
-      res.writeHead(response.status || 200);
-      const indent = process.env.NODE_ENV === 'production' ? 0 : 2;
-      res.end(JSON.stringify(response.data, null, indent));
+      writeJson(response.status || 200, response.data);
       doneRequest();
     } catch (err) {
       doneRequest();
       if (err instanceof SyntaxError) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+        writeJson(400, { error: 'Invalid JSON body', requestId });
         return;
       }
       const status = err.statusCode || 500;
-      res.writeHead(status);
-      res.end(JSON.stringify({ error: err.message }));
+      logger.error('API', `Unhandled request error (requestId=${requestId}, path=${path}, method=${method}): ${err.message}`);
+      writeJson(status, { error: err.message, requestId });
     }
   });
 
@@ -403,1145 +482,6 @@ function startAPIServer(port) {
   return server;
 }
 
-async function handleLegacyRoute(method, path, body, params, headers = {}) {
-  if (path === '/api/v1/health') {
-    return {
-      data: {
-        status: 'ok',
-        service: 'GoApp Ride Matching Platform',
-        version: '2.2',
-        uptime: process.uptime(),
-        runtime: enterpriseConfig.runtime,
-        redis: redis.getStats(),
-        identity: identityService.getStats(),
-        location: locationService.getStats(),
-        pricing: pricingService.getStats(),
-        rides: rideService.getStats(),
-        mockDb: mockDb.getStats(),
-        notifications: notificationService.getStats(),
-        wallet: walletService.getStats(),
-        driverWallet: driverWalletService.getStats(),
-        demandAggregation: demandAggregationService.getStats(),
-        demandLog: demandLogService.getStats(),
-        incentives: incentiveService.getStats(),
-        tickets: ticketService.getStats(),
-        rideSession: rideSessionService.getStats(),
-        sos: sosService.getStats(),
-        sms: smsService.getStats(),
-      },
-    };
-  }
-
-  if (path === '/api/v1/microservices' && method === 'GET') {
-    return { data: enterpriseConfig.microservices };
-  }
-
-  if (path === '/api/v1/aws/readiness' && method === 'GET') {
-    return {
-      data: {
-        runtime: enterpriseConfig.runtime,
-        aws: enterpriseConfig.aws,
-        checks: {
-          canRunWithoutDatabase: true,
-          eventBusBuffered: true,
-          inMemoryTestDataSeeded: Boolean(mockDb.getStats().seedMeta),
-        },
-      },
-    };
-  }
-
-  if (path === '/api/v1/users' && method === 'GET') {
-    const limit = Number(params.get('limit') || 20);
-    return { data: { users: identityService.getUsers(limit) } };
-  }
-
-  if (path === '/api/v1/auth/stats' && method === 'GET') {
-    return { data: identityService.getStats() };
-  }
-
-  if (path === '/api/v1/auth/otp/request' && method === 'POST') {
-    const result = await identityService.requestOtp(body);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  if (path === '/api/v1/auth/otp/verify' && method === 'POST') {
-    const result = await identityService.verifyOtp(body);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  if (path === '/api/v1/drivers' && method === 'GET') {
-    return { data: { drivers: locationService.getAllTracked() } };
-  }
-
-  if (path === '/api/v1/drivers/nearby' && method === 'GET') {
-    const lat = parseFloat(params.get('lat'));
-    const lng = parseFloat(params.get('lng'));
-    const radius = clampFloat(params.get('radius'), 0.1, 50, 5);
-
-    if (!validCoords(lat, lng)) {
-      return { status: 400, data: { error: 'lat and lng required and must be valid coordinates' } };
-    }
-
-    const nearby = await locationService.findNearby(lat, lng, radius, 20);
-    return { data: { count: nearby.length, drivers: nearby } };
-  }
-
-  if (path.match(/^\/api\/v1\/drivers\/(.+)\/location$/) && method === 'PUT') {
-    const driverId = path.split('/')[4];
-    const result = locationService.updateLocation(driverId, body);
-    return { data: result };
-  }
-
-  if (path === '/api/v1/rides/request' && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const pickupLat = parseFloat(body.pickupLat);
-    const pickupLng = parseFloat(body.pickupLng);
-    const destLat   = parseFloat(body.destLat);
-    const destLng   = parseFloat(body.destLng);
-
-    if (!validCoords(pickupLat, pickupLng)) {
-      return { status: 400, data: { error: 'pickupLat and pickupLng must be valid coordinates' } };
-    }
-
-    const zoneCheck = zoneService.checkPickup(pickupLat, pickupLng);
-    if (!zoneCheck.allowed) {
-      return { status: 403, data: { error: zoneCheck.message, reason: zoneCheck.reason } };
-    }
-
-    // Optional: preview coin redemption discount before creating ride
-    let coinRedemptionPreview = null;
-    if (body.useCoins && body.riderId) {
-      const estimates = await pricingService.getEstimates(pickupLat, pickupLng, destLat, destLng);
-      const rideType = body.rideType || 'sedan';
-      const estimatedFare = estimates.estimates[rideType]?.finalFare;
-      if (estimatedFare) {
-        const balance = walletService.getBalance(body.riderId);
-        const coinValue = parseFloat(process.env.COIN_INR_VALUE || '0.10');
-        const maxRedeemPct = parseFloat(process.env.MAX_REDEEM_PCT || '0.20');
-        // maxDiscountInr = min(rider's coins in INR, 20% of fare)
-        const maxDiscountInr = Math.min(
-          balance.coinBalance * coinValue,
-          estimatedFare * maxRedeemPct
-        );
-        coinRedemptionPreview = {
-          coinsAvailable:  balance.coinBalance,
-          maxDiscountInr:  Math.round(maxDiscountInr * 100) / 100,
-        };
-      }
-    }
-
-    // Record raw demand for area heatmap + time-series (fire-and-forget)
-    demandLogService.recordDemand(pickupLat, pickupLng, 'ride_requested');
-    demandLogService.recordTimeslot('ride_requested');
-    demandLogService.logScenario('ride_requested', {
-      riderId:    body.riderId,
-      pickupLat,
-      pickupLng,
-      destLat,
-      destLng,
-      rideType:   body.rideType || 'sedan',
-      useCoins:   !!body.useCoins,
-      usedPool:   !!body.poolId,
-      outcome:    'requested',
-    });
-
-    const result = await rideService.createRide({
-      ...body,
-      pickupLat,
-      pickupLng,
-      destLat,
-      destLng,
-      idempotencyKey: body.idempotencyKey || crypto.randomUUID(),
-    });
-
-    if (coinRedemptionPreview) result.coinRedemptionPreview = coinRedemptionPreview;
-    return { data: result };
-  }
-
-  if (path === '/api/v1/rides' && method === 'GET') {
-    return { data: { rides: rideService.getAllRides() } };
-  }
-
-  if (path.match(/^\/api\/v1\/rides\/(.+)\/cancel$/) && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/cancel$/)[1];
-    if (!body.cancelledBy) return { status: 400, data: { error: 'cancelledBy required' } };
-    const result = rideService.cancelRide(rideId, body.cancelledBy, body.userId);
-    return { data: result };
-  }
-
-  if (path.match(/^\/api\/v1\/rides\/(.+)\/arrived$/) && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/arrived$/)[1];
-    const ride = rideService.driverArrived(rideId);
-    if (!ride) return { status: 422, data: { error: 'Invalid state transition' } };
-    return { data: { status: ride.status, rideId } };
-  }
-
-  if (path.match(/^\/api\/v1\/rides\/(.+)\/start$/) && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/start$/)[1];
-    const ride = rideService.startTrip(rideId);
-    if (!ride) return { status: 422, data: { error: 'Invalid state transition' } };
-    return { data: { status: ride.status, rideId } };
-  }
-
-  if (path.match(/^\/api\/v1\/rides\/(.+)\/complete$/) && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/complete$/)[1];
-    const result = rideService.completeTrip(rideId, body.distanceKm, body.durationMin);
-    if (!result) return { status: 422, data: { error: 'Invalid state transition' } };
-
-    // Optional coin redemption (deduct coins from rider's balance for discount)
-    let coinRedemption = null;
-    const ride = rideService.getRide(rideId);
-    if (ride && body.useCoins && ride.riderId) {
-      const fareInr = result.fare?.finalFare;
-      if (fareInr) {
-        const redemption = walletService.redeemCoins(ride.riderId, fareInr, body.coinsToUse);
-        if (redemption.success) {
-          result.fare.finalFareAfterCoins = redemption.finalFare;
-          result.fare.coinDiscount = redemption.discountInr;
-          coinRedemption = redemption;
-        }
-      }
-    }
-
-    // Earn coins for this ride (always — on the original fare)
-    if (ride && ride.riderId) {
-      const earnFare = result.fare?.finalFare;
-      const earnResult = walletService.earnCoins(ride.riderId, earnFare, rideId);
-      if (earnResult) result.coinsEarned = earnResult.coins;
-    }
-
-    // Release demand from area (ride fulfilled)
-    if (ride) {
-      const pLat = ride.pickupLat || body.pickupLat;
-      const pLng = ride.pickupLng || body.pickupLng;
-      if (pLat && pLng) {
-        demandLogService.releaseRequest(pLat, pLng);
-        demandLogService.recordTimeslot('ride_completed');
-        demandLogService.logScenario('ride_completed', {
-          rideId,
-          riderId:     ride.riderId,
-          driverId:    ride.driverId,
-          fareInr:     result.fare?.finalFare,
-          distanceKm:  body.distanceKm,
-          durationMin: body.durationMin,
-          pickupLat:   pLat,
-          pickupLng:   pLng,
-          outcome:     'completed',
-        });
-      }
-    }
-
-    // Update driver incentive progress on ride completion
-    if (ride && ride.driverId) {
-      const fareInr = result.fare?.finalFare || 0;
-      const now = new Date();
-      const hour = now.getHours();
-      const isPeakHour = (hour >= 7 && hour <= 10) || (hour >= 17 && hour <= 21);
-      const areaKey = ride.pickupLat && ride.pickupLng
-        ? `${parseFloat(ride.pickupLat).toFixed(2)}_${parseFloat(ride.pickupLng).toFixed(2)}`
-        : null;
-      const incentiveUpdates = incentiveService.onRideCompleted(ride.driverId, { fareInr, isPeakHour, areaKey });
-      if (incentiveUpdates.length > 0) result.incentiveProgress = incentiveUpdates;
-    }
-
-    if (coinRedemption) result.coinRedemption = coinRedemption;
-    return { data: result };
-  }
-
-  if (path.match(/^\/api\/v1\/rides\/(.+)$/) && method === 'GET') {
-    const rideId = path.split('/')[4];
-    const ride = rideService.getRide(rideId);
-    return { data: ride || { error: 'Ride not found' } };
-  }
-
-  if (path === '/api/v1/fare/estimate' && method === 'POST') {
-    const pickupLat = parseFloat(body.pickupLat);
-    const pickupLng = parseFloat(body.pickupLng);
-    if (!validCoords(pickupLat, pickupLng)) {
-      return { status: 400, data: { error: 'pickupLat and pickupLng must be valid coordinates' } };
-    }
-    const estimates = await pricingService.getEstimates(pickupLat, pickupLng, body.destLat, body.destLng);
-    return { data: estimates };
-  }
-
-  if (path === '/api/v1/surge/zones' && method === 'GET') {
-    return { data: { zones: pricingService.getSurgeZones() } };
-  }
-
-  if (path === '/api/v1/surge/update' && method === 'POST') {
-    const result = pricingService.updateSurge(body.zoneId, body.demand, body.supply);
-    return { data: result };
-  }
-
-  if (path === '/api/v1/events' && method === 'GET') {
-    const count = parseInt(params.get('count') || '20', 10);
-    return { data: { events: eventBus.getRecentEvents(count) } };
-  }
-
-  if (path === '/api/v1/stats' && method === 'GET') {
-    return {
-      data: {
-        redis: redis.getStats(),
-        identity: identityService.getStats(),
-        location: locationService.getStats(),
-        pricing: pricingService.getStats(),
-        rides: rideService.getStats(),
-        events: { total: eventBus.events.length },
-      },
-    };
-  }
-
-  if (path === '/api/v1/formulas/haversine' && method === 'GET') {
-    const lat1 = parseFloat(params.get('lat1'));
-    const lng1 = parseFloat(params.get('lng1'));
-    const lat2 = parseFloat(params.get('lat2'));
-    const lng2 = parseFloat(params.get('lng2'));
-
-    if (![lat1, lng1, lat2, lng2].every(Number.isFinite)) {
-      return { status: 400, data: { error: 'lat1, lng1, lat2, lng2 required' } };
-    }
-
-    const dist = haversine(lat1, lng1, lat2, lng2);
-    const bear = bearing(lat1, lng1, lat2, lng2);
-    return {
-      data: {
-        from: { lat: lat1, lng: lng1 },
-        to: { lat: lat2, lng: lng2 },
-        distanceKm: Math.round(dist * 100) / 100,
-        bearingDeg: Math.round(bear * 10) / 10,
-        etaMin: Math.round((dist * 1.3 / (config.scoring.avgCitySpeedKmh || 25)) * 60 * 10) / 10,
-      },
-    };
-  }
-
-  if (path === '/api/v1/formulas/bearing' && method === 'GET') {
-    const lat1 = parseFloat(params.get('lat1'));
-    const lng1 = parseFloat(params.get('lng1'));
-    const lat2 = parseFloat(params.get('lat2'));
-    const lng2 = parseFloat(params.get('lng2'));
-
-    if (![lat1, lng1, lat2, lng2].every(Number.isFinite)) {
-      return { status: 400, data: { error: 'lat1, lng1, lat2, lng2 required' } };
-    }
-
-    return { data: { bearingDeg: Math.round(bearing(lat1, lng1, lat2, lng2) * 10) / 10 } };
-  }
-
-  // ═══════════════════════════════════════════
-  // GOOGLE MAPS — Places + Status
-  // ═══════════════════════════════════════════
-
-  // GET /api/v1/maps/status
-  if (path === '/api/v1/maps/status' && method === 'GET') {
-    return { data: googleMapsService.getStats() };
-  }
-
-  // GET /api/v1/maps/autocomplete?input=TEXT[&lat=X&lng=Y&sessionToken=T]
-  if (path === '/api/v1/maps/autocomplete' && method === 'GET') {
-    const input = params.get('input');
-    if (!input || input.trim().length < 2) {
-      return { status: 400, data: { error: 'input query param required (min 2 chars)' } };
-    }
-    const sessionToken = params.get('sessionToken') || undefined;
-    const lat = params.get('lat') ? parseFloat(params.get('lat')) : undefined;
-    const lng = params.get('lng') ? parseFloat(params.get('lng')) : undefined;
-    const result = await googleMapsService.autocomplete(input, sessionToken, lat, lng);
-    return { data: result };
-  }
-
-  // GET /api/v1/maps/place?placeId=ID[&sessionToken=T]
-  if (path === '/api/v1/maps/place' && method === 'GET') {
-    const placeId = params.get('placeId');
-    if (!placeId) {
-      return { status: 400, data: { error: 'placeId query param required' } };
-    }
-    const sessionToken = params.get('sessionToken') || undefined;
-    const result = await googleMapsService.getPlaceCoordinates(placeId, sessionToken);
-    if (result.error) return { status: 503, data: result };
-    return { data: result };
-  }
-
-  // GET /api/v1/maps/reverse-geocode?lat=X&lng=Y
-  if (path === '/api/v1/maps/reverse-geocode' && method === 'GET') {
-    const lat = parseFloat(params.get('lat'));
-    const lng = parseFloat(params.get('lng'));
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      return { status: 400, data: { error: 'lat and lng query params required' } };
-    }
-    const result = await googleMapsService.reverseGeocode(lat, lng);
-    if (result.error) return { status: 503, data: result };
-    return { data: result };
-  }
-
-  // ═══════════════════════════════════════════
-  // DEVICE TOKEN — FCM registration
-  // ═══════════════════════════════════════════
-
-  // POST /api/v1/users/:id/device-token  { token, platform }
-  const tokenRegMatch = path.match(/^\/api\/v1\/users\/(.+)\/device-token$/);
-  if (tokenRegMatch && method === 'POST') {
-    const userId = tokenRegMatch[1];
-    let deviceRecord = null;
-    if (config.db.backend === 'pg') {
-      const pgIdentityRepo = require('./repositories/pg/pg-identity-repository');
-      deviceRecord = await pgIdentityRepo.upsertUserDevice({
-        userId,
-        deviceId: body.deviceId,
-        platform: body.platform,
-        fcmToken: body.token,
-      });
-    }
-    const result = await notificationService.registerToken(
-      userId,
-      body.token,
-      body.platform,
-      deviceRecord?.id || null,
-    );
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // DELETE /api/v1/users/:id/device-token
-  const tokenDelMatch = path.match(/^\/api\/v1\/users\/(.+)\/device-token$/);
-  if (tokenDelMatch && method === 'DELETE') {
-    await notificationService.removeToken(tokenDelMatch[1]);
-    return { data: { success: true } };
-  }
-
-  // ═══════════════════════════════════════════
-  // ADMIN: Service Zone Management
-  // All routes require X-Admin-Token header
-  // ═══════════════════════════════════════════
-
-  if (path.startsWith('/api/v1/admin/zones')) {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-
-    // GET /api/v1/admin/zones — list all zones
-    if (path === '/api/v1/admin/zones' && method === 'GET') {
-      const zones = zoneService.listZones();
-      return { data: { zones, stats: zoneService.getStats() } };
-    }
-
-    // POST /api/v1/admin/zones — create a zone
-    if (path === '/api/v1/admin/zones' && method === 'POST') {
-      const result = zoneService.createZone({
-        name: body.name,
-        lat: parseFloat(body.lat),
-        lng: parseFloat(body.lng),
-        radiusKm: parseFloat(body.radiusKm),
-      });
-      return { status: result.success ? 201 : 400, data: result };
-    }
-
-    // PUT /api/v1/admin/zones/:id/enable — enable a zone
-    const enableMatch = path.match(/^\/api\/v1\/admin\/zones\/(.+)\/enable$/);
-    if (enableMatch && method === 'PUT') {
-      const result = zoneService.setZoneEnabled(enableMatch[1], true);
-      return { status: result.success ? 200 : 404, data: result };
-    }
-
-    // PUT /api/v1/admin/zones/:id/disable — disable a zone
-    const disableMatch = path.match(/^\/api\/v1\/admin\/zones\/(.+)\/disable$/);
-    if (disableMatch && method === 'PUT') {
-      const result = zoneService.setZoneEnabled(disableMatch[1], false);
-      return { status: result.success ? 200 : 404, data: result };
-    }
-
-    // DELETE /api/v1/admin/zones/:id — delete a zone
-    const deleteMatch = path.match(/^\/api\/v1\/admin\/zones\/(.+)$/);
-    if (deleteMatch && method === 'DELETE') {
-      const result = zoneService.deleteZone(deleteMatch[1]);
-      return { status: result.success ? 200 : 404, data: result };
-    }
-
-    // GET /api/v1/admin/notifications/stats — FCM token registry
-    if (path === '/api/v1/admin/notifications/stats' && method === 'GET') {
-      return { data: notificationService.getStats() };
-    }
-  }
-
-  // ═══════════════════════════════════════════
-  // WALLET / COINS
-  // ═══════════════════════════════════════════
-
-  // GET /api/v1/wallet/:userId — get coin balance
-  const walletBalanceMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/balance$/);
-  if (walletBalanceMatch && method === 'GET') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const userId = walletBalanceMatch[1];
-    return { data: walletService.getBalance(userId) };
-  }
-
-  // GET /api/v1/wallet/:userId/transactions — transaction history
-  const walletTxnMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/transactions$/);
-  if (walletTxnMatch && method === 'GET') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const userId = walletTxnMatch[1];
-    const limit = parseInt(params.get('limit') || '20', 10);
-    return { data: walletService.getTransactions(userId, Math.min(limit, 100)) };
-  }
-
-  // POST /api/v1/wallet/:userId/redeem — redeem coins for discount
-  const walletRedeemMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/redeem$/);
-  if (walletRedeemMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const userId = walletRedeemMatch[1];
-    const { fareInr, coinsToUse } = body;
-    if (!fareInr || fareInr <= 0) return { status: 400, data: { error: 'fareInr required' } };
-    const result = walletService.redeemCoins(userId, fareInr, coinsToUse);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // POST /api/v1/admin/wallet/:userId/adjust — admin coin adjustment
-  if (path.match(/^\/api\/v1\/admin\/wallet\/(.+)\/adjust$/) && method === 'POST') {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-    const userId = path.split('/')[5];
-    const { coins, reason } = body;
-    if (typeof coins !== 'number') return { status: 400, data: { error: 'coins (number) required' } };
-    return { data: walletService.adjustCoins(userId, coins, reason || 'admin adjustment') };
-  }
-
-  // GET /api/v1/admin/wallet/stats
-  if (path === '/api/v1/admin/wallet/stats' && method === 'GET') {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-    return { data: walletService.getStats() };
-  }
-
-  // ═══════════════════════════════════════════
-  // SOS / SAFETY
-  // ═══════════════════════════════════════════
-
-  // POST /api/v1/sos — trigger SOS
-  if (path === '/api/v1/sos' && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const result = sosService.triggerSos(body);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // GET /api/v1/sos/:sosId — get SOS details
-  const sosGetMatch = path.match(/^\/api\/v1\/sos\/([^/]+)$/);
-  if (sosGetMatch && method === 'GET') {
-    const sos = sosService.getSos(sosGetMatch[1]);
-    return { data: sos || { error: 'SOS not found' } };
-  }
-
-  // POST /api/v1/sos/:sosId/location — update live location during SOS
-  const sosLocationMatch = path.match(/^\/api\/v1\/sos\/(.+)\/location$/);
-  if (sosLocationMatch && method === 'POST') {
-    const result = sosService.updateLocation(sosLocationMatch[1], body);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // GET /api/v1/users/:userId/sos/active — get active SOS for a user
-  const userActiveSosMatch = path.match(/^\/api\/v1\/users\/(.+)\/sos\/active$/);
-  if (userActiveSosMatch && method === 'GET') {
-    const sos = sosService.getActiveSos(userActiveSosMatch[1]);
-    return { data: sos || { active: false } };
-  }
-
-  // Admin SOS routes
-  if (path.startsWith('/api/v1/admin/sos')) {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-
-    // GET /api/v1/admin/sos — list all SOS logs
-    if (path === '/api/v1/admin/sos' && method === 'GET') {
-      const status = params.get('status') || undefined;
-      const limit = parseInt(params.get('limit') || '50', 10);
-      return { data: { sosList: sosService.getAllSos({ status, limit: Math.min(limit, 200) }) } };
-    }
-
-    // PUT /api/v1/admin/sos/:sosId/status — update SOS status
-    const sosStatusMatch = path.match(/^\/api\/v1\/admin\/sos\/(.+)\/status$/);
-    if (sosStatusMatch && method === 'PUT') {
-      const result = sosService.updateStatus(sosStatusMatch[1], body);
-      return { status: result.success ? 200 : 400, data: result };
-    }
-
-    // GET /api/v1/admin/sos/stats
-    if (path === '/api/v1/admin/sos/stats' && method === 'GET') {
-      return { data: sosService.getStats() };
-    }
-  }
-
-  // ═══════════════════════════════════════════
-  // SMS SERVICE STATS (Admin)
-  // ═══════════════════════════════════════════
-  if (path === '/api/v1/admin/sms/stats' && method === 'GET') {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-    return { data: smsService.getStats() };
-  }
-
-  // ═══════════════════════════════════════════
-  // RIDER WALLET — Cash topup + Pay with wallet
-  // ═══════════════════════════════════════════
-
-  // POST /api/v1/wallet/:userId/topup  { amount, method, referenceId? }
-  const walletTopupMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/topup$/);
-  if (walletTopupMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const userId = walletTopupMatch[1];
-    const { amount, method: payMethod = 'upi', referenceId } = body;
-    if (!amount || amount <= 0) return { status: 400, data: { error: 'amount required and must be > 0' } };
-    const result = walletService.topupWallet(userId, parseFloat(amount), payMethod, referenceId);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // POST /api/v1/wallet/:userId/pay  { fareInr, rideId }
-  const walletPayMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/pay$/);
-  if (walletPayMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const userId = walletPayMatch[1];
-    const { fareInr, rideId } = body;
-    if (!fareInr || fareInr <= 0) return { status: 400, data: { error: 'fareInr required' } };
-    const result = walletService.payWithWallet(userId, parseFloat(fareInr), rideId);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // POST /api/v1/wallet/:userId/refund  { amount, rideId, reason? }
-  const walletRefundMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/refund$/);
-  if (walletRefundMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const userId = walletRefundMatch[1];
-    const { amount, rideId, reason } = body;
-    if (!amount || amount <= 0) return { status: 400, data: { error: 'amount required' } };
-    const result = walletService.refundToWallet(userId, parseFloat(amount), rideId, reason);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // POST /api/v1/admin/wallet/:userId/adjust-cash  { amount, reason }
-  if (path.match(/^\/api\/v1\/admin\/wallet\/(.+)\/adjust-cash$/) && method === 'POST') {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-    const userId = path.split('/')[5];
-    const { amount, reason } = body;
-    if (typeof amount !== 'number') return { status: 400, data: { error: 'amount (number) required' } };
-    return { data: walletService.adjustCash(userId, amount, reason || 'admin adjustment') };
-  }
-
-  // ═══════════════════════════════════════════
-  // DRIVER WALLET — Balance gate ≥ ₹300
-  // ═══════════════════════════════════════════
-
-  // GET /api/v1/driver-wallet/:driverId/balance
-  const drvWalletBalMatch = path.match(/^\/api\/v1\/driver-wallet\/(.+)\/balance$/);
-  if (drvWalletBalMatch && method === 'GET') {
-    return { data: driverWalletService.getBalance(drvWalletBalMatch[1]) };
-  }
-
-  // GET /api/v1/driver-wallet/:driverId/transactions?limit=20
-  const drvWalletTxnMatch = path.match(/^\/api\/v1\/driver-wallet\/(.+)\/transactions$/);
-  if (drvWalletTxnMatch && method === 'GET') {
-    const limit = parseInt(params.get('limit') || '20', 10);
-    return { data: driverWalletService.getTransactions(drvWalletTxnMatch[1], Math.min(limit, 100)) };
-  }
-
-  // POST /api/v1/driver-wallet/:driverId/recharge  { amount, method, referenceId? }
-  const drvRechargeMatch = path.match(/^\/api\/v1\/driver-wallet\/(.+)\/recharge$/);
-  if (drvRechargeMatch && method === 'POST') {
-    const driverId = drvRechargeMatch[1];
-    const { amount, method: payMethod = 'upi', referenceId } = body;
-    if (!amount || amount <= 0) return { status: 400, data: { error: 'amount required and must be > 0' } };
-    const result = driverWalletService.rechargeWallet(driverId, parseFloat(amount), payMethod, referenceId);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // GET /api/v1/driver-wallet/:driverId/eligibility — can driver receive rides?
-  const drvEligibleMatch = path.match(/^\/api\/v1\/driver-wallet\/(.+)\/eligibility$/);
-  if (drvEligibleMatch && method === 'GET') {
-    return { data: driverWalletService.canReceiveRide(drvEligibleMatch[1]) };
-  }
-
-  // POST /api/v1/admin/driver-wallet/:driverId/adjust  { amount, reason }
-  if (path.match(/^\/api\/v1\/admin\/driver-wallet\/(.+)\/adjust$/) && method === 'POST') {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-    const driverId = path.split('/')[5];
-    const { amount, reason } = body;
-    if (typeof amount !== 'number') return { status: 400, data: { error: 'amount (number) required' } };
-    return { data: driverWalletService.adminAdjust(driverId, amount, reason || 'admin adjustment') };
-  }
-
-  // GET /api/v1/admin/driver-wallet/stats
-  if (path === '/api/v1/admin/driver-wallet/stats' && method === 'GET') {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-    return { data: driverWalletService.getStats() };
-  }
-
-  // ═══════════════════════════════════════════
-  // DEMAND AGGREGATION — Pool Rides
-  // ═══════════════════════════════════════════
-
-  // POST /api/v1/pool/match  { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType? }
-  if (path === '/api/v1/pool/match' && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType } = body;
-    if (!riderId || !pickupLat || !pickupLng || !destLat || !destLng || !fareInr) {
-      return { status: 400, data: { error: 'riderId, pickupLat, pickupLng, destLat, destLng, fareInr required' } };
-    }
-    const result = demandAggregationService.smartMatch({
-      riderId,
-      pickupLat: parseFloat(pickupLat),
-      pickupLng: parseFloat(pickupLng),
-      destLat: parseFloat(destLat),
-      destLng: parseFloat(destLng),
-      fareInr: parseFloat(fareInr),
-      rideType,
-    });
-    return { data: result };
-  }
-
-  // POST /api/v1/pool  { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType? }
-  if (path === '/api/v1/pool' && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const result = demandAggregationService.createPool(body);
-    return { status: result.success ? 201 : 400, data: result };
-  }
-
-  // GET /api/v1/pool/:poolId
-  const poolGetMatch = path.match(/^\/api\/v1\/pool\/([^/]+)$/);
-  if (poolGetMatch && method === 'GET') {
-    const pool = demandAggregationService.getPool(poolGetMatch[1]);
-    return { data: pool || { error: 'Pool not found' } };
-  }
-
-  // POST /api/v1/pool/:poolId/join  { riderId, pickupLat, pickupLng }
-  const poolJoinMatch = path.match(/^\/api\/v1\/pool\/(.+)\/join$/);
-  if (poolJoinMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const result = demandAggregationService.joinPool(poolJoinMatch[1], body);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // POST /api/v1/pool/:poolId/leave  { riderId }
-  const poolLeaveMatch = path.match(/^\/api\/v1\/pool\/(.+)\/leave$/);
-  if (poolLeaveMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const result = demandAggregationService.leavePool(poolLeaveMatch[1], body.riderId);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // GET /api/v1/riders/:riderId/pools
-  const riderPoolsMatch = path.match(/^\/api\/v1\/riders\/(.+)\/pools$/);
-  if (riderPoolsMatch && method === 'GET') {
-    return { data: { pools: demandAggregationService.getRiderPools(riderPoolsMatch[1]) } };
-  }
-
-  // Admin pool routes
-  if (path.startsWith('/api/v1/admin/pool')) {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-
-    // GET /api/v1/admin/pool?status=OPEN&limit=50
-    if (path === '/api/v1/admin/pool' && method === 'GET') {
-      const status = params.get('status') || undefined;
-      const limit = parseInt(params.get('limit') || '50', 10);
-      return { data: { pools: demandAggregationService.listPools({ status, limit: Math.min(limit, 200) }) } };
-    }
-
-    // POST /api/v1/admin/pool/:poolId/dispatch  { driverId, rideId? }
-    const poolDispatchMatch = path.match(/^\/api\/v1\/admin\/pool\/(.+)\/dispatch$/);
-    if (poolDispatchMatch && method === 'POST') {
-      const result = demandAggregationService.dispatchDriver(poolDispatchMatch[1], body.driverId, body.rideId);
-      return { status: result.success ? 200 : 400, data: result };
-    }
-
-    // PUT /api/v1/admin/pool/:poolId/status  { status }
-    const poolStatusMatch = path.match(/^\/api\/v1\/admin\/pool\/(.+)\/status$/);
-    if (poolStatusMatch && method === 'PUT') {
-      const result = demandAggregationService.updateStatus(poolStatusMatch[1], body.status);
-      return { status: result.success ? 200 : 400, data: result };
-    }
-
-    // GET /api/v1/admin/pool/stats
-    if (path === '/api/v1/admin/pool/stats' && method === 'GET') {
-      return { data: demandAggregationService.getStats() };
-    }
-  }
-
-  // ═══════════════════════════════════════════
-  // DRIVER INCENTIVES — Tasks & Progress
-  // ═══════════════════════════════════════════
-
-  // GET /api/v1/incentives?activeOnly=true&type=trip_count
-  if (path === '/api/v1/incentives' && method === 'GET') {
-    const activeOnly = params.get('activeOnly') === 'true';
-    const type = params.get('type') || null;
-    const limit = parseInt(params.get('limit') || '50', 10);
-    return { data: { tasks: incentiveService.listTasks({ activeOnly, type, limit: Math.min(limit, 200) }) } };
-  }
-
-  // GET /api/v1/incentives/:taskId
-  const incentiveGetMatch = path.match(/^\/api\/v1\/incentives\/([^/]+)$/);
-  if (incentiveGetMatch && method === 'GET') {
-    const task = incentiveService.getTask(incentiveGetMatch[1]);
-    return { data: task || { error: 'Task not found' } };
-  }
-
-  // POST /api/v1/incentives/:taskId/enrol  { driverId }
-  const incentiveEnrolMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/enrol$/);
-  if (incentiveEnrolMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const result = incentiveService.enrolDriver(body.driverId, incentiveEnrolMatch[1]);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // POST /api/v1/incentives/:taskId/claim  { driverId }
-  const incentiveClaimMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/claim$/);
-  if (incentiveClaimMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const { driverId } = body;
-    if (!driverId) return { status: 400, data: { error: 'driverId required' } };
-    const result = incentiveService.claimReward(driverId, incentiveClaimMatch[1]);
-    if (!result.success) return { status: 400, data: result };
-
-    // Credit reward to driver wallet
-    let walletResult = null;
-    if (result.rewardType === 'cash' && result.rewardAmount > 0) {
-      walletResult = driverWalletService.creditIncentive(driverId, result.rewardAmount, incentiveClaimMatch[1], result.task.title);
-    } else if (result.rewardType === 'coins' && result.rewardCoins > 0) {
-      walletResult = walletService.adjustCoins(driverId, result.rewardCoins, `Incentive: ${result.task.title}`);
-    }
-
-    return { data: { ...result, walletCredit: walletResult } };
-  }
-
-  // GET /api/v1/drivers/:driverId/incentives — driver's progress on enrolled tasks
-  const driverIncentivesMatch = path.match(/^\/api\/v1\/drivers\/(.+)\/incentives$/);
-  if (driverIncentivesMatch && method === 'GET') {
-    return { data: { progress: incentiveService.getDriverProgress(driverIncentivesMatch[1]) } };
-  }
-
-  // GET /api/v1/incentives/:taskId/leaderboard?limit=20
-  const incentiveLeaderboardMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/leaderboard$/);
-  if (incentiveLeaderboardMatch && method === 'GET') {
-    const limit = parseInt(params.get('limit') || '20', 10);
-    return { data: { leaderboard: incentiveService.getTaskLeaderboard(incentiveLeaderboardMatch[1], Math.min(limit, 100)) } };
-  }
-
-  // Admin incentive routes
-  if (path.startsWith('/api/v1/admin/incentives')) {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-
-    // POST /api/v1/admin/incentives  — create task
-    if (path === '/api/v1/admin/incentives' && method === 'POST') {
-      const result = incentiveService.createTask({ ...body, createdBy: 'admin' });
-      return { status: result.success ? 201 : 400, data: result };
-    }
-
-    // GET /api/v1/admin/incentives  — list all tasks
-    if (path === '/api/v1/admin/incentives' && method === 'GET') {
-      const limit = parseInt(params.get('limit') || '50', 10);
-      return { data: { tasks: incentiveService.listTasks({ limit: Math.min(limit, 500) }) } };
-    }
-
-    // PUT /api/v1/admin/incentives/:taskId  — update task
-    const adminIncentiveUpdateMatch = path.match(/^\/api\/v1\/admin\/incentives\/([^/]+)$/);
-    if (adminIncentiveUpdateMatch && method === 'PUT') {
-      const result = incentiveService.updateTask(adminIncentiveUpdateMatch[1], body);
-      return { status: result.success ? 200 : 400, data: result };
-    }
-
-    // DELETE /api/v1/admin/incentives/:taskId
-    const adminIncentiveDeleteMatch = path.match(/^\/api\/v1\/admin\/incentives\/([^/]+)$/);
-    if (adminIncentiveDeleteMatch && method === 'DELETE') {
-      const result = incentiveService.deleteTask(adminIncentiveDeleteMatch[1]);
-      return { status: result.success ? 200 : 404, data: result };
-    }
-
-    // GET /api/v1/admin/incentives/stats
-    if (path === '/api/v1/admin/incentives/stats' && method === 'GET') {
-      return { data: incentiveService.getStats() };
-    }
-
-    // GET /api/v1/admin/incentives/:taskId/leaderboard
-    const adminLeaderboardMatch = path.match(/^\/api\/v1\/admin\/incentives\/(.+)\/leaderboard$/);
-    if (adminLeaderboardMatch && method === 'GET') {
-      const limit = parseInt(params.get('limit') || '20', 10);
-      return { data: { leaderboard: incentiveService.getTaskLeaderboard(adminLeaderboardMatch[1], Math.min(limit, 500)) } };
-    }
-  }
-
-  // ═══════════════════════════════════════════
-  // CHAT TICKET SYSTEM — Support
-  // ═══════════════════════════════════════════
-
-  // POST /api/v1/tickets  { userId, userType, subject, message, category?, rideId?, priority? }
-  if (path === '/api/v1/tickets' && method === 'POST') {
-    const result = ticketService.createTicket(body);
-    return { status: result.success ? 201 : 400, data: result };
-  }
-
-  // GET /api/v1/tickets/:ticketId
-  const ticketGetMatch = path.match(/^\/api\/v1\/tickets\/([^/]+)$/);
-  if (ticketGetMatch && method === 'GET') {
-    const ticket = ticketService.getTicket(ticketGetMatch[1]);
-    return { data: ticket || { error: 'Ticket not found' } };
-  }
-
-  // POST /api/v1/tickets/:ticketId/messages  { senderId, senderRole, content, attachments? }
-  const ticketMsgMatch = path.match(/^\/api\/v1\/tickets\/(.+)\/messages$/);
-  if (ticketMsgMatch && method === 'POST') {
-    const result = ticketService.addMessage(ticketMsgMatch[1], body);
-    return { status: result.success ? 200 : 400, data: result };
-  }
-
-  // PUT /api/v1/tickets/:ticketId/read  { readBy }
-  const ticketReadMatch = path.match(/^\/api\/v1\/tickets\/(.+)\/read$/);
-  if (ticketReadMatch && method === 'PUT') {
-    const result = ticketService.markMessagesRead(ticketReadMatch[1], body.readBy);
-    return { status: result.success ? 200 : 404, data: result };
-  }
-
-  // GET /api/v1/users/:userId/tickets?limit=20&status=OPEN
-  const userTicketsMatch = path.match(/^\/api\/v1\/users\/(.+)\/tickets$/);
-  if (userTicketsMatch && method === 'GET') {
-    const limit = parseInt(params.get('limit') || '20', 10);
-    const status = params.get('status') || null;
-    return { data: { tickets: ticketService.getUserTickets(userTicketsMatch[1], { limit: Math.min(limit, 100), status }) } };
-  }
-
-  // ═══════════════════════════════════════════
-  // DEMAND ANALYTICS — Heatmap, Timeline, Logs
-  // ═══════════════════════════════════════════
-
-  // GET /api/v1/demand/heatmap — current area demand map
-  if (path === '/api/v1/demand/heatmap' && method === 'GET') {
-    const areas    = demandLogService.getDemandMap();
-    const hotAreas = areas.filter(a => a.demandLevel === 'HIGH' || a.demandLevel === 'SURGE');
-    return {
-      data: {
-        snapshot:   new Date().toISOString(),
-        totalAreas: areas.length,
-        hotAreas:   hotAreas.length,
-        areas,
-      },
-    };
-  }
-
-  // GET /api/v1/demand/areas/hot?limit=10 — top high-demand areas
-  if (path === '/api/v1/demand/areas/hot' && method === 'GET') {
-    const limit = parseInt(params.get('limit') || '10', 10);
-    return { data: { hotAreas: demandLogService.getHotAreas(Math.min(limit, 50)) } };
-  }
-
-  // GET /api/v1/demand/timeline?hours=6 — demand by 15-min bucket
-  if (path === '/api/v1/demand/timeline' && method === 'GET') {
-    const hours = parseFloat(params.get('hours') || '6');
-    return { data: demandLogService.getTimeline(Math.min(hours, 72)) };
-  }
-
-  // GET /api/v1/demand/stats — real-time demand summary
-  if (path === '/api/v1/demand/stats' && method === 'GET') {
-    const stats   = demandLogService.getStats();
-    const current = demandLogService.getCurrentBucket();
-    const hot     = demandLogService.getHotAreas(5);
-    return {
-      data: {
-        ...stats,
-        currentBucket: current,
-        topHotAreas:   hot,
-        poolStats:     demandAggregationService.getStats(),
-      },
-    };
-  }
-
-  // Admin demand routes
-  if (path.startsWith('/api/v1/admin/demand')) {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-
-    // GET /api/v1/admin/demand/logs?type=no_match_found&limit=100&since=ISO&poolId=...&areaKey=...
-    if (path === '/api/v1/admin/demand/logs' && method === 'GET') {
-      const type    = params.get('type')    || null;
-      const limit   = parseInt(params.get('limit') || '100', 10);
-      const since   = params.get('since')   || null;
-      const poolId  = params.get('poolId')  || null;
-      const areaKey = params.get('areaKey') || null;
-      const logs    = demandLogService.getScenarioLogs({ type, limit: Math.min(limit, 500), since, poolId, areaKey });
-      return { data: { count: logs.length, logs } };
-    }
-
-    // GET /api/v1/admin/demand/logs/summary — count by scenario type
-    if (path === '/api/v1/admin/demand/logs/summary' && method === 'GET') {
-      return { data: demandLogService.getLogSummary() };
-    }
-
-    // GET /api/v1/admin/demand/areas — all areas with full metrics
-    if (path === '/api/v1/admin/demand/areas' && method === 'GET') {
-      return { data: { areas: demandLogService.getDemandMap() } };
-    }
-
-    // GET /api/v1/admin/demand/peak-hours?limit=20 — time buckets sorted by demand
-    if (path === '/api/v1/admin/demand/peak-hours' && method === 'GET') {
-      const limit = parseInt(params.get('limit') || '20', 10);
-      return { data: { peakHours: demandLogService.getPeakHours(Math.min(limit, 100)) } };
-    }
-
-    // GET /api/v1/admin/demand/no-match-analysis — why matches fail
-    if (path === '/api/v1/admin/demand/no-match-analysis' && method === 'GET') {
-      return { data: demandLogService.getNoMatchAnalysis() };
-    }
-
-    // POST /api/v1/admin/demand/snapshot — trigger manual snapshot
-    if (path === '/api/v1/admin/demand/snapshot' && method === 'POST') {
-      demandLogService._takeDemandSnapshot();
-      return { data: { success: true, message: 'Demand snapshot taken.', stats: demandLogService.getStats() } };
-    }
-
-    // GET /api/v1/admin/demand/timeline?hours=24
-    if (path === '/api/v1/admin/demand/timeline' && method === 'GET') {
-      const hours = parseFloat(params.get('hours') || '24');
-      return { data: demandLogService.getTimeline(Math.min(hours, 168)) }; // max 7 days
-    }
-  }
-
-  // Admin ticket routes
-  if (path.startsWith('/api/v1/admin/tickets')) {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-
-    // GET /api/v1/admin/tickets?status=OPEN&category=payment_issue&priority=urgent
-    if (path === '/api/v1/admin/tickets' && method === 'GET') {
-      const status   = params.get('status')   || null;
-      const category = params.get('category') || null;
-      const priority = params.get('priority') || null;
-      const agentId  = params.get('agentId')  || null;
-      const limit    = parseInt(params.get('limit') || '50', 10);
-      return { data: { tickets: ticketService.listTickets({ status, category, priority, agentId, limit: Math.min(limit, 500) }) } };
-    }
-
-    // PUT /api/v1/admin/tickets/:ticketId/status  { status, resolvedBy?, resolution?, agentId? }
-    const ticketStatusMatch = path.match(/^\/api\/v1\/admin\/tickets\/(.+)\/status$/);
-    if (ticketStatusMatch && method === 'PUT') {
-      const result = ticketService.updateStatus(ticketStatusMatch[1], body);
-      return { status: result.success ? 200 : 400, data: result };
-    }
-
-    // PUT /api/v1/admin/tickets/:ticketId/assign  { agentId }
-    const ticketAssignMatch = path.match(/^\/api\/v1\/admin\/tickets\/(.+)\/assign$/);
-    if (ticketAssignMatch && method === 'PUT') {
-      const result = ticketService.assignAgent(ticketAssignMatch[1], body.agentId);
-      return { status: result.success ? 200 : 400, data: result };
-    }
-
-    // GET /api/v1/admin/tickets/stats
-    if (path === '/api/v1/admin/tickets/stats' && method === 'GET') {
-      return { data: ticketService.getStats() };
-    }
-
-    // GET /api/v1/admin/tickets/agents
-    if (path === '/api/v1/admin/tickets/agents' && method === 'GET') {
-      return { data: { agents: ticketService.listAgents() } };
-    }
-
-    // POST /api/v1/admin/tickets/agents  { agentId, name, email }
-    if (path === '/api/v1/admin/tickets/agents' && method === 'POST') {
-      const result = ticketService.addAgent(body);
-      return { status: result.success ? 201 : 400, data: result };
-    }
-  }
-
-  // ═══════════════════════════════════════════
-  // RIDE SESSION RECOVERY (app kill recovery)
-  // ═══════════════════════════════════════════
-
-  // GET /api/v1/riders/:riderId/active-ride  — lightweight check on app open
-  const activeRideMatch = path.match(/^\/api\/v1\/riders\/(.+)\/active-ride$/);
-  if (activeRideMatch && method === 'GET') {
-    const riderId = activeRideMatch[1];
-    const ride = rideService.getActiveRide(riderId);
-    if (!ride) {
-      return { data: { hasActiveRide: false } };
-    }
-    rideSessionService._logRecovery({ type: 'active_check', riderId, rideId: ride.rideId, rideStatus: ride.status });
-    return {
-      data: {
-        hasActiveRide: true,
-        rideId: ride.rideId,
-        status: ride.status,
-        wsChannel: `ride:${ride.rideId}`,
-      },
-    };
-  }
-
-  // POST /api/v1/riders/:riderId/restore  — full recovery payload (requires auth)
-  const restoreMatch = path.match(/^\/api\/v1\/riders\/(.+)\/restore$/);
-  if (restoreMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const riderId = restoreMatch[1];
-    const result = rideSessionService.restoreSession(riderId, {
-      rideService,
-      locationService,
-      matchingEngine,
-    });
-    if (!result.hasActiveRide) {
-      return { data: { hasActiveRide: false } };
-    }
-    return { data: result };
-  }
-
-  // POST /api/v1/riders/:riderId/heartbeat  — keepalive ping every 30s
-  const heartbeatMatch = path.match(/^\/api\/v1\/riders\/(.+)\/heartbeat$/);
-  if (heartbeatMatch && method === 'POST') {
-    const authResult = await requireAuth(headers);
-    if (authResult.error) return authResult.error;
-    const riderId = heartbeatMatch[1];
-    const rideId = body.rideId || null;
-    const result = rideSessionService.heartbeat(riderId, rideId);
-    return { data: result };
-  }
-
-  // GET /api/v1/admin/recovery-logs?type=restore&riderId=xxx&limit=50
-  if (path === '/api/v1/admin/recovery-logs' && method === 'GET') {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-    const type    = params.get('type') || null;
-    const riderId = params.get('riderId') || null;
-    const limit   = Math.min(parseInt(params.get('limit') || '50', 10), 500);
-    return { data: { logs: rideSessionService.getRecoveryLogs({ type, riderId, limit }) } };
-  }
-
-  // GET /api/v1/admin/demand/daily-summary
-  if (path === '/api/v1/admin/demand/daily-summary' && method === 'GET') {
-    const authErr = requireAdmin(headers);
-    if (authErr) return authErr;
-    return { data: demandLogService.getDailySummary() };
-  }
-
-  perfMonitor.recordNotFound();
-  logger.warn('API', `404 ${method} ${path}`);
-  return { status: 404, data: { error: 'Not found', path, method } };
-}
-
 function bootstrapTestData() {
   const batchSize = Math.min(enterpriseConfig.performance.bootstrapBatchSize || 250, 1000);
   const seedResult = mockDb.seed({
@@ -1630,7 +570,22 @@ async function main() {
   if (!simOnly) {
     apiServer = startAPIServer(config.server.port);
 
-    const wsServer = new WebSocketServer();
+    const wsServer = new WebSocketServer({
+      authTimeoutMs: config.security.wsAuthTimeoutMs,
+      authenticateToken: async (token) => {
+        const payload = tokenService.verifyAccessToken(token);
+        if (!payload?.sessionToken) return null;
+        const session = await identityService.validateSession(payload.sessionToken);
+        if (!session) return null;
+        if (String(session.userId) !== String(payload.userId)) return null;
+        return { userId: session.userId, sessionToken: session.sessionToken };
+      },
+      canAccessRide: (userId, rideId) => {
+        const ride = rideService.getRide(rideId);
+        if (!ride) return false;
+        return String(ride.riderId) === String(userId) || String(ride.driverId) === String(userId);
+      },
+    });
     wsServer.start(config.server.wsPort);
     if (wsServer.server && typeof wsServer.server.on === 'function') {
       wsServer.server.on('error', (err) => logger.error('WS', `WebSocket server error: ${err.message}`));

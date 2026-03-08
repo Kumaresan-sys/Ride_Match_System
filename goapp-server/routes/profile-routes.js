@@ -1,8 +1,5 @@
 'use strict';
 
-const pgRepo = require('../repositories/pg/pg-identity-repository');
-const safetyRepo = require('../repositories/pg/pg-safety-repository');
-
 function formatMemberSince(createdAt) {
   if (createdAt === null || createdAt === undefined || createdAt === '') {
     return '';
@@ -36,6 +33,8 @@ function formatMemberSince(createdAt) {
 function registerProfileRoutes(router, ctx) {
   const { requireAuth } = ctx;
   const notificationService = ctx.services?.notificationService;
+  const profileService = ctx.services?.profileService || require('../services/profile-service');
+  const safetyService = ctx.services?.safetyService || require('../services/safety-service');
 
   // POST /api/v1/profile/create  — save/update rider profile
   const createProfileHandler = async ({ body, headers }) => {
@@ -57,7 +56,7 @@ function registerProfileRoutes(router, ctx) {
     }
 
     try {
-      await pgRepo.upsertUserProfileWithEmail({
+      await profileService.upsertUserProfileWithEmail({
         userId,
         name,
         gender,
@@ -73,9 +72,9 @@ function registerProfileRoutes(router, ctx) {
     }
 
     const [bonusResult, referralResult] = await Promise.all([
-      pgRepo.awardWelcomeBonus(userId),
-      pgRepo.generateOrGetReferralCode(userId),
-      safetyRepo.seedProfileEmergencyContact(userId, emergencyContact),
+      profileService.awardWelcomeBonus(userId),
+      profileService.generateOrGetReferralCode(userId),
+      safetyService.seedProfileEmergencyContact(userId, emergencyContact),
     ]);
 
     if (bonusResult.coinsAwarded > 0 && notificationService) {
@@ -108,8 +107,8 @@ function registerProfileRoutes(router, ctx) {
 
     const { userId } = authResult.session;
     const [profile, user] = await Promise.all([
-      pgRepo.getUserProfile(userId),
-      pgRepo.getUserById(userId),
+      profileService.getUserProfile(userId),
+      profileService.getUserById(userId),
     ]);
 
     if (!profile) {
@@ -150,7 +149,7 @@ function registerProfileRoutes(router, ctx) {
     }
 
     try {
-      await pgRepo.updateProfileFields({ userId, name, email });
+      await profileService.updateProfileFields({ userId, name, email });
     } catch (err) {
       if (err.code === 'EMAIL_DUPLICATE') {
         return { status: 409, data: { success: false, message: err.message } };
