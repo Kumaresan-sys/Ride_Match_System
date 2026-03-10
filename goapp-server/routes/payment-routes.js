@@ -62,7 +62,7 @@ function registerPaymentRoutes(router, ctx) {
       };
     }
 
-    const verification = razorpay.verifyPayment({
+    const verification = await razorpay.verifyPayment({
       razorpayOrderId,
       razorpayPaymentId,
       razorpaySignature,
@@ -81,6 +81,7 @@ function registerPaymentRoutes(router, ctx) {
       verification.amountInr,
       'razorpay',
       razorpayPaymentId,
+      `rzp_rider_verify:${razorpayPaymentId}`,
     );
     eventBus.publish('payment_processed', {
       userId: verification.userId,
@@ -148,7 +149,7 @@ function registerPaymentRoutes(router, ctx) {
       };
     }
 
-    const verification = razorpay.verifyPayment({
+    const verification = await razorpay.verifyPayment({
       razorpayOrderId,
       razorpayPaymentId,
       razorpaySignature,
@@ -167,6 +168,7 @@ function registerPaymentRoutes(router, ctx) {
       verification.amountInr,
       'razorpay',
       razorpayPaymentId,
+      `rzp_driver_verify:${razorpayPaymentId}`,
     );
     eventBus.publish('payment_processed', {
       userId: verification.userId,
@@ -177,7 +179,7 @@ function registerPaymentRoutes(router, ctx) {
     });
 
     // Check updated eligibility (driver needs ≥ ₹300 to receive rides)
-    const eligibility = driverWalletSvc.canReceiveRide(verification.userId);
+    const eligibility = await driverWalletSvc.canReceiveRide(verification.userId);
 
     return {
       status: 200,
@@ -202,7 +204,7 @@ function registerPaymentRoutes(router, ctx) {
     const auth = await requireAuth(headers);
     if (auth.error) return auth.error;
 
-    const order = razorpay.getOrder(pathParams.orderId);
+    const order = await razorpay.getOrder(pathParams.orderId);
     if (!order) {
       return { status: 404, data: { error: 'Order not found' } };
     }

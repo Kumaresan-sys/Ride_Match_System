@@ -9,6 +9,7 @@ class WalletRepository {
   redeemCoins() { throw new Error('Not implemented'); }
   getTransactions() { throw new Error('Not implemented'); }
   getRidePaymentInfo() { throw new Error('Not implemented'); }
+  getRidePaymentInfoBatch() { throw new Error('Not implemented'); }
 }
 
 module.exports = WalletRepository;

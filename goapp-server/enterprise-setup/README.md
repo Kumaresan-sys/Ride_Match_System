@@ -20,19 +20,27 @@ Complete enterprise infrastructure aligned to `GoApp-Enterprise-Architecture-248
 ### 1) Start infrastructure
 
 ```bash
-cd goapp-server/enterprise-setup
-docker compose up -d
+cd goapp-server
+docker compose up -d --build
 ```
 
 This starts:
-- **PostgreSQL 16 + PostGIS** on `localhost:5432` (database: `goapp_enterprise`)
+- **PostgreSQL 17 + PostGIS** on `localhost:5432` (database: `goapp_enterprise`)
 - **Redis 7** on `localhost:6379`
-- **Kafka 3.7** on `localhost:9092`
-- **Zookeeper 3.9** on `localhost:2181`
+- **Kafka (KRaft, no Zookeeper)** on `localhost:9092`
+- **GoApp API** on `localhost:3000` / `localhost:3001`
+
+Or use the one-command bootstrap (recommended):
+
+```bash
+cd goapp-server
+./scripts/setup-docker.sh
+```
 
 ### 2) Verify infrastructure
 
 ```bash
+cd goapp-server
 docker compose ps
 ```
 
@@ -46,14 +54,15 @@ The base enterprise schema remains 20 core migrations / 248 tables, plus extensi
 If you need to re-run migrations (reset database):
 
 ```bash
+cd goapp-server
 docker compose down -v
-docker compose up -d
+docker compose up -d --build
 ```
 
 ### 4) Manual migration (existing database)
 
 ```bash
-cd sql
+cd goapp-server/enterprise-setup/sql
 ./run-migrations.sh
 ```
 
@@ -67,15 +76,15 @@ Environment variables:
 ### 5) Initialize Kafka topics
 
 ```bash
-./scripts/init-topics.sh
+cd goapp-server
+./enterprise-setup/scripts/init-topics.sh
 ```
 
 ### 6) Run the application
 
 ```bash
-cd ..
-cp .env.example .env
-node server.js --api-only
+cd goapp-server
+npm start
 ```
 
 ### 7) Validate endpoints

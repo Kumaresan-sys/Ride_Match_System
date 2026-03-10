@@ -35,6 +35,9 @@ function registerWalletRoutes(router, ctx) {
   router.register('POST', '/api/v1/wallet/:userId/pay', async ({ pathParams, body, headers }) => {
     const auth = await ensureWalletOwner(headers, pathParams.userId);
     if (auth.error) return auth.error;
+    const idempotencyKey = String(
+      headers?.['idempotency-key'] || headers?.['x-idempotency-key'] || body?.idempotencyKey || ''
+    ).trim() || null;
     const parsed = validateSchema(body, [
       { key: 'fareInr', type: 'number', required: true, min: 0.01 },
       { key: 'rideId', type: 'string', required: false, maxLength: 255 },
@@ -47,7 +50,8 @@ function registerWalletRoutes(router, ctx) {
       parsed.data.fareInr,
       parsed.data.rideId,
       parsed.data.paymentId,
-      parsed.data.method
+      parsed.data.method,
+      idempotencyKey
     );
     return { status: result.success ? 200 : 400, data: result };
   });
@@ -55,6 +59,9 @@ function registerWalletRoutes(router, ctx) {
   router.register('POST', '/api/v1/wallet/:userId/refund', async ({ pathParams, body, headers }) => {
     const auth = await ensureWalletOwner(headers, pathParams.userId);
     if (auth.error) return auth.error;
+    const idempotencyKey = String(
+      headers?.['idempotency-key'] || headers?.['x-idempotency-key'] || body?.idempotencyKey || ''
+    ).trim() || null;
     const parsed = validateSchema(body, [
       { key: 'amount', type: 'number', required: true, min: 0.01 },
       { key: 'rideId', type: 'string', required: false, maxLength: 255 },
@@ -65,7 +72,8 @@ function registerWalletRoutes(router, ctx) {
       pathParams.userId,
       parsed.data.amount,
       parsed.data.rideId,
-      parsed.data.reason
+      parsed.data.reason,
+      idempotencyKey
     );
     return { status: result.success ? 200 : 400, data: result };
   });
@@ -82,7 +90,13 @@ function registerWalletRoutes(router, ctx) {
     ]);
     if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
 
-    const idempotencyKey = parsed.data.idempotencyKey || body.idempotency_key || null;
+    const idempotencyKey = String(
+      parsed.data.idempotencyKey
+      || body.idempotency_key
+      || headers?.['idempotency-key']
+      || headers?.['x-idempotency-key']
+      || ''
+    ).trim() || null;
     if (idempotencyKey) {
       const check = await redis.checkIdempotency(`wallet_topup:${pathParams.userId}:${idempotencyKey}`);
       if (check.isDuplicate) return { status: 200, data: { ...check.existingResult, duplicate: true } };
@@ -92,7 +106,8 @@ function registerWalletRoutes(router, ctx) {
       pathParams.userId,
       parsed.data.amount,
       parsed.data.method || 'upi',
-      parsed.data.referenceId || null
+      parsed.data.referenceId || null,
+      idempotencyKey
     );
 
     if (idempotencyKey && result.success) {

@@ -4,12 +4,13 @@
 
 'use strict';
 
-const db = require('../../services/db');
+const domainDb = require('../../infra/db/domain-db');
 const { logger } = require('../../utils/logger');
 
 class PgWalletRepository {
   constructor() {
     this.coinDriftWarnings = 0;
+    this.userCoinPrefsTableExists = null;
   }
 
   // ─── Ensure wallet row exists ─────────────────────────────────────────────
@@ -19,11 +20,30 @@ class PgWalletRepository {
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value));
   }
 
+  async _resolvePaymentRiderId(userId, client = null, { required = false } = {}) {
+    const queryText = `SELECT rider_id AS id
+                       FROM payment_rider_projection
+                       WHERE user_id = $1
+                       LIMIT 1`;
+    const result = client
+      ? await client.query(queryText, [userId])
+      : await domainDb.query('payments', queryText, [userId], { role: 'reader' });
+    const riderId = result.rows[0]?.id || null;
+    if (!riderId && required) {
+      const err = new Error(`Rider projection missing for user ${userId}`);
+      err.code = 'RIDER_PROJECTION_MISSING';
+      throw err;
+    }
+    return riderId;
+  }
+
   async _ensureWallet(userId) {
     const queries = [
       {
         sql: `INSERT INTO rider_wallets (rider_id)
-              SELECT id FROM riders WHERE user_id = $1
+              SELECT rider_id
+              FROM payment_rider_projection
+              WHERE user_id = $1
               ON CONFLICT (rider_id) DO NOTHING`,
         values: [userId],
       },
@@ -42,10 +62,11 @@ class PgWalletRepository {
     ];
 
     let lastErr = null;
+    let successCount = 0;
     for (const query of queries) {
       try {
-        await db.query(query.sql, query.values);
-        return;
+        await domainDb.query('payments', query.sql, query.values);
+        successCount += 1;
       } catch (err) {
         lastErr = err;
         if (!this._isSchemaCompatibilityError(err)) {
@@ -53,25 +74,24 @@ class PgWalletRepository {
         }
       }
     }
-    if (lastErr) throw lastErr;
+    if (successCount === 0 && lastErr) throw lastErr;
   }
 
   // ─── Balance ──────────────────────────────────────────────────────────────
 
   async getBalance(userId) {
     await this._ensureWallet(userId);
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('payments', 
       `SELECT
          COALESCE(cw.balance, rw.coin_balance, 0) AS coin_balance,
          COALESCE(rw.cash_balance, w.balance, 0) AS cash_balance,
          cw.balance AS coin_wallet_balance,
          rw.coin_balance AS rider_wallet_coin_balance
-       FROM users u
-       LEFT JOIN coin_wallets cw ON cw.user_id = u.id
-       LEFT JOIN riders r ON r.user_id = u.id
-       LEFT JOIN rider_wallets rw ON rw.rider_id = r.id
-       LEFT JOIN wallets w ON w.user_id = u.id
-       WHERE u.id = $1
+       FROM (SELECT $1::uuid AS user_id) request_user
+       LEFT JOIN coin_wallets cw ON cw.user_id = request_user.user_id
+       LEFT JOIN wallets w ON w.user_id = request_user.user_id
+       LEFT JOIN payment_rider_projection pr ON pr.user_id = request_user.user_id
+       LEFT JOIN rider_wallets rw ON rw.rider_id = pr.rider_id
        LIMIT 1`,
       [userId]
     );
@@ -91,8 +111,11 @@ class PgWalletRepository {
   }
 
   async getCoinAutoUsePreference(userId) {
+    if (!await this._hasUserCoinPreferencesTable()) {
+      return false;
+    }
     try {
-      const { rows } = await db.query(
+      const { rows } = await domainDb.query('payments', 
         `SELECT auto_use_enabled
          FROM user_coin_preferences
          WHERE user_id = $1
@@ -107,8 +130,11 @@ class PgWalletRepository {
   }
 
   async setCoinAutoUsePreference(userId, enabled) {
+    if (!await this._hasUserCoinPreferencesTable()) {
+      return enabled === true;
+    }
     try {
-      const { rows } = await db.query(
+      const { rows } = await domainDb.query('payments', 
         `INSERT INTO user_coin_preferences (user_id, auto_use_enabled)
          VALUES ($1, $2)
          ON CONFLICT (user_id)
@@ -133,7 +159,7 @@ class PgWalletRepository {
     };
 
     try {
-      const { rows } = await db.query(
+      const { rows } = await domainDb.query('payments', 
         `SELECT config_key, config_value
          FROM coin_config
          WHERE config_key = ANY($1::text[])`,
@@ -202,8 +228,8 @@ class PgWalletRepository {
                      wt.description,
                      EXTRACT(EPOCH FROM wt.created_at) * 1000 AS "createdAt"
               FROM wallet_transactions wt
-              JOIN riders r ON r.id = wt.rider_id
-              WHERE r.user_id = $1
+              JOIN payment_rider_projection pr ON pr.rider_id = wt.rider_id
+              WHERE pr.user_id = $1
                 AND COALESCE(wt.coins, 0) <> 0
               ORDER BY wt.created_at DESC
               LIMIT $2 OFFSET $3`,
@@ -215,10 +241,42 @@ class PgWalletRepository {
 
   // ─── Atomic balance adjustment + transaction log ──────────────────────────
 
-  async adjustAndRecord(userId, { coinDelta = 0, cashDelta = 0 }, tx) {
-    const client = await db.getClient();
+  async adjustAndRecord(userId, { coinDelta = 0, cashDelta = 0 }, tx, options = {}) {
+    const idempotencyKey = options.idempotencyKey || tx?.idempotencyKey || null;
+    const outboxEvent = options.outboxEvent || tx?.outboxEvent || null;
+    const client = await domainDb.getClient('payments');
     try {
       await client.query('BEGIN');
+
+      if (idempotencyKey) {
+        const { rows: idemRows } = await client.query(
+          `SELECT status, response_payload
+           FROM ledger_idempotency
+           WHERE domain = 'payments'
+             AND idempotency_key = $1
+           FOR UPDATE`,
+          [idempotencyKey]
+        ).catch((err) => {
+          if (!this._isSchemaCompatibilityError(err)) throw err;
+          return { rows: [] };
+        });
+
+        if (idemRows?.length && idemRows[0].status === 'completed' && idemRows[0].response_payload) {
+          await client.query('COMMIT');
+          return idemRows[0].response_payload;
+        }
+
+        if (!idemRows?.length) {
+          await client.query(
+            `INSERT INTO ledger_idempotency (domain, actor_id, idempotency_key, status)
+             VALUES ('payments', $1, $2, 'pending')
+             ON CONFLICT (domain, idempotency_key) DO NOTHING`,
+            [userId, idempotencyKey]
+          ).catch((err) => {
+            if (!this._isSchemaCompatibilityError(err)) throw err;
+          });
+        }
+      }
       const walletTxColumns = await this._getSchemaColumns(client, 'wallet_transactions');
       const useEnterpriseWalletLedger =
         walletTxColumns.has('wallet_id') &&
@@ -275,9 +333,37 @@ class PgWalletRepository {
         walletContext,
       });
 
+      if (outboxEvent) {
+        await this._insertOutboxWithClient(client, outboxEvent);
+      }
+
+      if (idempotencyKey) {
+        await client.query(
+          `UPDATE ledger_idempotency
+           SET status = 'completed',
+               response_payload = $2::jsonb,
+               updated_at = NOW()
+           WHERE domain = 'payments'
+             AND idempotency_key = $1`,
+          [idempotencyKey, JSON.stringify({ coinBalance, cashBalance })]
+        ).catch((err) => {
+          if (!this._isSchemaCompatibilityError(err)) throw err;
+        });
+      }
+
       await client.query('COMMIT');
       return { coinBalance, cashBalance };
     } catch (err) {
+      if (idempotencyKey) {
+        await client.query(
+          `UPDATE ledger_idempotency
+           SET status = 'failed',
+               updated_at = NOW()
+           WHERE domain = 'payments'
+             AND idempotency_key = $1`,
+          [idempotencyKey]
+        ).catch(() => {});
+      }
       await client.query('ROLLBACK');
       throw err;
     } finally {
@@ -317,7 +403,7 @@ class PgWalletRepository {
             LIMIT $2`,
       values: [userId, safeLimit],
     };
-    const { rows } = await db.query(query.sql, query.values);
+    const { rows } = await domainDb.query('payments', query.sql, query.values);
     return rows;
   }
 
@@ -337,7 +423,7 @@ class PgWalletRepository {
       ? `(${rideIdExpr}::text = $2 OR ${metadataExpr}->>'rideId' = $2)`
       : `${rideIdExpr}::text = $2`;
 
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('payments', 
       `SELECT wt.id::text AS "txId",
               wt.transaction_type AS type,
               ${rideIdExpr} AS "rideId",
@@ -354,14 +440,55 @@ class PgWalletRepository {
     return rows[0] || null;
   }
 
+  async getRidePaymentInfoBatch(userId, rideIds = []) {
+    const uniqRideIds = Array.from(new Set((rideIds || []).map((id) => String(id)).filter(Boolean)));
+    if (!uniqRideIds.length) return [];
+
+    const txCols = await this._getTableColumns('wallet_transactions');
+    const relation = this._resolveWalletTxUserRelation(txCols);
+    const metadataExpr = txCols.has('metadata')
+      ? 'wt.metadata'
+      : `'{}'::jsonb`;
+
+    let rideExpr = `''::text`;
+    if (txCols.has('reference_id') && txCols.has('metadata')) {
+      rideExpr = `COALESCE(wt.reference_id::text, ${metadataExpr}->>'rideId')`;
+    } else if (txCols.has('reference_id')) {
+      rideExpr = 'wt.reference_id::text';
+    } else if (txCols.has('ride_id')) {
+      rideExpr = 'wt.ride_id::text';
+    } else if (txCols.has('metadata')) {
+      rideExpr = `${metadataExpr}->>'rideId'`;
+    } else {
+      return [];
+    }
+
+    const { rows } = await domainDb.query('payments',
+      `SELECT DISTINCT ON (${rideExpr})
+              ${rideExpr} AS "rideId",
+              wt.id::text AS "txId",
+              wt.transaction_type AS type,
+              ${metadataExpr} AS metadata,
+              EXTRACT(EPOCH FROM wt.created_at) * 1000 AS "createdAt"
+       FROM wallet_transactions wt
+       ${relation.joinClause}
+       WHERE ${relation.userWhere}
+         AND ${rideExpr} = ANY($2::text[])
+       ORDER BY ${rideExpr}, wt.created_at DESC`,
+      [userId, uniqRideIds]
+    );
+
+    return rows.filter((row) => row.rideId);
+  }
+
   _resolveWalletTxUserRelation(txCols) {
     if (txCols.has('user_id')) {
       return { joinClause: '', userWhere: 'wt.user_id = $1' };
     }
     if (txCols.has('rider_id')) {
       return {
-        joinClause: 'JOIN riders r ON r.id = wt.rider_id',
-        userWhere: 'r.user_id = $1',
+        joinClause: 'JOIN payment_rider_projection pr ON pr.rider_id = wt.rider_id',
+        userWhere: 'pr.user_id = $1',
       };
     }
     if (txCols.has('wallet_id')) {
@@ -377,7 +504,7 @@ class PgWalletRepository {
     let lastErr = null;
     for (const query of queries) {
       try {
-        const { rows } = await db.query(query.sql, query.values);
+        const { rows } = await domainDb.query('payments', query.sql, query.values);
         return rows;
       } catch (err) {
         lastErr = err;
@@ -401,7 +528,7 @@ class PgWalletRepository {
   }
 
   async _getTableColumns(tableName) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('payments', 
       `SELECT column_name
        FROM information_schema.columns
        WHERE table_schema = current_schema()
@@ -411,6 +538,19 @@ class PgWalletRepository {
     return new Set(rows.map((row) => row.column_name));
   }
 
+  async _hasUserCoinPreferencesTable() {
+    if (this.userCoinPrefsTableExists !== null) {
+      return this.userCoinPrefsTableExists;
+    }
+    try {
+      const columns = await this._getTableColumns('user_coin_preferences');
+      this.userCoinPrefsTableExists = columns.size > 0;
+    } catch (_) {
+      this.userCoinPrefsTableExists = false;
+    }
+    return this.userCoinPrefsTableExists;
+  }
+
   _isSchemaCompatibilityError(err) {
     return /column .* does not exist|relation .* does not exist/i.test(
       String(err?.message || '')
@@ -418,11 +558,12 @@ class PgWalletRepository {
   }
 
   async _adjustRiderWallet(client, userId, { coinDelta = 0, cashDelta = 0 }) {
+    const riderId = await this._resolvePaymentRiderId(userId, client, { required: true });
     await client.query(
       `INSERT INTO rider_wallets (rider_id)
-       SELECT id FROM riders WHERE user_id = $1
+       VALUES ($1)
        ON CONFLICT (rider_id) DO NOTHING`,
-      [userId]
+      [riderId]
     );
 
     const { rows } = await client.query(
@@ -430,9 +571,9 @@ class PgWalletRepository {
          coin_balance = GREATEST(0, coin_balance + $2),
          cash_balance = GREATEST(0, cash_balance + $3),
          updated_at   = NOW()
-       WHERE rider_id = (SELECT id FROM riders WHERE user_id = $1)
+       WHERE rider_id = $1
        RETURNING coin_balance, cash_balance`,
-      [userId, coinDelta, cashDelta]
+      [riderId, coinDelta, cashDelta]
     );
 
     if (!rows.length) throw new Error(`Wallet not found for user ${userId}`);
@@ -461,7 +602,11 @@ class PgWalletRepository {
 
     const walletId = rows[0].id;
     const balanceBefore = Number(rows[0].balance || 0);
-    const balanceAfter = Math.max(0, balanceBefore + Number(cashDelta || 0));
+    const delta = Number(cashDelta || 0);
+    if (delta < 0 && (balanceBefore + delta) < 0) {
+      throw new Error(`INSUFFICIENT_BALANCE:${balanceBefore}`);
+    }
+    const balanceAfter = Math.max(0, balanceBefore + delta);
 
     await client.query(
       `UPDATE wallets
@@ -506,12 +651,11 @@ class PgWalletRepository {
       `SELECT
          COALESCE(cw.balance, rw.coin_balance, 0) AS coin_balance,
          COALESCE(rw.cash_balance, w.balance, 0) AS cash_balance
-       FROM users u
-       LEFT JOIN coin_wallets cw ON cw.user_id = u.id
-       LEFT JOIN riders r ON r.user_id = u.id
-       LEFT JOIN rider_wallets rw ON rw.rider_id = r.id
-       LEFT JOIN wallets w ON w.user_id = u.id
-       WHERE u.id = $1
+       FROM (SELECT $1::uuid AS user_id) request_user
+       LEFT JOIN coin_wallets cw ON cw.user_id = request_user.user_id
+       LEFT JOIN wallets w ON w.user_id = request_user.user_id
+       LEFT JOIN payment_rider_projection pr ON pr.user_id = request_user.user_id
+       LEFT JOIN rider_wallets rw ON rw.rider_id = pr.rider_id
        LIMIT 1`,
       [userId]
     );
@@ -522,21 +666,19 @@ class PgWalletRepository {
   }
 
   async _syncRiderCoinMirror(client, userId, authoritativeCoinBalance) {
+    const riderId = await this._resolvePaymentRiderId(userId, client, { required: true });
     await client.query(
       `INSERT INTO rider_wallets (rider_id, coin_balance, cash_balance)
-       SELECT r.id, $2, 0
-       FROM riders r
-       WHERE r.user_id = $1
+       VALUES ($1, $2, 0)
        ON CONFLICT (rider_id) DO NOTHING`,
-      [userId, authoritativeCoinBalance]
+      [riderId, authoritativeCoinBalance]
     );
     const before = await client.query(
       `SELECT rw.coin_balance
        FROM rider_wallets rw
-       JOIN riders r ON r.id = rw.rider_id
-       WHERE r.user_id = $1
+       WHERE rw.rider_id = $1
        FOR UPDATE`,
-      [userId]
+      [riderId]
     );
     const previous = Number(before.rows[0]?.coin_balance || 0);
     if (Number(previous) !== Number(authoritativeCoinBalance)) {
@@ -550,8 +692,8 @@ class PgWalletRepository {
       `UPDATE rider_wallets
        SET coin_balance = $2,
            updated_at = NOW()
-       WHERE rider_id = (SELECT id FROM riders WHERE user_id = $1)`,
-      [userId, authoritativeCoinBalance]
+       WHERE rider_id = $1`,
+      [riderId, authoritativeCoinBalance]
     );
   }
 
@@ -607,9 +749,10 @@ class PgWalletRepository {
     };
 
     if (walletTxColumns.has('rider_id')) {
-      params.push(userId);
+      const riderId = await this._resolvePaymentRiderId(userId, client, { required: true });
+      params.push(riderId);
       columns.push('rider_id');
-      values.push(`(SELECT id FROM riders WHERE user_id = $${params.length})`);
+      values.push(`$${params.length}`);
     } else if (walletTxColumns.has('user_id')) {
       push('user_id', userId);
     } else if (walletTxColumns.has('wallet_id') && walletContext?.walletId) {
@@ -658,10 +801,62 @@ class PgWalletRepository {
     return 'adjustment';
   }
 
+  async _insertOutboxWithClient(client, event) {
+    await client.query(
+      `INSERT INTO outbox_events (
+         id,
+         domain,
+         topic,
+         partition_key,
+         event_type,
+         aggregate_type,
+         aggregate_id,
+         event_version,
+         payload,
+         region,
+         idempotency_key,
+         status,
+         available_at,
+         created_at,
+         updated_at
+       ) VALUES (
+         gen_random_uuid(),
+         'payments',
+         $1,
+         $2,
+         $3,
+         $4,
+         $5,
+         COALESCE($6, 1),
+         $7::jsonb,
+         COALESCE($8, 'ap-south-1'),
+         $9,
+         'pending',
+         NOW(),
+         NOW(),
+         NOW()
+       )
+       ON CONFLICT (domain, idempotency_key)
+       WHERE idempotency_key IS NOT NULL
+       DO NOTHING`,
+      [
+        event.topic,
+        event.partitionKey || null,
+        event.eventType,
+        event.aggregateType,
+        event.aggregateId,
+        event.version || 1,
+        JSON.stringify(event.payload || {}),
+        event.region || null,
+        event.idempotencyKey || null,
+      ]
+    );
+  }
+
   // ─── Stats ────────────────────────────────────────────────────────────────
 
   async getStats() {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('payments', 
       `SELECT COUNT(*)::int          AS "totalUsers",
               SUM(coin_balance)::int AS "totalCoinsInCirculation",
               SUM(cash_balance)      AS "totalCashInWallets"

@@ -1,36 +1,23 @@
-// IP-based rate limit: max 10 OTP requests per IP per 10 minutes.
-// Guards against distributing attacks across many phone numbers from one IP.
-const IP_RATE_WINDOW_MS = 10 * 60 * 1000;
-const IP_RATE_MAX = 10;
-const ipRateMap = new Map();
-const REFRESH_RATE_WINDOW_MS = 10 * 60 * 1000;
-const REFRESH_RATE_MAX = 20;
-const refreshRateMap = new Map();
+// IP-based rate limits are enforced in Redis so limits are shared across instances.
+const RedisStateStore = require('../infra/redis/state-store');
+const redis = require('../services/redis-client');
 
-function checkIpRateLimit(ip) {
+const IP_RATE_WINDOW_SEC = 10 * 60;
+const IP_RATE_MAX = 10;
+const REFRESH_RATE_WINDOW_SEC = 10 * 60;
+const REFRESH_RATE_MAX = 20;
+const authStateStore = new RedisStateStore(redis);
+
+async function checkIpRateLimit(ip) {
   const key = ip || 'unknown';
-  const now = Date.now();
-  const record = ipRateMap.get(key);
-  if (record && (now - record.windowStart) < IP_RATE_WINDOW_MS) {
-    if (record.count >= IP_RATE_MAX) return false;
-    record.count++;
-  } else {
-    ipRateMap.set(key, { count: 1, windowStart: now });
-  }
-  return true;
+  const count = await authStateStore.incrementRateLimit('auth_otp_ip', key, IP_RATE_WINDOW_SEC);
+  return count <= IP_RATE_MAX;
 }
 
-function checkRefreshRateLimit(ip) {
+async function checkRefreshRateLimit(ip) {
   const key = ip || 'unknown';
-  const now = Date.now();
-  const record = refreshRateMap.get(key);
-  if (record && (now - record.windowStart) < REFRESH_RATE_WINDOW_MS) {
-    if (record.count >= REFRESH_RATE_MAX) return false;
-    record.count++;
-  } else {
-    refreshRateMap.set(key, { count: 1, windowStart: now });
-  }
-  return true;
+  const count = await authStateStore.incrementRateLimit('auth_refresh_ip', key, REFRESH_RATE_WINDOW_SEC);
+  return count <= REFRESH_RATE_MAX;
 }
 
 const ALLOWED_CHANNELS = new Set(['sms', 'whatsapp', 'voice']);
@@ -113,7 +100,7 @@ function registerAuthRoutes(router, ctx) {
   }
 
   const requestOtpHandler = async ({ body, ip }) => {
-    if (!checkIpRateLimit(ip)) {
+    if (!await checkIpRateLimit(ip)) {
       return {
         status: 429,
         data: { success: false, message: 'Too many requests from this IP', errorCode: 'IP_RATE_LIMITED' },
@@ -219,7 +206,7 @@ function registerAuthRoutes(router, ctx) {
   };
 
   const refreshTokenHandler = async ({ body, headers, ip }) => {
-    if (!checkRefreshRateLimit(ip)) {
+    if (!await checkRefreshRateLimit(ip)) {
       return {
         status: 429,
         data: {
@@ -288,7 +275,17 @@ function registerAuthRoutes(router, ctx) {
       String(body?.refreshToken || headers?.['x-refresh-token'] || '').trim();
 
     if (auth?.error && !refreshToken) {
-      return auth.error;
+      // Logout is idempotent from client perspective. If token is already
+      // expired/invalid and no refresh token is provided, treat as already
+      // logged out instead of surfacing a 401.
+      return {
+        status: 200,
+        data: {
+          success: true,
+          message: 'Logout successful',
+          alreadyLoggedOut: true,
+        },
+      };
     }
 
     const userAgent = String(headers?.['user-agent'] || '').slice(0, 512);
@@ -322,7 +319,7 @@ function registerAuthRoutes(router, ctx) {
   };
 
   const resendOtpHandler = async ({ body, ip }) => {
-    if (!checkIpRateLimit(ip)) {
+    if (!await checkIpRateLimit(ip)) {
       return {
         status: 429,
         data: { success: false, message: 'Too many requests from this IP', errorCode: 'IP_RATE_LIMITED' },

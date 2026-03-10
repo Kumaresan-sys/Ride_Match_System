@@ -161,22 +161,45 @@ class WalletService {
   }
 
   // ─── Topup cash wallet (rider recharges) ─────────────────────────────────
-  async topupWallet(userId, amount, method = 'upi', referenceId = null) {
+  async topupWallet(userId, amount, method = 'upi', referenceId = null, idempotencyKey = null) {
     if (!amount || amount <= 0)  return { success: false, error: 'Invalid topup amount.' };
     if (amount > 50000)          return { success: false, error: 'Max topup per transaction is ₹50,000.' };
 
     const tx = {
-      txId: `TXN-TOPUP-${Date.now()}`,
+      txId: idempotencyKey ? `wallet_topup:${idempotencyKey}` : `TXN-TOPUP-${Date.now()}`,
       type: 'cash_topup',
       amountInr: amount,
       method,
       referenceId,
       paymentId: referenceId || null,
+      idempotencyKey,
       createdAt: new Date().toISOString(),
     };
+    const outboxEnabled = Boolean(config.architecture?.featureFlags?.kafkaOutbox);
 
     await pgRepo._ensureWallet(userId);
-    const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: amount }, tx);
+    const balances = await pgRepo.adjustAndRecord(
+      userId,
+      { cashDelta: amount },
+      tx,
+      {
+        idempotencyKey,
+        outboxEvent: outboxEnabled ? {
+          topic: 'payment_completed',
+          partitionKey: referenceId || userId,
+          eventType: 'payment_completed',
+          aggregateType: 'wallet',
+          aggregateId: userId,
+          idempotencyKey: idempotencyKey || referenceId || null,
+          payload: {
+            userId,
+            amountInr: amount,
+            method,
+            referenceId: referenceId || null,
+          },
+        } : null,
+      }
+    );
     eventBus.publish('wallet_topup', { userId, amount, method, cashBalance: balances.cashBalance });
     eventBus.publish('wallet_updated', { userId, reason: 'wallet_topup' });
     notificationService.notifyWalletTopup(userId, {
@@ -189,7 +212,7 @@ class WalletService {
   }
 
   // ─── Pay for ride using cash wallet ──────────────────────────────────────
-  async payWithWallet(userId, fareInr, rideId, paymentId = null, method = null) {
+  async payWithWallet(userId, fareInr, rideId, paymentId = null, method = null, idempotencyKey = null) {
     if (!fareInr || fareInr <= 0) return { success: false, error: 'Invalid fare amount.' };
 
     const bal = await this.getBalance(userId);
@@ -203,16 +226,55 @@ class WalletService {
       };
     }
     const tx = {
-      txId: `TXN-PAY-${Date.now()}`,
+      txId: idempotencyKey ? `wallet_pay:${idempotencyKey}` : `TXN-PAY-${Date.now()}`,
       type: 'ride_payment',
       amountInr: fareInr,
       rideId,
       paymentId,
       method: method || 'wallet',
       paymentMethod: method || 'wallet',
+      idempotencyKey,
       createdAt: new Date().toISOString(),
     };
-    const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: -fareInr }, tx);
+    const outboxEnabled = Boolean(config.architecture?.featureFlags?.kafkaOutbox);
+    let balances;
+    try {
+      balances = await pgRepo.adjustAndRecord(
+        userId,
+        { cashDelta: -fareInr },
+        tx,
+        {
+          idempotencyKey,
+          outboxEvent: outboxEnabled ? {
+            topic: 'payment_completed',
+            partitionKey: paymentId || rideId || userId,
+            eventType: 'payment_completed',
+            aggregateType: 'ride_payment',
+            aggregateId: rideId || userId,
+            idempotencyKey: idempotencyKey || paymentId || null,
+            payload: {
+              userId,
+              fareInr,
+              rideId: rideId || null,
+              paymentId: paymentId || null,
+              method: method || 'wallet',
+            },
+          } : null,
+        }
+      );
+    } catch (err) {
+      if (String(err.message || '').startsWith('INSUFFICIENT_BALANCE:')) {
+        const currentBalance = Number(String(err.message).split(':')[1] || 0);
+        return {
+          success: false,
+          error: 'Insufficient wallet balance.',
+          cashBalance: currentBalance,
+          required: fareInr,
+          shortfall: Math.round((fareInr - currentBalance) * 100) / 100,
+        };
+      }
+      throw err;
+    }
     eventBus.publish('wallet_payment', { userId, fareInr, rideId, cashBalance: balances.cashBalance });
     eventBus.publish('wallet_updated', { userId, reason: 'wallet_payment' });
     notificationService.notifyWalletPayment(userId, {
@@ -225,13 +287,43 @@ class WalletService {
   }
 
   // ─── Refund to cash wallet ────────────────────────────────────────────────
-  async refundToWallet(userId, amount, rideId, reason = 'ride_cancelled') {
+  async refundToWallet(userId, amount, rideId, reason = 'ride_cancelled', idempotencyKey = null) {
     if (!amount || amount <= 0) return { success: false, error: 'Invalid refund amount.' };
 
-    const tx = { txId: `TXN-REFUND-${Date.now()}`, type: 'refund', amountInr: amount, rideId, reason, createdAt: new Date().toISOString() };
+    const tx = {
+      txId: idempotencyKey ? `wallet_refund:${idempotencyKey}` : `TXN-REFUND-${Date.now()}`,
+      type: 'refund',
+      amountInr: amount,
+      rideId,
+      reason,
+      idempotencyKey,
+      createdAt: new Date().toISOString(),
+    };
+    const outboxEnabled = Boolean(config.architecture?.featureFlags?.kafkaOutbox);
 
     await pgRepo._ensureWallet(userId);
-    const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: amount }, tx);
+    const balances = await pgRepo.adjustAndRecord(
+      userId,
+      { cashDelta: amount },
+      tx,
+      {
+        idempotencyKey,
+        outboxEvent: outboxEnabled ? {
+          topic: 'payment_completed',
+          partitionKey: rideId || userId,
+          eventType: 'payment_completed',
+          aggregateType: 'refund',
+          aggregateId: rideId || userId,
+          idempotencyKey: idempotencyKey || null,
+          payload: {
+            userId,
+            amountInr: amount,
+            rideId: rideId || null,
+            reason,
+          },
+        } : null,
+      }
+    );
     eventBus.publish('wallet_refund', { userId, amount, rideId, reason });
     eventBus.publish('wallet_updated', { userId, reason: 'wallet_refund' });
     notificationService.notifyWalletRefund(userId, {
@@ -307,6 +399,17 @@ class WalletService {
     if (!userId || !rideId) return null;
     const row = await pgRepo.getLatestRidePaymentInfo(userId, rideId);
     return this._paymentInfoFromTx(row);
+  }
+
+  async getRidePaymentInfoBatch(userId, rideIds = []) {
+    if (!userId || !Array.isArray(rideIds) || !rideIds.length) return {};
+    const rows = await pgRepo.getRidePaymentInfoBatch(userId, rideIds);
+    const byRideId = {};
+    for (const row of rows) {
+      if (!row?.rideId) continue;
+      byRideId[String(row.rideId)] = this._paymentInfoFromTx(row);
+    }
+    return byRideId;
   }
 
   async getStats() {

@@ -1,112 +1,118 @@
 // GoApp Matching Engine
-// Multi-stage matching, composite scoring, distributed locks, timeouts
+// Worker-owned, Redis-backed, deterministic matching.
 
+'use strict';
+
+const crypto = require('crypto');
 const config = require('../config');
 const redis = require('./redis-client');
 const locationService = require('./location-service');
-const { calculateCompositeScore, haversine } = require('../utils/formulas');
+const { haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
 const driverWalletService = require('./driver-wallet-service');
+const notificationService = require('./notification-service');
 const perfMonitor = require('./perf-monitor');
+const RedisStateStore = require('../infra/redis/state-store');
+const pgDriverRepo = require('../repositories/pg/pg-driver-repository');
+
+const OFFER_BATCH_SIZE = 5;
+const OFFER_TIMEOUT_SEC = 7;
+const MAX_MATCH_WINDOW_MS = 30_000;
 
 class MatchingEngine {
   constructor() {
-    this.activeMatches = new Map();  // rideId -> match state
-    this.driverPool = new Map();     // driverId -> driver data (from test data)
-    this.excludedDrivers = new Map(); // rideId -> Set of excluded driverIds
+    this.stateStore = new RedisStateStore(redis);
   }
 
-  registerDriver(driver) {
-    this.driverPool.set(driver.driverId, driver);
+  async registerDriver(driver) {
+    await this.stateStore.setDriverState(driver.driverId, {
+      status: driver.status || 'offline',
+      vehicleType: driver.vehicleType || '',
+      rating: Number(driver.rating || 0),
+      name: driver.name || '',
+      vehicleNumber: driver.vehicleNumber || '',
+    });
+    await this.stateStore.setDriverEligibility(driver.driverId, {
+      eligible: true,
+      reason: 'registered',
+      updatedAt: Date.now(),
+    }, 300);
   }
 
-  getDriver(driverId) {
-    return this.driverPool.get(driverId);
+  async getDriver(driverId) {
+    const dbDriver = await pgDriverRepo.getDriver(driverId).catch(() => null);
+    if (dbDriver) return dbDriver;
+
+    const state = await this.stateStore.getDriverState(driverId).catch(() => null);
+    if (!state || Object.keys(state).length === 0) return null;
+
+    return {
+      driverId,
+      name: state.name || 'Driver',
+      vehicleType: state.vehicleType || 'sedan',
+      vehicleNumber: state.vehicleNumber || null,
+      rating: Number(state.rating || 0),
+      status: state.status || 'offline',
+    };
   }
 
-  updateDriverStatus(driverId, status) {
-    const driver = this.driverPool.get(driverId);
-    if (driver) driver.status = status;
+  async updateDriverStatus(driverId, status) {
+    await this.stateStore.setDriverState(driverId, { status });
   }
 
-  updateDriverRating(driverId, newRating) {
-    const driver = this.driverPool.get(driverId);
-    if (driver) driver.rating = newRating;
+  async updateDriverRating(driverId, newRating) {
+    await this.stateStore.setDriverState(driverId, { rating: Number(newRating || 0) });
   }
 
-  // ═══════════════════════════════════════════
-  // MAIN MATCHING FLOW
-  // ═══════════════════════════════════════════
   async startMatching(ride, fromStage = 1) {
-    const { rideId, pickupLat, pickupLng, rideType } = ride;
+    const { rideId, pickupLat, pickupLng } = ride;
+    const startedAt = Date.now();
+    const configuredWindowMs = Math.max(1, Number(config.matching.maxTotalTimeoutSec || 30)) * 1000;
+    const hardDeadline = startedAt + Math.min(configuredWindowMs, MAX_MATCH_WINDOW_MS);
 
     logger.divider(`MATCHING STARTED: Ride ${rideId}`);
-    logger.info('MATCHING', `Pickup: (${pickupLat}, ${pickupLng}) | Type: ${rideType}`);
+    logger.info('MATCHING', `Pickup: (${pickupLat}, ${pickupLng})`);
 
-    const matchState = {
+    await this.stateStore.setMatchState(rideId, {
       rideId,
       currentStage: 0,
-      startTime: Date.now(),
+      startedAt,
       cancelled: false,
-      result: null,
-    };
-    this.activeMatches.set(rideId, matchState);
+    }, Math.max(config.matching.maxTotalTimeoutSec + 300, 600));
 
     eventBus.publish('ride_matching_started', { rideId, rideType: ride.rideType });
 
-    // Iterate through stages (optionally starting from a given stage)
-    const stages = config.matching.stages.filter(s => s.stage >= fromStage);
-    for (let i = 0; i < stages.length; i++) {
-      if (matchState.cancelled) {
+    const stages = config.matching.stages.filter((s) => s.stage >= fromStage);
+    for (const stage of stages) {
+      const state = await this.stateStore.getMatchState(rideId);
+      if (state?.cancelled) {
         logger.warn('MATCHING', `Ride ${rideId} cancelled during matching`);
+        await this.stateStore.clearMatchState(rideId);
         return { success: false, reason: 'CANCELLED' };
       }
 
-      const stage = stages[i];
-      matchState.currentStage = stage.stage;
+      await this.stateStore.setMatchState(rideId, { ...state, currentStage: stage.stage }, 1800);
+      eventBus.publish('ride_matching_stage_changed', { rideId, stage: stage.stage, radiusKm: stage.radiusKm });
 
-      logger.info('MATCHING', `\n  ┌─ Stage ${stage.stage}: ${stage.radiusKm}km radius, max ${stage.maxDrivers} drivers, ${stage.timeoutSec}s timeout`);
-
-      eventBus.publish('ride_matching_stage_changed', {
-        rideId, stage: stage.stage, radiusKm: stage.radiusKm,
-      });
-
-      // Step 1: Find nearby available drivers
       const nearbyDrivers = await this._findCandidates(ride, stage);
-
       if (nearbyDrivers.length === 0) {
-        logger.warn('MATCHING', `  └─ Stage ${stage.stage}: No drivers found in ${stage.radiusKm}km radius`);
+        if (Date.now() >= hardDeadline) break;
         continue;
       }
 
-      // Step 2: Score and rank drivers
-      const rankedDrivers = this._scoreAndRank(nearbyDrivers, ride, stage);
-
-      // Step 3: Broadcast to top drivers
-      const broadcastResult = await this._broadcastAndWait(rideId, rankedDrivers, stage);
-
-      if (broadcastResult.accepted) {
-        matchState.result = broadcastResult;
-        this.activeMatches.delete(rideId);
-        this.excludedDrivers.delete(rideId);
-        perfMonitor.recordMatch(true, Date.now() - matchState.startTime);
-        return broadcastResult;
+      const rankedDrivers = await this._scoreAndRank(nearbyDrivers, ride, stage);
+      const batchResult = await this._broadcastInBatches(rideId, rankedDrivers, stage, startedAt, hardDeadline);
+      if (batchResult.accepted) {
+        await this.stateStore.clearMatchState(rideId);
+        perfMonitor.recordMatch(true, Date.now() - startedAt);
+        return batchResult;
       }
 
-      // Check total timeout
-      const elapsed = (Date.now() - matchState.startTime) / 1000;
-      if (elapsed >= config.matching.maxTotalTimeoutSec) {
-        logger.error('MATCHING', `Ride ${rideId}: Max total timeout (${config.matching.maxTotalTimeoutSec}s) exceeded`);
-        break;
-      }
+      if (Date.now() >= hardDeadline) break;
     }
 
-    // All stages exhausted
-    logger.error('MATCHING', `Ride ${rideId}: No drivers available after all stages`);
-    this.activeMatches.delete(rideId);
-    this.excludedDrivers.delete(rideId);
-    perfMonitor.recordMatch(false, Date.now() - matchState.startTime);
-
+    await this.stateStore.clearMatchState(rideId);
+    perfMonitor.recordMatch(false, Date.now() - startedAt);
     eventBus.publish('ride_no_drivers', { rideId });
 
     return {
@@ -118,148 +124,223 @@ class MatchingEngine {
     };
   }
 
-  // ═══════════════════════════════════════════
-  // STEP 1: Find candidate drivers
-  // ═══════════════════════════════════════════
   async _findCandidates(ride, stage) {
     const { pickupLat, pickupLng, rideType } = ride;
-    const excluded = this.excludedDrivers.get(ride.rideId) || new Set();
+    const excluded = new Set(await this.stateStore.getExcludedDrivers(ride.rideId));
+    const nearby = await locationService.findNearby(pickupLat, pickupLng, stage.radiusKm, stage.maxDrivers * 3);
 
-    // Query Redis GEO
-    const nearby = await locationService.findNearby(
-      pickupLat, pickupLng, stage.radiusKm, stage.maxDrivers * 3 // get extra for filtering
+    const eligibilityEntries = await Promise.all(
+      nearby.map(async (loc) => {
+        const cached = await this.stateStore.getDriverEligibility(loc.driverId).catch(() => null);
+        if (cached && typeof cached.eligible !== 'undefined') return [loc.driverId, cached];
+        const computed = await driverWalletService.canReceiveRide(loc.driverId);
+        await this.stateStore.setDriverEligibility(loc.driverId, computed, 120).catch(() => {});
+        return [loc.driverId, computed];
+      }),
     );
 
-    // Batch wallet eligibility check before filter to avoid N+1 service calls
-    const eligibilityMap = new Map(
-      nearby.map(loc => [loc.driverId, driverWalletService.canReceiveRide(loc.driverId)])
+    const stateEntries = await Promise.all(
+      nearby.map(async (loc) => [loc.driverId, await this.stateStore.getDriverState(loc.driverId)]),
     );
 
-    // Filter: available, correct vehicle type, not excluded
-    const candidates = nearby.filter(loc => {
-      const driver = this.driverPool.get(loc.driverId);
-      if (!driver) return false;
-      if (driver.status !== 'online') return false;
-      if (rideType && driver.vehicleType !== rideType) return false;
-      if (excluded.has(loc.driverId)) return false;
-      return eligibilityMap.get(loc.driverId)?.eligible ?? false;
+    const eligibilityMap = new Map(eligibilityEntries);
+    const stateMap = new Map(stateEntries);
+
+    const candidates = nearby.filter((loc) => {
+      const state = stateMap.get(loc.driverId) || {};
+      if ((state.status || '').toLowerCase() !== 'online') return false;
+      if (rideType && state.vehicleType && state.vehicleType !== rideType) return false;
+      if (excluded.has(String(loc.driverId))) return false;
+      return Boolean(eligibilityMap.get(loc.driverId)?.eligible);
     });
 
-    logger.info('MATCHING', `  │  Found ${nearby.length} nearby → ${candidates.length} eligible candidates`);
+    logger.info('MATCHING', `Found ${nearby.length} nearby -> ${candidates.length} eligible candidates`);
     return candidates;
   }
 
-  // ═══════════════════════════════════════════
-  // STEP 2: Composite scoring
-  // ═══════════════════════════════════════════
-  _scoreAndRank(candidates, ride, stage) {
-    const { pickupLat, pickupLng } = ride;
+  _normalizeRate(value, fallback = 1) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    if (n > 1) return Math.max(0, Math.min(1, n / 100));
+    return Math.max(0, Math.min(1, n));
+  }
 
-    // Pre-compute ETA once per candidate (eliminates duplicate haversine in scoring)
-    const candidatesWithETA = candidates.map(c => {
-      const distKm = haversine(c.lat, c.lng, pickupLat, pickupLng);
-      return { ...c, _etaMin: (distKm / config.scoring.avgCitySpeedKmh) * 60 };
-    });
-    const maxETA = Math.max(...candidatesWithETA.map(c => c._etaMin), 1);
+  _hashJitter(seed) {
+    const h = crypto.createHash('sha256').update(seed).digest('hex').slice(0, 8);
+    const value = parseInt(h, 16) / 0xffffffff;
+    return Math.max(0, Math.min(1, value));
+  }
 
-    // Score each driver — pass precomputed etaMin to avoid second haversine call
-    const scored = candidatesWithETA.map(candidate => {
-      const driver = this.driverPool.get(candidate.driverId);
-      const driverData = {
-        ...driver,
-        lat: candidate.lat,
-        lng: candidate.lng,
-        heading: candidate.heading,
-        lastLocationUpdate: Date.now() - (candidate.ageSec * 1000),
+  async _scoreAndRank(candidates, ride, stage) {
+    const { pickupLat, pickupLng, rideId } = ride;
+
+    const profiles = await Promise.all(candidates.map(async (candidate) => {
+      const db = await pgDriverRepo.getDriver(candidate.driverId).catch(() => null);
+      const state = await this.stateStore.getDriverState(candidate.driverId).catch(() => ({}));
+      return {
+        driverId: candidate.driverId,
+        name: db?.name || state?.name || `Driver-${String(candidate.driverId).slice(0, 6)}`,
+        vehicleType: db?.vehicleType || state?.vehicleType || 'sedan',
+        vehicleNumber: db?.vehicleNumber || state?.vehicleNumber || null,
+        rating: Number(db?.rating || state?.rating || config.rating.defaultRating || 5),
+        acceptanceRate: this._normalizeRate(db?.acceptanceRate ?? state?.acceptanceRate ?? 1),
+        completionRate: this._normalizeRate(db?.completionRate ?? state?.completionRate ?? 1),
+        cancelRate: this._normalizeRate(state?.cancelRate ?? 0, 0),
+        lastTripEndTime: Number(state?.lastTripEndTime || Date.now()),
+        ...candidate,
       };
+    }));
 
-      const scoreResult = calculateCompositeScore(driverData, pickupLat, pickupLng, maxETA, candidate._etaMin);
+    const withEta = profiles.map((candidate) => {
+      const distKm = haversine(candidate.lat, candidate.lng, pickupLat, pickupLng);
+      const etaMin = (distKm / config.scoring.avgCitySpeedKmh) * 60;
+      return {
+        ...candidate,
+        _distKm: distKm,
+        _etaMin: etaMin,
+      };
+    });
+
+    const maxEta = Math.max(...withEta.map((candidate) => candidate._etaMin), 1);
+
+    const scored = withEta.map((candidate) => {
+      const etaNorm = Math.max(0, Math.min(1, 1 - (candidate._etaMin / maxEta)));
+      const now = Date.now();
+      const idleMin = Math.max(0, (now - Number(candidate.lastTripEndTime || now)) / 60000);
+      const idleTimeNorm = Math.max(0, Math.min(1, idleMin / 30));
+      const fairnessJitter = this._hashJitter(`${rideId}:${candidate.driverId}:${stage.stage}`);
+
+      const score = (0.40 * etaNorm)
+        + (0.20 * candidate.acceptanceRate)
+        + (0.15 * candidate.completionRate)
+        + (0.10 * (1 - candidate.cancelRate))
+        + (0.10 * idleTimeNorm)
+        + (0.05 * fairnessJitter);
 
       return {
         driverId: candidate.driverId,
-        driverName: driver.name,
-        vehicleType: driver.vehicleType,
-        vehicleNumber: driver.vehicleNumber,
-        ...scoreResult,
+        driverName: candidate.name,
+        vehicleType: candidate.vehicleType,
+        vehicleNumber: candidate.vehicleNumber,
+        score: Math.round(score * 1000) / 1000,
+        etaMin: Math.round(candidate._etaMin * 10) / 10,
+        distKm: Math.round(candidate._distKm * 100) / 100,
+        breakdown: {
+          etaNorm: Math.round(etaNorm * 1000) / 1000,
+          acceptanceRate: Math.round(candidate.acceptanceRate * 1000) / 1000,
+          completionRate: Math.round(candidate.completionRate * 1000) / 1000,
+          cancelRate: Math.round(candidate.cancelRate * 1000) / 1000,
+          idleTimeNorm: Math.round(idleTimeNorm * 1000) / 1000,
+          fairnessJitter: Math.round(fairnessJitter * 1000) / 1000,
+        },
       };
     });
 
-    // Sort by score descending
     scored.sort((a, b) => b.score - a.score);
-
-    // Take top N for this stage
-    const topDrivers = scored.slice(0, stage.maxDrivers);
-
-    // Log ranking
-    logger.info('MATCHING', `  │  Driver Rankings:`);
-    topDrivers.forEach((d, i) => {
-      logger.info('MATCHING',
-        `  │  ${i + 1}. ${d.driverName} (${d.driverId}) | Score: ${d.score} | ETA: ${d.etaMin}min | Dist: ${d.distKm}km`);
-      logger.info('MATCHING',
-        `  │     Breakdown → ETA:${d.breakdown.etaScore} Idle:${d.breakdown.idleScore} Accept:${d.breakdown.acceptanceScore} ` +
-        `Complete:${d.breakdown.completionScore} Rating:${d.breakdown.ratingScore} Heading:${d.breakdown.headingScore} Fresh:${d.breakdown.freshnessModifier}`);
-    });
-
-    return topDrivers;
+    return scored.slice(0, stage.maxDrivers);
   }
 
-  // ═══════════════════════════════════════════
-  // STEP 3: Broadcast and wait for acceptance
-  // ═══════════════════════════════════════════
-  async _broadcastAndWait(rideId, rankedDrivers, stage) {
-    logger.info('MATCHING', `  │  Broadcasting to ${rankedDrivers.length} drivers...`);
+  _chunk(items, size) {
+    const out = [];
+    for (let i = 0; i < items.length; i += size) {
+      out.push(items.slice(i, i + size));
+    }
+    return out;
+  }
 
+  async _broadcastInBatches(rideId, rankedDrivers, stage, startedAt, hardDeadline) {
+    const batches = this._chunk(rankedDrivers, OFFER_BATCH_SIZE);
+    for (const batch of batches) {
+      const remainingMs = hardDeadline - Date.now();
+      if (remainingMs <= 0) break;
+
+      const timeoutSec = Math.max(1, Math.min(OFFER_TIMEOUT_SEC, Math.floor(remainingMs / 1000)));
+      const result = await this._broadcastAndWaitBatch({
+        rideId,
+        drivers: batch,
+        stage,
+        timeoutSec,
+        startedAt,
+      });
+
+      if (result.accepted) return result;
+    }
+
+    return { accepted: false, reason: 'TIMEOUT' };
+  }
+
+  async _broadcastAndWaitBatch({ rideId, drivers, stage, timeoutSec, startedAt }) {
     eventBus.publish('ride_broadcast_sent', {
       rideId,
       stage: stage.stage,
-      driverIds: rankedDrivers.map(d => d.driverId),
+      driverIds: drivers.map((driver) => driver.driverId),
+      timeoutSec,
     });
 
-    // Simulate driver responses
-    return new Promise((resolve) => {
-      let settled = false;  // guard: ensure promise resolves exactly once
+    const offers = await Promise.all(drivers.map((driver) => this.stateStore.setRideOffer(
+      rideId,
+      driver.driverId,
+      {
+        offerId: `${rideId}:${driver.driverId}:${Date.now()}`,
+        rideId,
+        driverId: driver.driverId,
+        stage: stage.stage,
+        score: driver.score,
+        etaMin: driver.etaMin,
+      },
+      timeoutSec + 30,
+    )));
 
+    await Promise.all(offers.map((offer, idx) => notificationService.notifyDriverRideOffer(offer.driverId, {
+      offerId: offer.offerId,
+      rideId,
+      stage: stage.stage,
+      etaMin: drivers[idx].etaMin,
+      score: drivers[idx].score,
+      ttlSec: timeoutSec,
+    }).catch(() => {})));
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let pollTimer = null;
       const settle = (result) => {
         if (settled) return;
         settled = true;
+        if (pollTimer) clearInterval(pollTimer);
         resolve(result);
       };
 
-      const timeout = setTimeout(() => {
-        clearTimeout(acceptTimer);
-        logger.warn('MATCHING', `  └─ Stage ${stage.stage}: Timeout (${stage.timeoutSec}s) - no driver accepted`);
+      const timeout = setTimeout(async () => {
+        await this.stateStore.clearAcceptedDriver(rideId).catch(() => {});
         settle({ accepted: false, reason: 'TIMEOUT' });
-      }, stage.timeoutSec * 1000);
+      }, timeoutSec * 1000);
 
-      // Simulate: random driver accepts within timeout
-      const acceptDelay = Math.random() * (stage.timeoutSec * 0.8) * 1000;
-      const respondingDrivers = rankedDrivers.filter(() => Math.random() > 0.3);
+      pollTimer = setInterval(async () => {
+        try {
+          const acceptedDriverId = await this.stateStore.getAcceptedDriver(rideId);
+          if (!acceptedDriverId) return;
 
-      if (respondingDrivers.length === 0) {
-        // No drivers responded — let the timeout fire normally
-        var acceptTimer = null;
-        return;
-      }
+          const winner = drivers.find((driver) => String(driver.driverId) === String(acceptedDriverId));
+          if (!winner) return;
 
-      var acceptTimer = setTimeout(async () => {
-        clearTimeout(timeout);
+          clearTimeout(timeout);
 
-        // First responding driver tries to claim
-        const winner = respondingDrivers[0];
-        const lockResult = await this._claimRide(rideId, winner.driverId);
+          const lockResult = await this._claimRide(rideId, winner.driverId);
+          await this.stateStore.clearAcceptedDriver(rideId);
+          if (!lockResult.acquired) {
+            settle({ accepted: false, reason: 'LOCK_CONTENTION' });
+            return;
+          }
 
-        if (lockResult.acquired) {
-          // Notify other drivers
-          const losers = rankedDrivers.filter(d => d.driverId !== winner.driverId);
-          losers.forEach(d => {
-            eventBus.publish('ride_accept_rejected', { rideId, driverId: d.driverId });
-            logger.info('MATCHING', `  │  Notified ${d.driverName}: ride taken`);
-          });
+          await this.updateDriverStatus(winner.driverId, 'on_trip');
 
-          // Update driver status
-          this.updateDriverStatus(winner.driverId, 'on_trip');
-
-          logger.success('MATCHING', `  └─ MATCHED! Driver ${winner.driverName} (${winner.driverId}) | Score: ${winner.score} | ETA: ${winner.etaMin}min`);
+          drivers
+            .filter((driver) => String(driver.driverId) !== String(winner.driverId))
+            .forEach((driver) => eventBus.publish('ride_accept_rejected', {
+              rideId,
+              driverId: driver.driverId,
+              reason: 'winner_selected',
+            }));
 
           settle({
             accepted: true,
@@ -272,71 +353,69 @@ class MatchingEngine {
             etaMin: winner.etaMin,
             distKm: winner.distKm,
             stage: stage.stage,
-            matchTimeSec: Math.round((Date.now() - (this.activeMatches.get(rideId)?.startTime ?? Date.now())) / 1000),
+            lockToken: lockResult.lockToken,
+            matchTimeSec: Math.round((Date.now() - startedAt) / 1000),
           });
-        } else {
-          // Lock was taken by another process — treat as timeout for this stage
-          logger.warn('MATCHING', `  └─ Stage ${stage.stage}: Lock contention — treating as no-accept`);
-          settle({ accepted: false, reason: 'LOCK_CONTENTION' });
+        } catch (err) {
+          logger.warn('MATCHING', `Offer polling failed for ${rideId}: ${err.message}`);
         }
-      }, acceptDelay);
+      }, 250);
     });
   }
 
-  // ═══════════════════════════════════════════
-  // Distributed Lock (SETNX)
-  // ═══════════════════════════════════════════
   async _claimRide(rideId, driverId) {
-    const lockResult = await redis.acquireLock(rideId, driverId, 60);
-
+    const lockResult = await this.stateStore.acquireRideAssignLock(rideId, driverId, 60);
     if (lockResult.acquired) {
       eventBus.publish('ride_accepted', { rideId, driverId });
     } else {
       eventBus.publish('ride_accept_rejected', {
-        rideId, driverId, holder: lockResult.holder,
+        rideId,
+        driverId,
+        holder: lockResult.holder,
       });
     }
-
     return lockResult;
   }
 
-  // ═══════════════════════════════════════════
-  // Cancellation during matching
-  // ═══════════════════════════════════════════
-  cancelMatching(rideId) {
-    const matchState = this.activeMatches.get(rideId);
-    if (matchState) {
-      matchState.cancelled = true;
-      logger.warn('MATCHING', `Ride ${rideId} matching cancelled`);
-      eventBus.publish('ride_cancelled_during_matching', { rideId });
-    }
+  async cancelMatching(rideId) {
+    const state = await this.stateStore.getMatchState(rideId);
+    if (!state) return;
+    await this.stateStore.setMatchState(rideId, { ...state, cancelled: true }, 3600);
+    eventBus.publish('ride_cancelled_during_matching', { rideId });
   }
 
-  // Exclude a driver (e.g., after driver cancellation)
-  excludeDriver(rideId, driverId) {
-    if (!this.excludedDrivers.has(rideId)) {
-      this.excludedDrivers.set(rideId, new Set());
-    }
-    this.excludedDrivers.get(rideId).add(driverId);
+  async excludeDriver(rideId, driverId) {
+    await this.stateStore.addExcludedDriver(rideId, driverId, 3600);
   }
 
-  // Continue matching from last stage after driver cancellation
   async resumeMatching(ride, fromStage) {
-    logger.info('MATCHING', `Resuming matching for ride ${ride.rideId} from stage ${fromStage}`);
     return this.startMatching(ride, fromStage);
   }
 
-  getActiveMatches() {
-    const matches = [];
-    for (const [rideId, state] of this.activeMatches) {
-      matches.push({
-        rideId,
-        stage: state.currentStage,
-        elapsedSec: Math.round((Date.now() - state.startTime) / 1000),
-        cancelled: state.cancelled,
-      });
+  async getActiveMatches() {
+    return [];
+  }
+
+  async acceptOffer(rideId, driverId, offerId = null) {
+    const offer = await this.stateStore.getRideOffer(rideId, driverId);
+    if (!offer) {
+      return { success: false, error: 'No active offer found for this driver/ride.' };
     }
-    return matches;
+    if (offerId && String(offer.offerId) !== String(offerId)) {
+      return { success: false, error: 'Offer is stale or does not belong to this ride.' };
+    }
+
+    const accepted = await this.stateStore.markRideAccepted(rideId, driverId, OFFER_TIMEOUT_SEC + 10);
+    if (accepted !== 'OK') {
+      return { success: false, error: 'Ride already accepted by another driver.' };
+    }
+
+    return {
+      success: true,
+      rideId,
+      driverId,
+      offerId: offer.offerId,
+    };
   }
 }
 

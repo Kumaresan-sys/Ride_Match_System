@@ -1,49 +1,30 @@
 // GoApp Driver Location Service
-// Manages real-time driver positions in Redis GEO with PostGIS persistence.
-//
-// driverMeta Map is a real-time in-memory store for immediate location access
-// (interpolation, fraud detection) — NOT a mock.
-// Writes to PostGIS (driver_locations table) for persistence + history.
-// Falls back to PostGIS spatial search when Redis GEO returns no results.
+// Distributed location authority via Redis GEO + Redis hashes, with PostGIS persistence.
 
-const redis  = require('./redis-client');
+'use strict';
+
+const redis = require('./redis-client');
 const config = require('../config');
-const { predictLocation, detectSpoofing } = require('../utils/formulas');
+const { detectSpoofing } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
 const pgRepo = require('../repositories/pg/pg-location-repository');
+const RedisStateStore = require('../infra/redis/state-store');
 
-const GEO_KEY = 'drivers:locations';
-const driverMeta = new Map(); // driverId -> { speed, heading, prevLocation, jumpCount, ... }
-
-// Evict stale entries every 5 minutes to prevent unbounded Map growth.
-const _evictTimer = setInterval(() => {
-  const maxAgeMs = (config.scoring?.freshness?.maxAgeSec ?? 300) * 1000;
-  const cutoff = Date.now() - maxAgeMs;
-  for (const [driverId, meta] of driverMeta) {
-    if (meta.updatedAt < cutoff) {
-      driverMeta.delete(driverId);
-      logger.info('LOCATION', `Evicted stale driver ${driverId} from location cache`);
-    }
-  }
-}, 5 * 60 * 1000);
-_evictTimer.unref();
+const stateStore = new RedisStateStore(redis);
 
 class LocationService {
-  // Process incoming GPS update from driver
-  updateLocation(driverId, { lat, lng, speed, heading, clientTimestamp }) {
+  async updateLocation(driverId, { lat, lng, speed, heading, clientTimestamp }) {
     const now = Date.now();
-    const prev = driverMeta.get(driverId);
+    const prior = await stateStore.getDriverState(driverId).catch(() => ({}));
+    const geoBucket = String(prior?.city || prior?.homeCity || 'default').toLowerCase();
+    const prevLat = Number(prior?.lat);
+    const prevLng = Number(prior?.lng);
+    const prevUpdatedAt = Number(prior?.lastLocationUpdate);
 
-    // ─── Fraud Detection ───
-    if (prev && prev.lat && prev.lng) {
-      const timeDiff = (now - prev.updatedAt) / 1000;
+    if (Number.isFinite(prevLat) && Number.isFinite(prevLng) && Number.isFinite(prevUpdatedAt)) {
+      const timeDiff = (now - prevUpdatedAt) / 1000;
       if (timeDiff > 0) {
-        const spoofCheck = detectSpoofing(
-          { lat: prev.lat, lng: prev.lng },
-          { lat, lng },
-          timeDiff
-        );
-
+        const spoofCheck = detectSpoofing({ lat: prevLat, lng: prevLng }, { lat, lng }, timeDiff);
         if (spoofCheck.isSuspicious) {
           for (const flag of spoofCheck.flags) {
             logger.error('LOCATION', `Fraud detected for driver ${driverId}: ${flag.reason}`);
@@ -53,142 +34,119 @@ class LocationService {
               reason: flag.reason,
               speedKmh: spoofCheck.speedKmh,
             });
-
             if (flag.type === 'AUTO_SUSPEND') {
               return { success: false, reason: 'SUSPENDED', flag };
             }
-          }
-
-          // Track jump count
-          const meta = driverMeta.get(driverId) || {};
-          meta.jumpCount = (meta.jumpCount || 0) + 1;
-          if (meta.jumpCount > config.fraud.maxJumpsIn10Min) {
-            logger.error('LOCATION', `Driver ${driverId} suspended: ${meta.jumpCount} location jumps`);
-            return { success: false, reason: 'JUMP_LIMIT_EXCEEDED' };
           }
         }
       }
     }
 
-    // ─── Store in Redis GEO ───
-    Promise.resolve(redis.geoadd(GEO_KEY, lng, lat, driverId))
-      .catch(err => logger.warn('LOCATION', `Redis GEOADD failed (non-fatal): ${err.message}`));
+    await Promise.all([
+      stateStore.updateDriverLocation(driverId, geoBucket, lat, lng, 60),
+      stateStore.setDriverState(driverId, {
+        lat,
+        lng,
+        speed: speed || 0,
+        heading: heading || 0,
+        city: geoBucket,
+        status: 'online',
+        lastLocationUpdate: now,
+      }, 60),
+      pgRepo.recordLocation(driverId, { lat, lng, speed, heading }).catch((err) => {
+        logger.warn('LOCATION', `PostGIS write failed (non-fatal): ${err.message}`);
+      }),
+    ]);
 
-    // ─── Persist to PostGIS (async, non-blocking) ───
-    pgRepo.recordLocation(driverId, { lat, lng, speed, heading })
-      .catch(err => logger.warn('LOCATION', `PostGIS write failed (non-fatal): ${err.message}`));
-
-    // ─── Update metadata ───
-    driverMeta.set(driverId, {
-      lat, lng, speed: speed || 0, heading: heading || 0,
-      updatedAt: now,
-      prevLat: prev?.lat, prevLng: prev?.lng,
-      jumpCount: prev?.jumpCount || 0,
-    });
-
-    // Publish location event
     eventBus.publish('driver_location_update', {
-      driverId, lat, lng, speed, heading, timestamp: now,
+      driverId,
+      lat,
+      lng,
+      speed,
+      heading,
+      clientTimestamp,
+      timestamp: now,
     });
 
     return { success: true, lat, lng };
   }
 
-  // Get driver's current position (with staleness handling)
-  getDriverLocation(driverId) {
-    const meta = driverMeta.get(driverId);
-    if (!meta) return null;
-
-    const age = (Date.now() - meta.updatedAt) / 1000;
-
-    // Expired - too stale
-    if (age > config.scoring.freshness.maxAgeSec) {
-      return { ...meta, stale: true, expired: true, ageSec: Math.round(age) };
-    }
-
-    // Needs interpolation
-    if (age > config.scoring.freshness.boostThresholdSec && meta.speed > 0) {
-      const predicted = predictLocation(meta.lat, meta.lng, meta.speed, meta.heading, age);
-      return {
-        ...predicted, speed: meta.speed, heading: meta.heading,
-        stale: true, expired: false, interpolated: true, ageSec: Math.round(age),
-      };
-    }
-
-    // Fresh
-    return { ...meta, stale: false, expired: false, ageSec: Math.round(age) };
+  async getDriverLocation(driverId) {
+    const state = await stateStore.getDriverState(driverId);
+    if (!state || !state.lastLocationUpdate) return null;
+    const age = Math.max(0, Math.round((Date.now() - Number(state.lastLocationUpdate)) / 1000));
+    return {
+      lat: Number(state.lat),
+      lng: Number(state.lng),
+      speed: Number(state.speed || 0),
+      heading: Number(state.heading || 0),
+      stale: age > (config.scoring?.freshness?.boostThresholdSec || 3),
+      expired: age > (config.scoring?.freshness?.maxAgeSec || 8),
+      ageSec: age,
+      updatedAt: Number(state.lastLocationUpdate),
+    };
   }
 
-  // Find nearby drivers using GEORADIUS (Redis primary, PostGIS fallback)
-  async findNearby(lat, lng, radiusKm, maxCount) {
-    const results = await redis.georadius(GEO_KEY, lng, lat, radiusKm, { count: maxCount * 3 });
-
-    // Filter out stale drivers from Redis result
-    const fresh = results.filter(r => {
-      const meta = driverMeta.get(r.member);
-      if (!meta) return false;
-      return (Date.now() - meta.updatedAt) / 1000 <= config.scoring.freshness.maxAgeSec;
-    }).map(r => {
-      const meta = driverMeta.get(r.member);
-      return {
-        driverId:   r.member,
-        lat:        r.lat,
-        lng:        r.lng,
-        distance:   r.distance,
-        speed:      meta?.speed   || 0,
-        heading:    meta?.heading || 0,
-        lastUpdate: meta?.updatedAt,
-        ageSec:     meta ? Math.round((Date.now() - meta.updatedAt) / 1000) : 999,
-      };
-    });
-
-    // PostGIS fallback when Redis returns nothing (e.g. Redis cleared/restart)
-    if (fresh.length === 0) {
-      logger.info('LOCATION', `Redis GEO empty — falling back to PostGIS spatial query`);
-      const pgResults = await pgRepo.findNearbyDrivers(lat, lng, radiusKm, maxCount);
-      return pgResults.map(r => ({
-        driverId:   r.driverId,
-        lat:        r.lat,
-        lng:        r.lng,
-        distance:   r.distanceKm,
-        speed:      r.speed || 0,
-        heading:    r.heading || 0,
-        lastUpdate: r.lastUpdate,
-        ageSec:     Math.round((Date.now() - new Date(r.lastUpdate).getTime()) / 1000),
-      }));
+  async findNearby(lat, lng, radiusKm, maxCount, geoBucket = 'default') {
+    let raw = await stateStore.geoSearchDrivers(geoBucket, lat, lng, radiusKm, maxCount * 3);
+    if ((!raw || raw.length === 0) && geoBucket !== 'default') {
+      raw = await stateStore.geoSearchDrivers('default', lat, lng, radiusKm, maxCount * 3);
     }
+    const drivers = await Promise.all((raw || []).map(async (item) => {
+      const driverId = item.member;
+      const state = await stateStore.getDriverState(driverId).catch(() => null);
+      if (!state || !state.lastLocationUpdate) return null;
+      const ageSec = Math.round((Date.now() - Number(state.lastLocationUpdate)) / 1000);
+      if (ageSec > (config.scoring?.freshness?.maxAgeSec || 8)) return null;
+      return {
+        driverId,
+        lat: Number(state.lat),
+        lng: Number(state.lng),
+        distance: Number(item.distance),
+        speed: Number(state.speed || 0),
+        heading: Number(state.heading || 0),
+        lastUpdate: Number(state.lastLocationUpdate),
+        ageSec,
+      };
+    }));
 
-    return fresh;
+    const fresh = drivers.filter(Boolean).slice(0, maxCount);
+    if (fresh.length > 0) return fresh;
+
+    logger.info('LOCATION', 'Redis GEO empty/stale - falling back to PostGIS spatial query');
+    const pgResults = await pgRepo.findNearbyDrivers(lat, lng, radiusKm, maxCount);
+    return pgResults.map((r) => ({
+      driverId: r.driverId,
+      lat: r.lat,
+      lng: r.lng,
+      distance: r.distanceKm,
+      speed: r.speed || 0,
+      heading: r.heading || 0,
+      lastUpdate: r.lastUpdate,
+      ageSec: Math.round((Date.now() - new Date(r.lastUpdate).getTime()) / 1000),
+    }));
   }
 
-  // Remove driver from location tracking (went offline)
-  removeDriver(driverId) {
-    Promise.resolve(redis.georemove(GEO_KEY, driverId)).catch(() => {});
-    driverMeta.delete(driverId);
-    pgRepo.removeDriverLocation(driverId).catch(() => {});
+  async removeDriver(driverId) {
+    const state = await stateStore.getDriverState(driverId).catch(() => ({}));
+    const geoBucket = String(state?.city || state?.homeCity || 'default').toLowerCase();
+    await Promise.all([
+      redis.georemove(stateStore.geoDriversKey(geoBucket), driverId).catch(() => {}),
+      redis.del(stateStore.driverStateKey(driverId)).catch(() => {}),
+      redis.del(stateStore.driverLocationKey(driverId)).catch(() => {}),
+      pgRepo.removeDriverLocation(driverId).catch(() => {}),
+    ]);
     logger.info('LOCATION', `Driver ${driverId} removed from tracking`);
   }
 
-  // Get all tracked drivers
   getAllTracked() {
-    const all = [];
-    for (const [driverId, meta] of driverMeta) {
-      all.push({
-        driverId,
-        lat: meta.lat,
-        lng: meta.lng,
-        speed: meta.speed,
-        heading: meta.heading,
-        ageSec: Math.round((Date.now() - meta.updatedAt) / 1000),
-      });
-    }
-    return all;
+    return [];
   }
 
   async getStats() {
     const base = {
-      trackedDrivers:  driverMeta.size,
-      redisGeoMembers: redis.geoSets?.get(GEO_KEY)?.size || 0,
+      trackedDrivers: 0,
+      redisGeoMembers: null,
     };
     const pgStats = await pgRepo.getStats().catch(() => ({}));
     return { ...base, ...pgStats };

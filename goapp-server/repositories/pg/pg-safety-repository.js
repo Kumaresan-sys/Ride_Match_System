@@ -1,6 +1,6 @@
 'use strict';
 
-const db = require('../../services/db');
+const domainDb = require('../../infra/db/domain-db');
 
 class PgSafetyRepository {
   constructor() {
@@ -14,7 +14,7 @@ class PgSafetyRepository {
    */
   async getContacts(userId) {
     const activeWhere = await this._activeContactWhere();
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id::text, contact_name, phone_number, is_primary
        FROM emergency_contacts
        WHERE user_id = $1 AND ${activeWhere}
@@ -29,7 +29,7 @@ class PgSafetyRepository {
    * If this is the first contact it becomes primary automatically.
    */
   async addContact(userId, { name, phoneNumber }) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
       const activeWhere = await this._activeContactWhere();
@@ -71,7 +71,7 @@ class PgSafetyRepository {
    * promotes the oldest remaining contact.
    */
   async deleteContact(userId, contactId) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
       const activeWhere = await this._activeContactWhere();
@@ -128,7 +128,7 @@ class PgSafetyRepository {
    * Sets one contact as primary and unsets all others for the user.
    */
   async makePrimary(userId, contactId) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
       const activeWhere = await this._activeContactWhere();
@@ -172,7 +172,7 @@ class PgSafetyRepository {
    */
   async updateContact(userId, contactId, { name, phoneNumber }) {
     const activeWhere = await this._activeContactWhere();
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `UPDATE emergency_contacts
        SET contact_name = $3, phone_number = $4
        WHERE id = $1 AND user_id = $2 AND ${activeWhere}
@@ -197,7 +197,7 @@ class PgSafetyRepository {
 
     const activeWhere = await this._activeContactWhere();
     // Skip if this number already exists (active contact)
-    const { rows: existing } = await db.query(
+    const { rows: existing } = await domainDb.query('identity', 
       `SELECT id FROM emergency_contacts
        WHERE user_id = $1 AND phone_number = $2 AND ${activeWhere}`,
       [userId, phone]
@@ -214,7 +214,7 @@ class PgSafetyRepository {
    * Returns safety preferences for a user (creates defaults if none exist).
    */
   async getPreferences(userId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `INSERT INTO safety_preferences (user_id)
        VALUES ($1)
        ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
@@ -228,7 +228,7 @@ class PgSafetyRepository {
    * Upserts safety preferences.
    */
   async updatePreferences(userId, { autoShare, shareAtNight }) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `INSERT INTO safety_preferences (user_id, auto_share, share_at_night)
        VALUES ($1, $2, $3)
        ON CONFLICT (user_id) DO UPDATE
@@ -254,7 +254,7 @@ class PgSafetyRepository {
 
   async _hasDeletedAtColumn() {
     if (this._hasEmergencyDeletedAt != null) return this._hasEmergencyDeletedAt;
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT EXISTS (
          SELECT 1
          FROM information_schema.columns

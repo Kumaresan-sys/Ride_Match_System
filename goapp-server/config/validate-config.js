@@ -89,9 +89,12 @@ function validateConfig({ strict = false } = {}) {
     errors.push('REDIS_HOST is required when REDIS_BACKEND=real.');
   }
 
-  if (!isTest && config.kafka.backend !== 'real') {
-    const msg = `KAFKA_BACKEND should be 'real' in ${nodeEnv} environment (got '${config.kafka.backend}').`;
-    if (strict || !isDevelopment) errors.push(msg); else warnings.push(msg);
+  if (!['real', 'disabled'].includes(config.kafka.backend)) {
+    errors.push(`KAFKA_BACKEND must be 'real' or 'disabled' (got '${config.kafka.backend}').`);
+  } else if (config.kafka.backend !== 'real' && !isDevelopment && !isTest) {
+    errors.push(`KAFKA_BACKEND should be 'real' in ${nodeEnv} environment (got '${config.kafka.backend}').`);
+  } else if (config.kafka.backend !== 'real' && isDevelopment) {
+    warnings.push('Kafka is disabled in development mode. Event workers/outbox relay will be skipped.');
   }
 
   if (!isTest && config.db.backend === 'mock') {

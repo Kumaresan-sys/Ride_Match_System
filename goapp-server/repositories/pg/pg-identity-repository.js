@@ -7,19 +7,38 @@
 
 'use strict';
 
-const db = require('../../services/db');
+const domainDb = require('../../infra/db/domain-db');
+const { logger } = require('../../utils/logger');
 
 const OTP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
 class PgIdentityRepository {
   constructor() {
     this._riderColumnCache = new Map();
+    this._logoutLookupFailureMetrics = {
+      'rides:active_ride': 0,
+      'payments:pending_wallet_payment': 0,
+    };
+  }
+
+  _trackLogoutLookupFailure({ domain, lookup, userId, error }) {
+    const key = `${domain}:${lookup}`;
+    const current = Number(this._logoutLookupFailureMetrics[key] || 0);
+    const next = current + 1;
+    this._logoutLookupFailureMetrics[key] = next;
+    const safeError = String(error?.message || error || 'unknown')
+      .replace(/\s+/g, ' ')
+      .slice(0, 180);
+    logger.warn(
+      'IDENTITY',
+      `metric=identity.logout.cross_domain_lookup_failed count=${next} domain=${domain} lookup=${lookup} userId=${userId} err="${safeError}"`
+    );
   }
 
   // ─── OTP Rate Limiting ────────────────────────────────────────────────────
 
   async getRateLimit(phone) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT request_count, is_blocked, blocked_until
        FROM otp_rate_limits
        WHERE phone_number = $1
@@ -34,7 +53,7 @@ class PgIdentityRepository {
     const windowStart = new Date(
       Math.floor(Date.now() / OTP_WINDOW_MS) * OTP_WINDOW_MS
     );
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `INSERT INTO otp_rate_limits (phone_number, window_start, request_count)
        VALUES ($1, $2, 1)
        ON CONFLICT (phone_number, window_start)
@@ -48,7 +67,7 @@ class PgIdentityRepository {
   // ─── OTP Requests ─────────────────────────────────────────────────────────
 
   async expirePendingOtpsByPhone(phoneNumber) {
-    await db.query(
+    await domainDb.query('identity', 
       `UPDATE otp_requests
        SET status = 'expired'
        WHERE phone_number = $1
@@ -58,7 +77,7 @@ class PgIdentityRepository {
   }
 
   async createOtpRequest({ requestId, phoneNumber, otpCode, otpType, channel, expiresAt }) {
-    await db.query(
+    await domainDb.query('identity', 
       `INSERT INTO otp_requests
          (id, phone_number, otp_code, otp_type, channel, status, expires_at)
        VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
@@ -67,7 +86,7 @@ class PgIdentityRepository {
   }
 
   async getOtpRequest(requestId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id, phone_number, otp_code, otp_type, status,
               attempts, max_attempts,
               EXTRACT(EPOCH FROM expires_at) * 1000 AS "expiresAt",
@@ -79,7 +98,7 @@ class PgIdentityRepository {
   }
 
   async getActiveOtpByPhone(phone) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id, phone_number, otp_code, otp_type, status,
               attempts, max_attempts,
               EXTRACT(EPOCH FROM expires_at) * 1000  AS "expiresAt",
@@ -97,7 +116,7 @@ class PgIdentityRepository {
   // Atomically increment attempts and optionally set a new status.
   // Also writes a row to otp_attempts for per-attempt audit trail.
   async recordOtpAttempt(requestId, newStatus, { isCorrect = false, ipAddress = null } = {}) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
 
@@ -131,7 +150,7 @@ class PgIdentityRepository {
   // ─── User Profiles ────────────────────────────────────────────────────────
 
   async upsertUserProfile({ userId, name, gender, dateOfBirth, emergencyContact }) {
-    await db.query(
+    await domainDb.query('identity', 
       `INSERT INTO user_profiles (user_id, display_name, gender, date_of_birth, emergency_contact)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (user_id) DO UPDATE
@@ -145,7 +164,7 @@ class PgIdentityRepository {
   }
 
   async getUserProfile(userId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT up.display_name AS name,
               up.gender,
               TO_CHAR(up.date_of_birth, 'DD FMMonth YYYY') AS date_of_birth,
@@ -160,14 +179,14 @@ class PgIdentityRepository {
   }
 
   async updateUserEmail(userId, email) {
-    await db.query(
+    await domainDb.query('identity', 
       `UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1`,
       [userId, email]
     );
   }
 
   async upsertUserProfileWithEmail({ userId, name, gender, dateOfBirth, emergencyContact, email }) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
 
@@ -225,7 +244,7 @@ class PgIdentityRepository {
   }
 
   async updateProfileFields({ userId, name, email }) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
 
@@ -262,7 +281,7 @@ class PgIdentityRepository {
   }
 
   async isProfileComplete(userId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT 1 FROM user_profiles
        WHERE user_id = $1
          AND display_name IS NOT NULL AND display_name <> ''
@@ -276,7 +295,7 @@ class PgIdentityRepository {
 
   // Upserts the user row and also ensures a riders record exists (for rider type)
   async upsertUser({ userId, phoneNumber, userType }) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
 
@@ -358,7 +377,7 @@ class PgIdentityRepository {
     refreshTokenHash,
     sessionExpiresAt,
   }) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
 
@@ -545,7 +564,7 @@ class PgIdentityRepository {
   }
 
   async getUserByPhone(phone) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id, phone_number, email, user_type, status, phone_verified,
               EXTRACT(EPOCH FROM created_at) * 1000 AS "createdAt"
        FROM users WHERE phone_number = $1 AND deleted_at IS NULL`,
@@ -555,7 +574,7 @@ class PgIdentityRepository {
   }
 
   async getUserById(userId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id, phone_number, email, user_type, status, phone_verified,
               EXTRACT(EPOCH FROM created_at) * 1000 AS "createdAt"
        FROM users WHERE id = $1 AND deleted_at IS NULL`,
@@ -565,7 +584,7 @@ class PgIdentityRepository {
   }
 
   async getUsers(limit = 100) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id, phone_number, email, user_type, status, phone_verified,
               EXTRACT(EPOCH FROM created_at) * 1000 AS "createdAt"
        FROM users WHERE deleted_at IS NULL
@@ -586,7 +605,7 @@ class PgIdentityRepository {
     ipAddress = null,
     userAgent = null,
   }) {
-    await db.query(
+    await domainDb.query('identity', 
       `INSERT INTO user_sessions (
          user_id, device_id, session_token, refresh_token,
          ip_address, user_agent, is_active, expires_at
@@ -612,7 +631,7 @@ class PgIdentityRepository {
       ? platform
       : 'web';
 
-    const { rows: existingRows } = await db.query(
+    const { rows: existingRows } = await domainDb.query('identity', 
       `SELECT id
        FROM user_devices
        WHERE user_id = $1
@@ -622,7 +641,7 @@ class PgIdentityRepository {
     );
 
     if (existingRows[0]?.id) {
-      const { rows } = await db.query(
+      const { rows } = await domainDb.query('identity', 
         `UPDATE user_devices
          SET device_type = $2,
              fcm_token = COALESCE($3, fcm_token),
@@ -637,7 +656,7 @@ class PgIdentityRepository {
       return rows[0] || null;
     }
 
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `INSERT INTO user_devices (
          user_id, device_id, device_type, fcm_token, is_active, last_active_at
        )
@@ -656,7 +675,7 @@ class PgIdentityRepository {
     status = 'success',
     loginMethod = 'otp',
   }) {
-    await db.query(
+    await domainDb.query('identity', 
       `INSERT INTO user_login_history (
          user_id, login_method, ip_address, device_id, status, created_at
        )
@@ -666,7 +685,7 @@ class PgIdentityRepository {
   }
 
   async getSession(sessionToken) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT us.id, us.session_token, us.refresh_token, us.device_id, us.user_id,
               ud.device_id AS "deviceIdentifier",
               ud.device_type AS "deviceType",
@@ -685,7 +704,7 @@ class PgIdentityRepository {
   }
 
   async getSessionByRefreshToken(refreshTokenHash, refreshTokenTtlMs) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT us.id, us.session_token, us.refresh_token, us.device_id, us.user_id,
               ud.device_id AS "deviceIdentifier",
               ud.device_type AS "deviceType",
@@ -712,7 +731,7 @@ class PgIdentityRepository {
     ipAddress = null,
     userAgent = null,
   }) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `UPDATE user_sessions
        SET session_token = $2,
            refresh_token = $3,
@@ -740,7 +759,7 @@ class PgIdentityRepository {
   }
 
   async revokeSession(sessionToken) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `UPDATE user_sessions
        SET is_active = false, revoked_at = NOW()
        WHERE session_token = $1
@@ -751,7 +770,7 @@ class PgIdentityRepository {
   }
 
   async revokeSessionByRefreshToken(refreshTokenHash) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `UPDATE user_sessions
        SET is_active = false, revoked_at = NOW()
        WHERE refresh_token = $1
@@ -782,24 +801,48 @@ class PgIdentityRepository {
       : null;
 
     // Check for active ride
-    const { rows: rideRows } = await db.query(
-      `SELECT id FROM rides
-       WHERE rider_id = $1
-         AND status IN ('requested','accepted','in_progress','driver_assigned')
-       LIMIT 1`,
-      [userId]
-    ).catch(() => ({ rows: [] }));
+    let rideRows = [];
+    try {
+      const { rows } = await domainDb.query('rides', 
+        `SELECT id FROM rides
+         WHERE rider_id = $1
+           AND status IN ('requested','accepted','in_progress','driver_assigned')
+         LIMIT 1`,
+        [userId]
+      );
+      rideRows = rows;
+    } catch (err) {
+      this._trackLogoutLookupFailure({
+        domain: 'rides',
+        lookup: 'active_ride',
+        userId,
+        error: err,
+      });
+      rideRows = [];
+    }
 
     // Check for pending wallet payment (hold transactions indicate an in-progress ride payment)
-    const { rows: payRows } = await db.query(
-      `SELECT wt.id FROM wallet_transactions wt
-       JOIN wallets w ON w.id = wt.wallet_id
-       WHERE w.user_id = $1 AND wt.transaction_type = 'hold'
-       LIMIT 1`,
-      [userId]
-    ).catch(() => ({ rows: [] }));
+    let payRows = [];
+    try {
+      const { rows } = await domainDb.query('payments', 
+        `SELECT wt.id FROM wallet_transactions wt
+         JOIN wallets w ON w.id = wt.wallet_id
+         WHERE w.user_id = $1 AND wt.transaction_type = 'hold'
+         LIMIT 1`,
+        [userId]
+      );
+      payRows = rows;
+    } catch (err) {
+      this._trackLogoutLookupFailure({
+        domain: 'payments',
+        lookup: 'pending_wallet_payment',
+        userId,
+        error: err,
+      });
+      payRows = [];
+    }
 
-    await db.query(
+    await domainDb.query('identity', 
       `INSERT INTO user_logout_logs
          (user_id, session_id, logout_type, ip_address, user_agent,
           device_id, session_started_at, session_duration_sec,
@@ -820,7 +863,7 @@ class PgIdentityRepository {
     );
 
     // Also write to user_security_logs for unified security audit trail
-    await db.query(
+    await domainDb.query('identity', 
       `INSERT INTO user_security_logs
          (user_id, event_type, event_detail, ip_address, device_id, risk_level)
        VALUES ($1, 'logout', $2, $3, $4, 'low')`,
@@ -845,7 +888,7 @@ class PgIdentityRepository {
     reason = null,
     maxAttempts = 3,
   }) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `INSERT INTO refresh_token_security (
          refresh_token_hash, user_id, device_id, suspicious_attempt_count,
          first_suspicious_at, last_suspicious_at, last_reason, revoked_at
@@ -866,7 +909,7 @@ class PgIdentityRepository {
     const shouldRevoke = alreadyRevoked || attempts >= maxAttempts;
 
     if (shouldRevoke && !alreadyRevoked) {
-      await db.query(
+      await domainDb.query('identity', 
         `UPDATE refresh_token_security
          SET revoked_at = NOW()
          WHERE refresh_token_hash = $1`,
@@ -878,7 +921,7 @@ class PgIdentityRepository {
   }
 
   async clearSuspiciousRefreshAttempts(refreshTokenHash) {
-    await db.query(
+    await domainDb.query('identity', 
       `DELETE FROM refresh_token_security
        WHERE refresh_token_hash = $1`,
       [refreshTokenHash]
@@ -893,7 +936,7 @@ class PgIdentityRepository {
     deviceRecordId = null,
     riskLevel = 'medium',
   }) {
-    await db.query(
+    await domainDb.query('identity', 
       `INSERT INTO user_security_logs (user_id, event_type, event_detail, ip_address, device_id, risk_level)
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [
@@ -910,7 +953,7 @@ class PgIdentityRepository {
   // ─── Roles ────────────────────────────────────────────────────────────────
 
   async getUserRoles(userId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT role, granted_at, expires_at
        FROM user_roles
        WHERE user_id = $1
@@ -925,7 +968,7 @@ class PgIdentityRepository {
   // ─── Preferences ──────────────────────────────────────────────────────────
 
   async getUserPreferences(userId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT preference_key AS key, preference_value AS value
        FROM user_preferences
        WHERE user_id = $1
@@ -940,7 +983,7 @@ class PgIdentityRepository {
   }
 
   async setUserPreference(userId, key, value) {
-    await db.query(
+    await domainDb.query('identity', 
       `INSERT INTO user_preferences (user_id, preference_key, preference_value)
        VALUES ($1, $2, $3)
        ON CONFLICT (user_id, preference_key)
@@ -958,14 +1001,14 @@ class PgIdentityRepository {
     const riderSelectSql = hasWelcomeBonusClaimed
       ? `SELECT id, welcome_bonus_claimed FROM riders WHERE user_id = $1 LIMIT 1`
       : `SELECT id, false AS welcome_bonus_claimed FROM riders WHERE user_id = $1 LIMIT 1`;
-    const { rows: riderRows } = await db.query(riderSelectSql, [userId]);
+    const { rows: riderRows } = await domainDb.query('identity', riderSelectSql, [userId]);
     if (!riderRows[0] || Boolean(riderRows[0].welcome_bonus_claimed)) {
       return { coinsAwarded: 0, alreadyClaimed: true };
     }
 
     const riderId = riderRows[0].id;
     const BONUS = 100;
-    const client = await db.getClient();
+    const client = await domainDb.getClient('identity');
     try {
       await client.query('BEGIN');
 
@@ -1026,7 +1069,7 @@ class PgIdentityRepository {
   async generateOrGetReferralCode(userId) {
     const hasRiderReferralCode = await this._hasRiderColumn('referral_code');
     // Return existing code if already created
-    const { rows: riderRows } = await db.query(
+    const { rows: riderRows } = await domainDb.query('identity', 
       `SELECT ${hasRiderReferralCode ? 'r.referral_code' : 'NULL::text AS referral_code'}, up.display_name
        FROM riders r
        LEFT JOIN user_profiles up ON up.user_id = r.user_id
@@ -1041,7 +1084,7 @@ class PgIdentityRepository {
     const prefix = name.substring(0, 4).toUpperCase().padEnd(4, 'X');
 
     // Get active referral program
-    const { rows: progRows } = await db.query(
+    const { rows: progRows } = await domainDb.query('identity', 
       `SELECT id FROM referral_programs WHERE is_active = true ORDER BY created_at DESC LIMIT 1`
     );
     const programId = progRows[0]?.id || null;
@@ -1051,7 +1094,7 @@ class PgIdentityRepository {
       const suffix = String(Math.floor(1000 + Math.random() * 9000));
       const code = `${prefix}${suffix}`;
       try {
-        const client = await db.getClient();
+        const client = await domainDb.getClient('identity');
         try {
           await client.query('BEGIN');
           if (programId) {
@@ -1088,7 +1131,7 @@ class PgIdentityRepository {
     if (this._riderColumnCache.has(columnName)) {
       return this._riderColumnCache.get(columnName);
     }
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT EXISTS (
          SELECT 1
          FROM information_schema.columns
@@ -1107,9 +1150,9 @@ class PgIdentityRepository {
 
   async getStats() {
     const [{ rows: u }, { rows: s }, { rows: o }] = await Promise.all([
-      db.query(`SELECT COUNT(*)::int AS cnt FROM users WHERE deleted_at IS NULL`),
-      db.query(`SELECT COUNT(*)::int AS cnt FROM user_sessions WHERE is_active = true AND expires_at > NOW()`),
-      db.query(
+      domainDb.query('identity', `SELECT COUNT(*)::int AS cnt FROM users WHERE deleted_at IS NULL`),
+      domainDb.query('identity', `SELECT COUNT(*)::int AS cnt FROM user_sessions WHERE is_active = true AND expires_at > NOW()`),
+      domainDb.query('identity', 
         `SELECT status, COUNT(*)::int AS cnt
          FROM otp_requests
          WHERE created_at > NOW() - INTERVAL '24 hours'

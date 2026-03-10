@@ -1,14 +1,16 @@
 const crypto = require('crypto');
 const { validateSchema } = require('./validation');
+const RedisStateStore = require('../infra/redis/state-store');
+const redis = require('../services/redis-client');
 
-const RIDE_RATE_WINDOW_MS = 60 * 1000;
+const RIDE_RATE_WINDOW_SEC = 60;
 const RIDE_RATE_MAX = 20;
-const rideRateByKey = new Map();
 
 function registerRideRoutes(router, ctx) {
   const { services, repositories } = ctx;
   const requireAuth = ctx.requireAuth;
   const requireAdmin = ctx.requireAdmin;
+  const stateStore = new RedisStateStore(redis);
 
   async function authenticate(headers) {
     const auth = await requireAuth(headers || {});
@@ -27,17 +29,10 @@ function registerRideRoutes(router, ctx) {
     return !requireAdmin(headers);
   }
 
-  function checkRideRateLimit(key) {
-    const now = Date.now();
+  async function checkRideRateLimit(key) {
     const k = key || 'unknown';
-    const rec = rideRateByKey.get(k);
-    if (rec && (now - rec.windowStart) < RIDE_RATE_WINDOW_MS) {
-      if (rec.count >= RIDE_RATE_MAX) return false;
-      rec.count += 1;
-      return true;
-    }
-    rideRateByKey.set(k, { count: 1, windowStart: now });
-    return true;
+    const count = await stateStore.incrementRateLimit('ride_request', k, RIDE_RATE_WINDOW_SEC);
+    return count <= RIDE_RATE_MAX;
   }
 
   function toIso(value) {
@@ -112,7 +107,7 @@ function registerRideRoutes(router, ctx) {
     return null;
   }
 
-  async function normalizeRideForClient(ride) {
+  async function normalizeRideForClient(ride, paymentInfoByRide = null) {
     if (!ride || typeof ride !== 'object') return null;
 
     const status = normalizeStatus(ride.status);
@@ -205,10 +200,12 @@ function registerRideRoutes(router, ctx) {
         normalized.riderId &&
         typeof repositories.wallet.getRidePaymentInfo === 'function') {
       try {
-        const paymentInfo = await repositories.wallet.getRidePaymentInfo(
-          normalized.riderId,
-          normalized.rideId
-        );
+        const paymentInfo = paymentInfoByRide instanceof Map
+          ? paymentInfoByRide.get(normalized.rideId)
+          : await repositories.wallet.getRidePaymentInfo(
+            normalized.riderId,
+            normalized.rideId
+          );
         if (paymentInfo) {
           if (!normalized.paymentTransactionId && paymentInfo.paymentTransactionId) {
             normalized.paymentTransactionId = paymentInfo.paymentTransactionId;
@@ -228,7 +225,7 @@ function registerRideRoutes(router, ctx) {
   router.register('POST', '/api/v1/rides/request', async ({ body, headers, ip }) => {
     const auth = await authenticate(headers);
     if (auth.error) return auth.error;
-    if (!checkRideRateLimit(`${ip || 'unknown'}:${auth.session.userId}`)) {
+    if (!await checkRideRateLimit(`${ip || 'unknown'}:${auth.session.userId}`)) {
       return { status: 429, data: { error: 'Rate limit exceeded for ride requests. Try again shortly.' } };
     }
 
@@ -306,12 +303,16 @@ function registerRideRoutes(router, ctx) {
       services.demandLogService.recordTimeslot('ride_requested');
     }
 
+    const idempotencyHeader = String(
+      headers?.['idempotency-key'] || headers?.['x-idempotency-key'] || ''
+    ).trim() || null;
+
     const result = await repositories.ride.createRide({
       ...body,
       ...parsed.data,
       rideId: crypto.randomUUID(),
       rideNumber: `RD${Date.now().toString(36).toUpperCase()}`,
-      idempotencyKey: parsed.data.idempotencyKey || crypto.randomUUID(),
+      idempotencyKey: parsed.data.idempotencyKey || idempotencyHeader || crypto.randomUUID(),
     });
 
     if (coinRedemptionPreview) {
@@ -321,17 +322,41 @@ function registerRideRoutes(router, ctx) {
     return { data: result };
   });
 
-  router.register('GET', '/api/v1/rides', async ({ headers }) => {
+  router.register('GET', '/api/v1/rides', async ({ headers, params }) => {
     const auth = await authenticate(headers);
     if (auth.error) return auth.error;
 
-    const rides = await repositories.ride.getAllRides();
-    const normalized = (await Promise.all(rides.map(normalizeRideForClient)))
+    const limitRaw = Number.parseInt(params?.get('limit') || '50', 10);
+    const limit = Math.min(Math.max(limitRaw, 1), 200);
+    const cursor = params?.get('cursor') || null;
+    const page = await repositories.ride.getRidesPage({ limit, cursor });
+    const rides = page?.rides || [];
+    const paymentInfoByRide = new Map();
+    if (rides.length > 0 && typeof repositories.wallet.getRidePaymentInfoBatch === 'function') {
+      const rideIdsByRider = new Map();
+      for (const ride of rides) {
+        const rideId = String(ride?.rideId || '');
+        const riderId = String(ride?.riderId || '');
+        if (!rideId || !riderId) continue;
+        const current = rideIdsByRider.get(riderId) || [];
+        current.push(rideId);
+        rideIdsByRider.set(riderId, current);
+      }
+
+      await Promise.all(Array.from(rideIdsByRider.entries()).map(async ([riderId, rideIds]) => {
+        const batch = await repositories.wallet.getRidePaymentInfoBatch(riderId, rideIds).catch(() => ({}));
+        Object.entries(batch || {}).forEach(([rideId, info]) => {
+          paymentInfoByRide.set(String(rideId), info);
+        });
+      }));
+    }
+
+    const normalized = (await Promise.all(rides.map((ride) => normalizeRideForClient(ride, paymentInfoByRide))))
       .filter(Boolean);
-    if (isAdmin(headers || {})) return { data: { rides: normalized } };
+    if (isAdmin(headers || {})) return { data: { rides: normalized, nextCursor: page?.nextCursor || null } };
 
     const ownRides = normalized.filter(ride => canAccessRide(auth.session.userId, ride));
-    return { data: { rides: ownRides } };
+    return { data: { rides: ownRides, nextCursor: page?.nextCursor || null } };
   });
 
   router.register('GET', '/api/v1/rides/:rideId', async ({ pathParams, headers }) => {
@@ -365,6 +390,29 @@ function registerRideRoutes(router, ctx) {
     return { data: result };
   });
 
+  // Driver-side accept endpoint.
+  router.register('POST', '/api/v1/rides/:rideId/accept', async ({ pathParams, headers }) => {
+    const auth = await authenticate(headers);
+    if (auth.error) return auth.error;
+
+    const result = await services.matchingEngine.acceptOffer(pathParams.rideId, auth.session.userId);
+    if (!result.success) return { status: 409, data: result };
+    return { data: result };
+  });
+
+  router.register('POST', '/api/v2/rides/:rideId/offers/:offerId/accept', async ({ pathParams, headers }) => {
+    const auth = await authenticate(headers);
+    if (auth.error) return auth.error;
+
+    const result = await services.matchingEngine.acceptOffer(
+      pathParams.rideId,
+      auth.session.userId,
+      pathParams.offerId
+    );
+    if (!result.success) return { status: 409, data: result };
+    return { data: result };
+  });
+
   router.register('POST', '/api/v1/rides/:rideId/arrived', async ({ pathParams, headers }) => {
     const auth = await authenticate(headers);
     if (auth.error) return auth.error;
@@ -373,7 +421,7 @@ function registerRideRoutes(router, ctx) {
       return { status: 403, data: { error: 'Forbidden: only assigned driver can update arrival.' } };
     }
 
-    const updated = services.rideService.driverArrived(pathParams.rideId);
+    const updated = await services.rideService.driverArrived(pathParams.rideId);
     return { data: updated ? { status: updated.status, rideId: pathParams.rideId } : { error: 'Invalid state' } };
   });
 
@@ -385,7 +433,7 @@ function registerRideRoutes(router, ctx) {
       return { status: 403, data: { error: 'Forbidden: only assigned driver can start trip.' } };
     }
 
-    const updated = services.rideService.startTrip(pathParams.rideId);
+    const updated = await services.rideService.startTrip(pathParams.rideId);
     return { data: updated ? { status: updated.status, rideId: pathParams.rideId } : { error: 'Invalid state' } };
   });
 

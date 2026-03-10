@@ -15,10 +15,12 @@ function registerRecoveryRoutes(router, ctx) {
       return forbiddenError('Forbidden: riderId must match authenticated user.');
     }
 
-    const ride = rideService.getActiveRide(pathValidation.data.riderId);
+    const ride = await (rideService.getActiveRideAsync
+      ? rideService.getActiveRideAsync(pathValidation.data.riderId)
+      : Promise.resolve(rideService.getActiveRide(pathValidation.data.riderId)));
     if (!ride) return { data: { hasActiveRide: false } };
 
-    rideSessionService._logRecovery({
+    await rideSessionService._logRecovery({
       type: 'active_check',
       riderId: pathValidation.data.riderId,
       rideId: ride.rideId,
@@ -44,7 +46,7 @@ function registerRecoveryRoutes(router, ctx) {
       return forbiddenError('Forbidden: riderId must match authenticated user.');
     }
 
-    const result = rideSessionService.restoreSession(pathValidation.data.riderId, {
+    const result = await rideSessionService.restoreSession(pathValidation.data.riderId, {
       rideService,
       locationService,
       matchingEngine,

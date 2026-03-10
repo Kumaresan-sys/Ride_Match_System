@@ -46,6 +46,12 @@ const DocumentStorageService = require('./services/document-storage-service');
 const DriverDocumentService = require('./services/driver-document-service');
 const buildRouteDispatcher = require('./routes');
 const validateConfig = require('./config/validate-config');
+const { bootstrapArchitecture } = require('./infra/bootstrap');
+const { bootstrapModules } = require('./modules');
+const MatchingWorker = require('./workers/matching-worker');
+const NotificationWorker = require('./workers/notification-worker');
+const OutboxRelayWorker = require('./workers/outbox-relay-worker');
+const DomainProjectionWorker = require('./workers/domain-projection-worker');
 const {
   ServiceIdentityRepository,
   ServiceRideRepository,
@@ -161,13 +167,14 @@ async function requireAuth(headers) {
   return { session };
 }
 
-function startAPIServer(port) {
+function startAPIServer(port, runtime = {}) {
   const repositories = {
     identity: new ServiceIdentityRepository(identityService),
     ride: new ServiceRideRepository(rideService),
     matchingState: new ServiceMatchingStateRepository(matchingEngine),
     wallet: new ServiceWalletRepository(walletService),
   };
+  const modules = runtime.modules || bootstrapModules();
 
   const dispatchRoute = buildRouteDispatcher({
     enterpriseConfig,
@@ -204,6 +211,8 @@ function startAPIServer(port) {
       zoneMetricsService,
       googleMapsService,
       smsService,
+      infra: runtime.infra || null,
+      modules,
     },
   });
 
@@ -548,7 +557,39 @@ async function main() {
     throw new Error(`REDIS_BACKEND must be 'real' for runtime flow (got '${config.redis.backend}').`);
   }
 
-  const apiServer = startAPIServer(config.server.port);
+  const infrastructure = await bootstrapArchitecture({ eventBus });
+  const modules = bootstrapModules();
+
+  logger.info('BOOT', `Architecture flags => MATCHING_V2=${String(config.architecture.featureFlags.matchingV2)} REDIS_STATE_V2=${String(config.architecture.featureFlags.redisStateV2)} KAFKA_OUTBOX=${String(config.architecture.featureFlags.kafkaOutbox)} KAFKA_OUTBOX_RELAY_WORKER=${String(config.architecture.featureFlags.kafkaOutboxRelayWorker)} KAFKA_DOMAIN_PROJECTION_WORKER=${String(config.architecture.featureFlags.kafkaDomainProjectionWorker)}`);
+  logger.info('BOOT', `Domain modules loaded: ${modules.modules.map(m => m.name).join(', ')}`);
+
+  if (config.architecture.featureFlags.kafkaMatchingWorker) {
+    const matchingWorker = new MatchingWorker({ rideService, matchingEngine });
+    matchingWorker.start().catch((err) => logger.error('BOOT', `matching worker start failed: ${err.message}`));
+  } else {
+    logger.info('BOOT', 'Kafka matching worker disabled (KAFKA_MATCHING_WORKER=false).');
+  }
+
+  if (config.architecture.featureFlags.kafkaOutboxRelayWorker) {
+    const outboxRelayWorker = new OutboxRelayWorker();
+    outboxRelayWorker.start().catch((err) => logger.error('BOOT', `outbox relay worker start failed: ${err.message}`));
+  } else {
+    logger.info('BOOT', 'Outbox relay worker disabled (KAFKA_OUTBOX_RELAY_WORKER=false).');
+  }
+
+  if (config.architecture.featureFlags.kafkaDomainProjectionWorker) {
+    const domainProjectionWorker = new DomainProjectionWorker();
+    domainProjectionWorker.start().catch((err) => logger.error('BOOT', `domain projection worker start failed: ${err.message}`));
+  } else {
+    logger.info('BOOT', 'Domain projection worker disabled (KAFKA_DOMAIN_PROJECTION_WORKER=false).');
+  }
+
+  if (config.architecture.featureFlags.kafkaNotificationWorker) {
+    const worker = new NotificationWorker({ notificationService });
+    worker.start().catch((err) => logger.error('BOOT', `notification worker start failed: ${err.message}`));
+  }
+
+  const apiServer = startAPIServer(config.server.port, { infra: infrastructure, modules });
 
   const wsServer = new WebSocketServer({
     authTimeoutMs: config.security.wsAuthTimeoutMs,
