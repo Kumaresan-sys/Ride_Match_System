@@ -58,7 +58,7 @@ function registerAdminSupportRoutes(router, ctx) {
     const riderId = params.get('riderId') || null;
     const limitParsed = parseQueryNumber(params, 'limit', { min: 1, max: 500, fallback: 50 });
     if (!limitParsed.ok) return validationError(limitParsed.error);
-    return { data: { logs: rideSessionService.getRecoveryLogs({ type, riderId, limit: limitParsed.value }) } };
+    return { data: { logs: await rideSessionService.getRecoveryLogs({ type, riderId, limit: limitParsed.value }) } };
   });
 }
 

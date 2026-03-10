@@ -4,7 +4,7 @@
 
 'use strict';
 
-const db = require('../../services/db');
+const domainDb = require('../../infra/db/domain-db');
 
 class PgRideRepository {
   // ─── Create ───────────────────────────────────────────────────────────────
@@ -14,18 +14,22 @@ class PgRideRepository {
     pickupLat, pickupLng, destLat, destLng,
     pickupZoneId, dropZoneId,
     fareEstimate, surgeMultiplier, idempotencyKey,
+    outboxEvent = null,
   }) {
-    const client = await db.getClient();
+    const client = await domainDb.getClient('rides');
     try {
       await client.query('BEGIN');
 
-      // riderId is the users.id UUID; resolve to riders.id
+      // riderId is users.id UUID, resolved from projection for domain isolation.
       const { rows: riderRows } = await client.query(
-        `SELECT id FROM riders WHERE user_id = $1 LIMIT 1`,
+        `SELECT rider_id AS id
+         FROM ride_rider_projection
+         WHERE user_id = $1
+         LIMIT 1`,
         [riderId]
       );
       if (!riderRows.length) {
-        throw new Error(`Rider record not found for user ${riderId}. Complete rider onboarding first.`);
+        throw new Error(`Rider projection not found for user ${riderId}. Run projection backfill.`);
       }
       const dbRiderId = riderRows[0].id;
 
@@ -51,6 +55,10 @@ class PgRideRepository {
         [rows[0].id]
       );
 
+      if (outboxEvent) {
+        await this._insertOutboxWithClient(client, 'rides', outboxEvent);
+      }
+
       await client.query('COMMIT');
       return rows[0];
     } catch (err) {
@@ -64,7 +72,8 @@ class PgRideRepository {
   // ─── Read ─────────────────────────────────────────────────────────────────
 
   async getRide(rideId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query(
+      'rides',
       `SELECT r.ride_number AS "rideId", r.status,
               r.id AS "dbRideId",
               r.pickup_lat AS "pickupLat", r.pickup_lng AS "pickupLng",
@@ -76,8 +85,8 @@ class PgRideRepository {
               r.estimated_fare AS "estimatedFare", r.actual_fare AS "finalFare",
               r.surge_multiplier AS "surgeMultiplier",
               r.idempotency_key AS "idempotencyKey",
-              u.id AS "riderId",
-              d.user_id AS "driverId",
+              rrp.user_id AS "riderId",
+              rdp.user_id AS "driverId",
               EXTRACT(EPOCH FROM r.arrived_at)    * 1000 AS "arrivedAt",
               EXTRACT(EPOCH FROM r.accepted_at)   * 1000 AS "acceptedAt",
               EXTRACT(EPOCH FROM r.started_at)    * 1000 AS "startedAt",
@@ -85,9 +94,8 @@ class PgRideRepository {
               EXTRACT(EPOCH FROM r.cancelled_at)  * 1000 AS "cancelledAt",
               EXTRACT(EPOCH FROM r.created_at)    * 1000 AS "createdAt"
        FROM rides r
-       JOIN riders ri ON ri.id = r.rider_id
-       JOIN users  u  ON u.id  = ri.user_id
-       LEFT JOIN drivers d ON d.id = r.driver_id
+       LEFT JOIN ride_rider_projection rrp ON rrp.rider_id = r.rider_id
+       LEFT JOIN ride_driver_projection rdp ON rdp.driver_id = r.driver_id
        WHERE r.id::text = $1 OR r.ride_number = $1`,
       [rideId]
     );
@@ -95,7 +103,29 @@ class PgRideRepository {
   }
 
   async getAllRides(limit = 200) {
-    const { rows } = await db.query(
+    const page = await this.getRidesPage({ limit, cursor: null });
+    return page.rides;
+  }
+
+  async getRidesPage({ limit = 50, cursor = null } = {}) {
+    const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+    let cursorCreatedAt = null;
+    let cursorDbRideId = null;
+
+    if (cursor) {
+      try {
+        const decoded = JSON.parse(Buffer.from(String(cursor), 'base64').toString('utf8'));
+        cursorCreatedAt = decoded.createdAt || null;
+        cursorDbRideId = decoded.dbRideId || null;
+      } catch (_) {
+        cursorCreatedAt = null;
+        cursorDbRideId = null;
+      }
+    }
+
+    const hasCursor = Boolean(cursorCreatedAt && cursorDbRideId);
+    const { rows } = await domainDb.query(
+      'rides',
       `SELECT r.id AS "dbRideId",
               r.ride_number AS "rideId",
               r.status,
@@ -110,8 +140,8 @@ class PgRideRepository {
               r.dropoff_address AS "destAddress",
               r.estimated_fare AS "estimatedFare",
               r.actual_fare AS "finalFare",
-              u.id AS "riderId",
-              d.user_id AS "driverId",
+              rrp.user_id AS "riderId",
+              rdp.user_id AS "driverId",
               EXTRACT(EPOCH FROM r.accepted_at)   * 1000 AS "acceptedAt",
               EXTRACT(EPOCH FROM r.arrived_at)    * 1000 AS "arrivedAt",
               EXTRACT(EPOCH FROM r.started_at)    * 1000 AS "startedAt",
@@ -119,18 +149,30 @@ class PgRideRepository {
               EXTRACT(EPOCH FROM r.cancelled_at)  * 1000 AS "cancelledAt",
               EXTRACT(EPOCH FROM r.created_at)    * 1000 AS "createdAt"
        FROM rides r
-       JOIN riders ri ON ri.id = r.rider_id
-       JOIN users u ON u.id = ri.user_id
-       LEFT JOIN drivers d ON d.id = r.driver_id
+       LEFT JOIN ride_rider_projection rrp ON rrp.rider_id = r.rider_id
+       LEFT JOIN ride_driver_projection rdp ON rdp.driver_id = r.driver_id
+       WHERE ($2::timestamptz IS NULL OR (r.created_at, r.id) < ($2::timestamptz, $3::uuid))
        ORDER BY r.created_at DESC
        LIMIT $1`,
-      [limit]
+      [safeLimit + 1, hasCursor ? cursorCreatedAt : null, hasCursor ? cursorDbRideId : null]
     );
-    return rows;
+
+    const hasNext = rows.length > safeLimit;
+    const pageRows = hasNext ? rows.slice(0, safeLimit) : rows;
+    const last = pageRows[pageRows.length - 1] || null;
+    const nextCursor = hasNext && last
+      ? Buffer.from(JSON.stringify({
+        createdAt: new Date(Number(last.createdAt)).toISOString(),
+        dbRideId: last.dbRideId,
+      })).toString('base64')
+      : null;
+
+    return { rides: pageRows, nextCursor };
   }
 
   async getRideByIdempotencyKey(key) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query(
+      'rides',
       `SELECT id AS "dbRideId", ride_number AS "rideId", status
          FROM rides
         WHERE idempotency_key = $1`,
@@ -147,7 +189,8 @@ class PgRideRepository {
       cancelledAt, cancelledBy, finalFare, actualDistanceM, actualDurationS,
     } = extra;
 
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query(
+      'rides',
       `WITH updated AS (
          UPDATE rides SET
            status       = $2,
@@ -186,11 +229,12 @@ class PgRideRepository {
 
   // Resolve driver external_id → DB UUID for FK usage
   async resolveDriverDbId(driverExternalId) {
-    const { rows } = await db.query(
-      `SELECT d.id FROM drivers d
-       JOIN users u ON u.id = d.user_id
-       WHERE u.id = $1
-         OR d.id::text = $1
+    const { rows } = await domainDb.query(
+      'rides',
+      `SELECT driver_id AS id
+       FROM ride_driver_projection
+       WHERE user_id::text = $1
+          OR driver_id::text = $1
        LIMIT 1`,
       [driverExternalId]
     );
@@ -200,7 +244,8 @@ class PgRideRepository {
   // ─── Stats ────────────────────────────────────────────────────────────────
 
   async getStats() {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query(
+      'analytics',
       `SELECT
          COUNT(*)                                                           AS "totalRides",
          COUNT(*) FILTER (WHERE status = 'completed')                      AS "completedRides",
@@ -218,6 +263,59 @@ class PgRideRepository {
       totalRevenue:     `₹${parseFloat(r.totalRevenue).toFixed(2)}`,
       avgMatchTimeSec:  Math.round(parseFloat(r.avgMatchTimeSec)),
     };
+  }
+
+  async _insertOutboxWithClient(client, domain, event) {
+    await client.query(
+      `INSERT INTO outbox_events (
+         id,
+         domain,
+         topic,
+         partition_key,
+         event_type,
+         aggregate_type,
+         aggregate_id,
+         event_version,
+         payload,
+         region,
+         idempotency_key,
+         status,
+         available_at,
+         created_at,
+         updated_at
+       ) VALUES (
+         gen_random_uuid(),
+         $1,
+         $2,
+         $3,
+         $4,
+         $5,
+         $6,
+         COALESCE($7, 1),
+         $8::jsonb,
+         COALESCE($9, 'ap-south-1'),
+         $10,
+         'pending',
+         NOW(),
+         NOW(),
+         NOW()
+       )
+       ON CONFLICT (domain, idempotency_key)
+       WHERE idempotency_key IS NOT NULL
+       DO NOTHING`,
+      [
+        domain,
+        event.topic,
+        event.partitionKey || null,
+        event.eventType,
+        event.aggregateType,
+        event.aggregateId,
+        event.version || 1,
+        JSON.stringify(event.payload || {}),
+        event.region || null,
+        event.idempotencyKey || null,
+      ]
+    );
   }
 }
 

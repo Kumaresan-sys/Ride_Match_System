@@ -17,6 +17,9 @@ const { logger, eventBus } = require('../utils/logger');
 const driverWalletService = require('./driver-wallet-service');
 const rideSessionService  = require('./ride-session-service');
 const pgRepo = require('../repositories/pg/pg-ride-repository');
+const RedisStateStore = require('../infra/redis/state-store');
+const KafkaProducer = require('../infra/kafka/producer');
+const { TOPICS } = require('../infra/kafka/topics');
 
 const S = config.rideStatuses;
 
@@ -24,6 +27,9 @@ class RideService {
   constructor() {
     this.rides              = new Map(); // rideId -> ride object (hot cache for active rides)
     this.cancellationCounts = new Map(); // `${type}:${userId}` -> { count, windowStart }
+    this.redisStateV2       = Boolean(config.architecture?.featureFlags?.redisStateV2);
+    this.stateStore         = new RedisStateStore(redis);
+    this.kafkaProducer      = new KafkaProducer();
   }
 
   // ═══════════════════════════════════════════
@@ -90,10 +96,8 @@ class RideService {
       cancelledBy: null,
     };
 
-    this.rides.set(rideId, ride);
-
-    // Persist to PostgreSQL (non-blocking — hot-cache Map is source of truth during the ride)
-    pgRepo.createRide({
+    const outboxEnabled = Boolean(config.architecture?.featureFlags?.kafkaOutbox);
+    await pgRepo.createRide({
       rideId: dbRideId,
       rideNumber: rideId,
       riderId,
@@ -105,17 +109,55 @@ class RideService {
       fareEstimate: fareEstimate.finalFare,
       surgeMultiplier: estimates.surgeMultiplier,
       idempotencyKey,
-    }).catch(err => logger.warn('RIDE', `pg createRide failed (non-fatal): ${err.message}`));
+      outboxEvent: outboxEnabled
+        ? {
+          topic: TOPICS.RIDE_REQUESTED,
+          eventType: 'ride_requested',
+          aggregateType: 'ride',
+          aggregateId: rideId,
+          partitionKey: rideId,
+          payload: {
+            rideId,
+            riderId,
+            pickupLat,
+            pickupLng,
+            destLat,
+            destLng,
+            rideType: ride.rideType,
+            requestedAt: now,
+          },
+        }
+        : null,
+    });
+
+    this.rides.set(rideId, ride);
 
     // Index active ride in Redis for fast recovery lookup (4-hour TTL)
-    if (riderId) redis.set(`active_ride:${riderId}`, rideId, 4 * 3600);
+    if (riderId) {
+      if (this.redisStateV2) {
+        await this.stateStore.setRiderActiveRide(riderId, rideId, 4 * 3600);
+        await this.stateStore.setActiveRide(rideId, {
+          rideId,
+          riderId,
+          status: ride.status,
+          pickupLat,
+          pickupLng,
+          destLat,
+          destLng,
+          rideType: ride.rideType,
+          createdAt: now,
+        }, 4 * 3600);
+      } else {
+        await redis.set(`active_ride:${riderId}`, rideId, { EX: 4 * 3600 });
+      }
+    }
 
     // Track session for app-crash recovery
-    rideSessionService.onRideCreated(riderId, rideId);
+    await rideSessionService.onRideCreated(riderId, rideId);
 
     // Store idempotency
     if (idempotencyKey) {
-      redis.setIdempotency(idempotencyKey, { rideId, status: S.REQUESTED }, 300);
+      await redis.setIdempotency(idempotencyKey, { rideId, status: S.REQUESTED }, 300);
     }
 
     logger.success('RIDE', `Created ride ${rideId} for rider ${riderId}`, {
@@ -134,20 +176,67 @@ class RideService {
       eventTime: new Date(now).toISOString(),
     }).catch((err) => logger.warn('ZONE_METRICS', `recordRequested failed: ${err.message}`));
 
-    // ─── Start Matching ───
-    this._updateStatus(rideId, S.MATCHING);
-    notificationService.notifyRideRequested(riderId, rideId);
+    // ─── Strict async matching ownership cutover ───
+    if (!outboxEnabled) {
+      await this.kafkaProducer.publish(TOPICS.RIDE_REQUESTED, {
+        rideId,
+        riderId,
+        pickupLat,
+        pickupLng,
+        destLat,
+        destLng,
+        rideType: ride.rideType,
+        requestedAt: now,
+      }, rideId);
+    }
 
+    return {
+      rideId,
+      pickupZoneId: ride.pickupZoneId,
+      dropZoneId: ride.dropZoneId,
+      status: S.REQUESTED,
+      queuedForMatching: true,
+      fareEstimate: fareEstimate.finalFare,
+    };
+  }
+
+  async processRideRequestedEvent(event = {}) {
+    const rideId = event.rideId;
+    if (!rideId) return { success: false, reason: 'MISSING_RIDE_ID' };
+
+    let ride = this.rides.get(rideId);
+    if (!ride) {
+      const fromDb = await pgRepo.getRide(rideId);
+      if (!fromDb) return { success: false, reason: 'RIDE_NOT_FOUND' };
+      ride = {
+        ...fromDb,
+        rideId: fromDb.rideId || rideId,
+        statusHistory: [],
+      };
+      this.rides.set(rideId, ride);
+    }
+
+    if ([S.MATCHING, S.ACCEPTED, S.DRIVER_ARRIVING, S.TRIP_STARTED, S.TRIP_COMPLETED].includes(ride.status)) {
+      return { success: true, duplicate: true, rideId };
+    }
+
+    this._updateStatus(rideId, S.MATCHING);
+    notificationService.notifyRideRequested(ride.riderId, rideId);
     const matchResult = await matchingEngine.startMatching(ride);
 
     if (matchResult.success) {
-      ride.driverId  = matchResult.driverId;
+      ride.driverId = matchResult.driverId;
       ride.acceptedAt = Date.now();
       ride.matchResult = matchResult;
       this._updateStatus(rideId, S.ACCEPTED);
       this._updateStatus(rideId, S.DRIVER_ARRIVING);
-
-      notificationService.notifyRideMatched(riderId, matchResult.driverId, {
+      eventBus.publish('ride_matched', {
+        rideId,
+        riderId: ride.riderId,
+        driverId: matchResult.driverId,
+        etaMin: matchResult.etaMin,
+      });
+      notificationService.notifyRideMatched(ride.riderId, matchResult.driverId, {
         rideId,
         driverName: matchResult.driverName,
         vehicleType: matchResult.vehicleType,
@@ -155,53 +244,26 @@ class RideService {
         etaMin: matchResult.etaMin,
         score: matchResult.score,
       });
-      eventBus.publish('ride_matched', {
-        rideId,
-        riderId,
-        driverId: matchResult.driverId,
-        etaMin: matchResult.etaMin,
-      });
-
-      return {
-        rideId,
-        pickupZoneId: ride.pickupZoneId,
-        dropZoneId: ride.dropZoneId,
-        status: S.DRIVER_ARRIVING,
-        driver: {
+      if (!config.architecture?.featureFlags?.kafkaOutbox) {
+        await this.kafkaProducer.publish(TOPICS.RIDE_MATCHED, {
+          rideId,
+          riderId: ride.riderId,
           driverId: matchResult.driverId,
-          name: matchResult.driverName,
-          vehicleType: matchResult.vehicleType,
-          vehicleNumber: matchResult.vehicleNumber,
           etaMin: matchResult.etaMin,
-          score: matchResult.score,
-        },
-        fareEstimate: fareEstimate.finalFare,
-        matchTimeSec: matchResult.matchTimeSec,
-      };
-    } else {
-      this._updateStatus(rideId, S.NO_DRIVERS);
-      zoneMetricsService.recordNoDriver({
-        zoneId: ride.pickupZoneId,
-        riderId: ride.riderId,
-        eventTime: new Date().toISOString(),
-      }).catch((err) => logger.warn('ZONE_METRICS', `recordNoDriver failed: ${err.message}`));
-      notificationService.notifyNoDrivers(riderId, rideId);
-      return {
-        rideId,
-        pickupZoneId: ride.pickupZoneId,
-        dropZoneId: ride.dropZoneId,
-        status: S.NO_DRIVERS,
-        message: matchResult.message,
-        canRetry: matchResult.canRetry,
-        retryCooldownSec: matchResult.retryCooldownSec,
-      };
+        }, rideId);
+      }
+      return { success: true, rideId, driverId: matchResult.driverId };
     }
+
+    this._updateStatus(rideId, S.NO_DRIVERS);
+    notificationService.notifyNoDrivers(ride.riderId, rideId);
+    return { success: false, rideId, reason: matchResult.reason || 'NO_DRIVERS' };
   }
 
   // ═══════════════════════════════════════════
   // RIDE STATE TRANSITIONS
   // ═══════════════════════════════════════════
-  driverArrived(rideId) {
+  async driverArrived(rideId) {
     const ride = this.rides.get(rideId);
     if (!ride || ride.status !== S.DRIVER_ARRIVING) return null;
 
@@ -209,13 +271,13 @@ class RideService {
     eventBus.publish('driver_arrived', { rideId, driverId: ride.driverId, riderId: ride.riderId });
     logger.success('RIDE', `Driver arrived at pickup for ride ${rideId}`);
 
-    const arrivedDriver = matchingEngine.getDriver(ride.driverId);
+    const arrivedDriver = await matchingEngine.getDriver(ride.driverId);
     notificationService.notifyDriverArrived(ride.riderId, arrivedDriver?.name || 'Your driver', rideId);
 
     return ride;
   }
 
-  startTrip(rideId) {
+  async startTrip(rideId) {
     const ride = this.rides.get(rideId);
     if (!ride || ride.status !== S.DRIVER_ARRIVED) return null;
 
@@ -252,7 +314,7 @@ class RideService {
     });
 
     // Update driver stats
-    const driver = matchingEngine.getDriver(ride.driverId);
+    const driver = await matchingEngine.getDriver(ride.driverId);
     if (driver) {
       driver.ridesCompleted = (driver.ridesCompleted || 0) + 1;
       driver.lastTripEndTime = Date.now();
@@ -260,8 +322,20 @@ class RideService {
     }
 
     // Release lock and clear active-ride index
-    redis.releaseLock(rideId);
-    if (ride.riderId) redis.del(`active_ride:${ride.riderId}`);
+    if (this.redisStateV2) {
+      await this.stateStore.releaseRideAssignLock(rideId, ride.matchResult?.lockToken || ride.driverId || null);
+      if (ride.riderId) await this.stateStore.clearRiderActiveRide(ride.riderId);
+      await this.stateStore.setActiveRide(rideId, {
+        rideId,
+        riderId: ride.riderId,
+        driverId: ride.driverId,
+        status: S.TRIP_COMPLETED,
+        completedAt: ride.completedAt,
+      }, 3600);
+    } else {
+      await redis.releaseLock(rideId);
+      if (ride.riderId) await redis.del(`active_ride:${ride.riderId}`);
+    }
 
     eventBus.publish('ride_completed', {
       rideId, driverId: ride.driverId, riderId: ride.riderId,
@@ -291,10 +365,13 @@ class RideService {
     if (ride.driverId) {
       const platformFee    = Math.round(finalFare.platformCommission * 100) / 100;
       const driverEarnings = Math.round(finalFare.driverEarnings * 100) / 100;
-      driverWalletService.deductCommission(ride.driverId, platformFee, rideId);
-      driverWalletService.creditEarnings(ride.driverId, driverEarnings, rideId);
+      await driverWalletService.settleRidePayout(ride.driverId, {
+        platformFee,
+        earnings: driverEarnings,
+        rideId,
+      });
     }
-    rideSessionService.onRideEnded(ride.riderId);
+    await rideSessionService.onRideEnded(ride.riderId);
 
     notificationService.notifyTripCompleted(ride.riderId, ride.driverId, {
       rideId,
@@ -315,7 +392,7 @@ class RideService {
   // ═══════════════════════════════════════════
   // CANCELLATION
   // ═══════════════════════════════════════════
-  cancelRide(rideId, cancelledBy, userId) {
+  async cancelRide(rideId, cancelledBy, userId) {
     const ride = this.rides.get(rideId);
     if (!ride) return { success: false, reason: 'Ride not found' };
 
@@ -326,7 +403,7 @@ class RideService {
     if (cancelledBy === 'rider') {
       if (ride.status === S.MATCHING || ride.status === S.BROADCAST) {
         // Cancel during matching - no penalty
-        matchingEngine.cancelMatching(rideId);
+        await matchingEngine.cancelMatching(rideId);
         this._updateStatus(rideId, S.CANCELLED_BY_RIDER);
         eventBus.publish('ride_cancelled_by_rider', { rideId, phase: 'during_matching' });
 
@@ -345,9 +422,10 @@ class RideService {
         }
 
         // Free the driver
-        const driver = matchingEngine.getDriver(ride.driverId);
+        const driver = await matchingEngine.getDriver(ride.driverId);
         if (driver) driver.status = 'online';
-        redis.releaseLock(rideId);
+        if (this.redisStateV2) await this.stateStore.releaseRideAssignLock(rideId, ride.matchResult?.lockToken || ride.driverId || null);
+        else await redis.releaseLock(rideId);
 
         this._updateStatus(rideId, S.CANCELLED_BY_RIDER);
         eventBus.publish('ride_cancelled_by_rider', {
@@ -359,7 +437,7 @@ class RideService {
       }
 
       // Track rider cancellations
-      penalty = this._trackCancellation('rider', userId);
+      penalty = await this._trackCancellation('rider', userId);
 
     } else if (cancelledBy === 'driver') {
       // Driver cancels after accepting
@@ -367,18 +445,19 @@ class RideService {
       const cancelledDriverId = ride.driverId;
 
       // Exclude this driver from re-matching
-      matchingEngine.excludeDriver(rideId, cancelledDriverId);
+      await matchingEngine.excludeDriver(rideId, cancelledDriverId);
 
       // Free the driver
-      const driver = matchingEngine.getDriver(cancelledDriverId);
+      const driver = await matchingEngine.getDriver(cancelledDriverId);
       if (driver) driver.status = 'online';
-      redis.releaseLock(rideId);
+      if (this.redisStateV2) await this.stateStore.releaseRideAssignLock(rideId, ride.matchResult?.lockToken || ride.driverId || null);
+      else await redis.releaseLock(rideId);
 
       this._updateStatus(rideId, S.CANCELLED_BY_DRIVER);
       eventBus.publish('ride_cancelled_by_driver', { rideId, driverId: cancelledDriverId });
 
       // Track driver cancellations
-      penalty = this._trackCancellation('driver', userId);
+      penalty = await this._trackCancellation('driver', userId);
 
       logger.warn('RIDE', `Driver cancelled ride ${rideId} - resuming matching from stage ${lastStage}`);
 
@@ -432,8 +511,21 @@ class RideService {
       riderId: ride.riderId,
       eventTime: new Date(now).toISOString(),
     }).catch((err) => logger.warn('ZONE_METRICS', `recordCancelled failed: ${err.message}`));
-    if (ride.riderId) redis.del(`active_ride:${ride.riderId}`);
-    rideSessionService.onRideEnded(ride.riderId);
+    if (ride.riderId) {
+      if (this.redisStateV2) await this.stateStore.clearRiderActiveRide(ride.riderId);
+      else await redis.del(`active_ride:${ride.riderId}`);
+    }
+    if (this.redisStateV2) {
+      await this.stateStore.setActiveRide(rideId, {
+        rideId,
+        riderId: ride.riderId,
+        driverId: ride.driverId,
+        status: ride.status,
+        cancelledAt: ride.cancelledAt,
+        cancelledBy,
+      }, 3600);
+    }
+    await rideSessionService.onRideEnded(ride.riderId);
 
     this._pruneOldRides();
 
@@ -457,7 +549,31 @@ class RideService {
   }
 
   // ─── Cancellation Tracking ───
-  _trackCancellation(type, userId) {
+  async _trackCancellation(type, userId) {
+    if (this.redisStateV2) {
+      const ttlSec = type === 'driver' ? 24 * 3600 : 3600;
+      const count = await this.stateStore.incrementCancelCount(type, userId, ttlSec);
+      const thresholds = type === 'driver'
+        ? config.cancellation.driver.window24h
+        : config.cancellation.rider.window1h;
+
+      if (count > (thresholds.threshold5 || 5)) {
+        return {
+          level: 'severe',
+          action: type === 'driver' ? '60-min queue timeout + warning' : '30-min request block',
+          count,
+        };
+      }
+      if (count > (thresholds.threshold3 || 3)) {
+        return {
+          level: 'moderate',
+          action: type === 'driver' ? '15-min queue timeout' : 'Cancellation fee',
+          count,
+        };
+      }
+      return null;
+    }
+
     const key = `${type}:${userId}`;
     const windowMs = type === 'driver' ? 24 * 3600 * 1000 : 3600 * 1000;
     const now = Date.now();
@@ -506,22 +622,68 @@ class RideService {
     // Persist status change to PostgreSQL
     pgRepo.updateStatus(rideId, newStatus, pgExtra)
       .catch(err => logger.warn('RIDE', `pg updateStatus failed (non-fatal): ${err.message}`));
+
+    if (this.redisStateV2 && ride.riderId) {
+      this.stateStore.setActiveRide(rideId, {
+        rideId,
+        riderId: ride.riderId,
+        driverId: ride.driverId,
+        status: newStatus,
+        updatedAt: Date.now(),
+      }, 4 * 3600).catch((err) => logger.warn('RIDE', `REDIS_STATE_V2 setActiveRide failed: ${err.message}`));
+    }
   }
 
   // ─── Active ride lookup by riderId (for app session recovery) ───
+  async getActiveRideAsync(riderId) {
+    const activeStatuses = new Set([
+      'MATCHING', 'BROADCAST', 'ACCEPTED',
+      'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'TRIP_STARTED',
+    ]);
+
+    if (this.redisStateV2) {
+      const rideId = await this.stateStore.getRiderActiveRide(riderId);
+      if (rideId) {
+        const hot = this.rides.get(rideId);
+        if (hot && activeStatuses.has(hot.status)) return hot;
+
+        const [activeSnapshot, fromDb] = await Promise.all([
+          this.stateStore.getActiveRide(rideId).catch(() => null),
+          pgRepo.getRide(rideId).catch(() => null),
+        ]);
+
+        const hydrated = fromDb || activeSnapshot;
+        if (hydrated && activeStatuses.has(String(hydrated.status || '').toUpperCase())) {
+          this.rides.set(rideId, {
+            ...hydrated,
+            rideId,
+            riderId: hydrated.riderId || riderId,
+            statusHistory: hydrated.statusHistory || [],
+            createdAt: hydrated.createdAt || Date.now(),
+          });
+          return this.rides.get(rideId);
+        }
+      }
+    } else {
+      const cachedId = await redis.get(`active_ride:${riderId}`);
+      if (cachedId) {
+        const r = this.rides.get(cachedId);
+        if (r && activeStatuses.has(r.status)) return r;
+      }
+    }
+
+    for (const ride of this.rides.values()) {
+      if (ride.riderId === riderId && activeStatuses.has(ride.status)) return ride;
+    }
+    return null;
+  }
+
   getActiveRide(riderId) {
     const activeStatuses = new Set([
       'MATCHING', 'BROADCAST', 'ACCEPTED',
       'DRIVER_ARRIVING', 'DRIVER_ARRIVED', 'TRIP_STARTED',
     ]);
-    // Fast path: Redis index
-    const cachedId = redis.get('active_ride:' + riderId);
-    if (cachedId) {
-      const r = this.rides.get(cachedId);
-      if (r && activeStatuses.has(r.status)) return r;
-      redis.del('active_ride:' + riderId);
-    }
-    // Fallback: linear scan of hot-cache
+    // Hot-cache scan remains synchronous path for recovery endpoints.
     for (const ride of this.rides.values()) {
       if (ride.riderId === riderId && activeStatuses.has(ride.status)) return ride;
     }
@@ -529,13 +691,21 @@ class RideService {
   }
 
   getRide(rideId) {
-    // Hot cache first; fall back to PG
-    if (this.rides.has(rideId)) return this.rides.get(rideId);
+    return this.rides.get(rideId) || null;
+  }
+
+  async getRideAsync(rideId) {
+    const hot = this.getRide(rideId);
+    if (hot) return hot;
     return pgRepo.getRide(rideId);
   }
 
   getAllRides() {
     return pgRepo.getAllRides();
+  }
+
+  getRidesPage(options = {}) {
+    return pgRepo.getRidesPage(options);
   }
 
   getStats() {

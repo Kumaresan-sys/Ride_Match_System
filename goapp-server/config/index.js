@@ -229,13 +229,118 @@ module.exports = {
   },
 
   // ─── Kafka ─────────────────────────────────────────────────────────────────
-  // Always uses real Apache Kafka via kafkajs
+  // Real Apache Kafka via kafkajs (can be disabled in local/dev)
   kafka: {
-    backend:  'real',
+    backend:  process.env.KAFKA_BACKEND || 'real',
     clientId: process.env.KAFKA_CLIENT_ID || 'goapp-server',
     brokers: (process.env.KAFKA_BROKERS  || 'localhost:9092').split(',').map(b => b.trim()),
+    producerPartitioner: (process.env.KAFKA_PRODUCER_PARTITIONER || 'legacy').trim().toLowerCase(),
     // Consumer group prefix for multi-instance deployments
     groupPrefix: process.env.KAFKA_GROUP_PREFIX || 'goapp',
+  },
+
+  // ─── Architecture Upgrade Flags / Topology ───────────────────────────────
+  architecture: {
+    featureFlags: {
+      matchingV2: process.env.MATCHING_V2 !== 'false',
+      // Keep matching + state-store cutovers aligned by default.
+      redisStateV2: process.env.REDIS_STATE_V2
+        ? process.env.REDIS_STATE_V2 === 'true'
+        : process.env.MATCHING_V2 !== 'false',
+      kafkaOutbox: process.env.KAFKA_OUTBOX === 'true',
+      kafkaEventBridge: process.env.KAFKA_EVENT_BRIDGE === 'true',
+      kafkaMatchingWorker: process.env.KAFKA_MATCHING_WORKER === 'true',
+      kafkaNotificationWorker: process.env.KAFKA_NOTIFICATION_WORKER === 'true',
+      kafkaOutboxRelayWorker: process.env.KAFKA_OUTBOX_RELAY_WORKER === 'true',
+      kafkaDomainProjectionWorker: process.env.KAFKA_DOMAIN_PROJECTION_WORKER === 'true',
+    },
+    dbTopology: {
+      identity: {
+        database: process.env.IDENTITY_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        writer: {
+          host: process.env.IDENTITY_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.IDENTITY_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.IDENTITY_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.IDENTITY_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.IDENTITY_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+        reader: {
+          host: process.env.IDENTITY_DB_READER_HOST || process.env.IDENTITY_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.IDENTITY_DB_READER_PORT || process.env.IDENTITY_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.IDENTITY_DB_READER_USER || process.env.IDENTITY_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.IDENTITY_DB_READER_PASSWORD || process.env.IDENTITY_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.IDENTITY_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+      },
+      drivers: {
+        database: process.env.DRIVERS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        writer: {
+          host: process.env.DRIVERS_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.DRIVERS_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.DRIVERS_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.DRIVERS_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.DRIVERS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+        reader: {
+          host: process.env.DRIVERS_DB_READER_HOST || process.env.DRIVERS_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.DRIVERS_DB_READER_PORT || process.env.DRIVERS_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.DRIVERS_DB_READER_USER || process.env.DRIVERS_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.DRIVERS_DB_READER_PASSWORD || process.env.DRIVERS_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.DRIVERS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+      },
+      rides: {
+        database: process.env.RIDES_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        writer: {
+          host: process.env.RIDES_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.RIDES_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.RIDES_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.RIDES_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.RIDES_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+        reader: {
+          host: process.env.RIDES_DB_READER_HOST || process.env.RIDES_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.RIDES_DB_READER_PORT || process.env.RIDES_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.RIDES_DB_READER_USER || process.env.RIDES_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.RIDES_DB_READER_PASSWORD || process.env.RIDES_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.RIDES_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+      },
+      payments: {
+        database: process.env.PAYMENTS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        writer: {
+          host: process.env.PAYMENTS_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.PAYMENTS_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.PAYMENTS_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.PAYMENTS_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.PAYMENTS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+        reader: {
+          host: process.env.PAYMENTS_DB_READER_HOST || process.env.PAYMENTS_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.PAYMENTS_DB_READER_PORT || process.env.PAYMENTS_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.PAYMENTS_DB_READER_USER || process.env.PAYMENTS_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.PAYMENTS_DB_READER_PASSWORD || process.env.PAYMENTS_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.PAYMENTS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+      },
+      analytics: {
+        database: process.env.ANALYTICS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        writer: {
+          host: process.env.ANALYTICS_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.ANALYTICS_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.ANALYTICS_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.ANALYTICS_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.ANALYTICS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+        reader: {
+          host: process.env.ANALYTICS_DB_READER_HOST || process.env.ANALYTICS_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.ANALYTICS_DB_READER_PORT || process.env.ANALYTICS_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.ANALYTICS_DB_READER_USER || process.env.ANALYTICS_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.ANALYTICS_DB_READER_PASSWORD || process.env.ANALYTICS_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.ANALYTICS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+      },
+    },
   },
 
   // Runtime cutover controls. Defaults are hard-on for non-test flows.

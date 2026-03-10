@@ -1,9 +1,8 @@
-// GoApp Kafka Event Bus — real Apache Kafka via kafkajs
-//
-// API:
-//   publish(topic, payload)               → void  (fire-and-forget)
-//   subscribe(topic, groupId, handler)    → Promise<void>
-//   getRecentEvents(n)                    → Array (always empty in real mode)
+// GoApp Kafka client wrapper
+// Safe bootstrap behavior:
+// - No process exit on startup failure
+// - Lazy producer/consumer connect
+// - Graceful no-op when Kafka backend is disabled or kafkajs is missing
 
 'use strict';
 
@@ -12,44 +11,113 @@ const { logger } = require('../utils/logger');
 
 class RealKafkaBus {
   constructor() {
-    this._producer  = null;
-    this._consumers = new Map(); // `${topic}:${groupId}` → consumer
-    this._ready     = false;
+    this._producer = null;
+    this._consumers = new Map(); // `${topic}:${groupId}` => consumer
+    this._ready = false;
+    this._connectPromise = null;
+    this._backendEnabled = config.kafka?.backend === 'real';
+    this._kafkaLibAvailable = true;
+
+    try {
+      // Probe dependency at startup for clear operator signal.
+      // eslint-disable-next-line global-require
+      require.resolve('kafkajs');
+    } catch (_) {
+      this._kafkaLibAvailable = false;
+      logger.error('KAFKA', 'kafkajs dependency not installed. Kafka publish/consume is disabled.');
+    }
   }
 
   async connect() {
-    const { Kafka, logLevel } = require('kafkajs');
-    const kafka = new Kafka({
-      clientId:  config.kafka.clientId  || 'goapp-server',
-      brokers:   config.kafka.brokers   || ['localhost:9092'],
-      logLevel:  logLevel.WARN,
-      retry: { initialRetryTime: 200, retries: 8 },
-    });
+    if (!this._backendEnabled || !this._kafkaLibAvailable) return false;
+    if (this._ready) return true;
+    if (this._connectPromise) return this._connectPromise;
 
-    this._kafka    = kafka;
-    this._producer = kafka.producer({ allowAutoTopicCreation: true });
-    await this._producer.connect();
-    this._ready = true;
-    logger.info('KAFKA', `Producer connected to ${(config.kafka.brokers || ['localhost:9092']).join(',')}`);
+    this._connectPromise = (async () => {
+      try {
+        const { Kafka, logLevel, Partitioners } = require('kafkajs');
+        this._kafka = new Kafka({
+          clientId: config.kafka.clientId || 'goapp-server',
+          brokers: config.kafka.brokers || ['localhost:9092'],
+          logLevel: logLevel.WARN,
+          retry: {
+            initialRetryTime: 200,
+            retries: 8,
+          },
+        });
+
+        const configuredPartitioner = String(
+          process.env.KAFKA_PRODUCER_PARTITIONER ||
+          config.kafka?.producerPartitioner ||
+          'legacy'
+        )
+          .trim()
+          .toLowerCase();
+
+        const useDefaultPartitioner = configuredPartitioner === 'default';
+        const createPartitioner = useDefaultPartitioner
+          ? Partitioners.DefaultPartitioner
+          : Partitioners.LegacyPartitioner;
+
+        this._producer = this._kafka.producer({
+          allowAutoTopicCreation: true,
+          createPartitioner,
+        });
+        await this._producer.connect();
+        this._ready = true;
+        logger.info(
+          'KAFKA',
+          `Producer partitioner set to ${useDefaultPartitioner ? 'default' : 'legacy'}`
+        );
+        logger.info('KAFKA', `Producer connected to ${(config.kafka.brokers || ['localhost:9092']).join(',')}`);
+        return true;
+      } catch (err) {
+        this._ready = false;
+        logger.error('KAFKA', `Producer connection failed: ${err.message}`);
+        return false;
+      } finally {
+        this._connectPromise = null;
+      }
+    })();
+
+    return this._connectPromise;
   }
 
   publish(topic, payload) {
-    if (!this._ready) {
-      logger.warn('KAFKA', `Producer not ready — dropping event: ${topic}`);
-      return;
+    if (!this._backendEnabled || !this._kafkaLibAvailable) {
+      return Promise.resolve({ queued: false, reason: 'kafka_disabled' });
     }
-    this._producer.send({
+
+    return this._publishInternal(topic, payload);
+  }
+
+  async _publishInternal(topic, payload) {
+    const connected = await this.connect();
+    if (!connected || !this._producer) {
+      throw new Error(`Producer unavailable for topic ${topic}`);
+    }
+
+    await this._producer.send({
       topic,
       messages: [{ value: JSON.stringify({ ...payload, _ts: Date.now() }) }],
-    }).catch(err => logger.error('KAFKA', `Publish failed [${topic}]: ${err.message}`));
+    });
+    return { queued: true };
   }
 
   async subscribe(topic, groupId, handler) {
-    if (!this._kafka) throw new Error('Kafka not connected. Call connect() first.');
+    if (!this._backendEnabled || !this._kafkaLibAvailable) {
+      logger.warn('KAFKA', `Subscribe skipped [${topic}/${groupId}] because Kafka backend is disabled.`);
+      return;
+    }
+
+    const connected = await this.connect();
+    if (!connected || !this._kafka) {
+      throw new Error(`Kafka not connected for subscription ${topic}/${groupId}`);
+    }
 
     const consumer = this._kafka.consumer({
       groupId,
-      sessionTimeout:   30000,
+      sessionTimeout: 30000,
       heartbeatInterval: 3000,
     });
 
@@ -71,34 +139,31 @@ class RealKafkaBus {
     logger.info('KAFKA', `Subscribed to [${topic}] as group [${groupId}]`);
   }
 
-  // Graceful shutdown
   async disconnect() {
-    for (const c of this._consumers.values()) {
-      await c.disconnect().catch(() => {});
+    for (const consumer of this._consumers.values()) {
+      await consumer.disconnect().catch(() => {});
     }
-    if (this._producer) await this._producer.disconnect().catch(() => {});
+
+    if (this._producer) {
+      await this._producer.disconnect().catch(() => {});
+    }
+
     this._ready = false;
     logger.info('KAFKA', 'Disconnected');
   }
 
-  getRecentEvents() { return []; } // not buffered in real mode
+  getRecentEvents() {
+    return [];
+  }
 
   getStats() {
     return {
-      backend:   'real',
-      ready:     this._ready,
+      backend: this._backendEnabled ? 'real' : 'disabled',
+      ready: this._ready,
       consumers: this._consumers.size,
-      brokers:   config.kafka?.brokers || ['localhost:9092'],
+      brokers: config.kafka?.brokers || ['localhost:9092'],
     };
   }
 }
 
-// ─── Factory & Export ─────────────────────────────────────────────────────────
-
-const client = new RealKafkaBus();
-client.connect().catch(err => {
-  logger.error('KAFKA', `Initial connection failed: ${err.message}`);
-  process.nextTick(() => process.exit(1));
-});
-
-module.exports = client;
+module.exports = new RealKafkaBus();

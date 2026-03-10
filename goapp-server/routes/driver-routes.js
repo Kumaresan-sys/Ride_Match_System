@@ -54,7 +54,7 @@ function registerDriverRoutes(router, ctx) {
     ]);
     if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
 
-    return { data: locationService.updateLocation(pathParams.driverId, parsed.data) };
+    return { data: await locationService.updateLocation(pathParams.driverId, parsed.data) };
   });
 
   router.register('POST', '/api/v1/users/:userId/device-token', async ({ pathParams, body, headers }) => {
@@ -119,7 +119,7 @@ function registerDriverRoutes(router, ctx) {
     if (owner.error) return owner.error;
 
     const limit = Number.parseInt(params.get('limit') || '20', 10);
-    return { data: driverWalletService.getTransactions(pathParams.driverId, Math.min(Math.max(limit, 1), 100)) };
+    return { data: await driverWalletService.getTransactions(pathParams.driverId, Math.min(Math.max(limit, 1), 100)) };
   });
 
   router.register('POST', '/api/v1/driver-wallet/:driverId/recharge', async ({ pathParams, body, headers }) => {
@@ -139,7 +139,7 @@ function registerDriverRoutes(router, ctx) {
     ]);
     if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
 
-    const result = driverWalletService.rechargeWallet(
+    const result = await driverWalletService.rechargeWallet(
       pathParams.driverId,
       parsed.data.amount,
       parsed.data.method || 'upi',
@@ -158,7 +158,7 @@ function registerDriverRoutes(router, ctx) {
       forbiddenMessage: 'Forbidden: cannot access another driver wallet.',
     });
     if (owner.error) return owner.error;
-    return { data: driverWalletService.canReceiveRide(pathParams.driverId) };
+    return { data: await driverWalletService.canReceiveRide(pathParams.driverId) };
   });
 }
 

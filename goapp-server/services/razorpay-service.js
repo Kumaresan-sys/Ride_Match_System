@@ -5,38 +5,30 @@
 'use strict';
 
 const crypto = require('crypto');
-const https  = require('https');
+const https = require('https');
+const redis = require('./redis-client');
 const { logger, eventBus } = require('../utils/logger');
 
-// ─── In-memory order store ────────────────────────────────────────────────────
-// Maps orderId → PendingOrder. Evicts oldest when cap is hit.
-const pendingOrders = new Map();
-const MAX_PENDING_ORDERS = 10_000;
+const ORDER_TTL_SEC = 24 * 3600;
 
-function _storePendingOrder(entry) {
-  if (pendingOrders.size >= MAX_PENDING_ORDERS) {
-    const firstKey = pendingOrders.keys().next().value;
-    pendingOrders.delete(firstKey);
-  }
-  pendingOrders.set(entry.orderId, entry);
+function pendingOrderKey(orderId) {
+  return `payment:pending_order:${orderId}`;
 }
 
-// ─── Razorpay Service ─────────────────────────────────────────────────────────
 class RazorpayService {
   constructor() {
-    this.keyId         = process.env.RAZORPAY_KEY_ID         || '';
-    this.keySecret     = process.env.RAZORPAY_KEY_SECRET      || '';
-    this.webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET  || '';
-    this.currency      = 'INR';
-    this.enabled       = Boolean(this.keyId && this.keySecret);
+    this.keyId = process.env.RAZORPAY_KEY_ID || '';
+    this.keySecret = process.env.RAZORPAY_KEY_SECRET || '';
+    this.webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
+    this.currency = 'INR';
+    this.enabled = Boolean(this.keyId && this.keySecret);
 
-    // Operational counters
     this._stats = {
-      ordersCreated:   0,
+      ordersCreated: 0,
       paymentsVerified: 0,
-      paymentsFailed:  0,
+      paymentsFailed: 0,
       webhooksReceived: 0,
-      webhooksInvalid:  0,
+      webhooksInvalid: 0,
       totalCreditedInr: 0,
     };
 
@@ -47,17 +39,15 @@ class RazorpayService {
     }
   }
 
-  // ─── Create Order ─────────────────────────────────────────────────────────
-  // Called by both rider-topup and driver-recharge flows.
-  //
-  // Params:
-  //   amountInr  {number}  — exact rupee amount (e.g. 500)
-  //   userId     {string}  — rider/driver id
-  //   userType   {string}  — 'rider' | 'driver'
-  //   receipt    {string?} — unique receipt id (auto-generated if omitted)
-  //   notes      {object?} — extra metadata stored with the order
-  //
-  // Returns { success, orderId, amount (paise), currency, keyId } on success.
+  async _saveOrder(order) {
+    await redis.set(pendingOrderKey(order.orderId), JSON.stringify(order), { EX: ORDER_TTL_SEC });
+  }
+
+  async _getOrderInternal(orderId) {
+    const raw = await redis.get(pendingOrderKey(orderId));
+    return raw ? JSON.parse(raw) : null;
+  }
+
   async createOrder({ amountInr, userId, userType, receipt, notes = {} }) {
     if (!this.enabled) {
       return { success: false, error: 'Razorpay is not configured on this server.' };
@@ -69,70 +59,69 @@ class RazorpayService {
       return { success: false, error: 'userId and userType are required' };
     }
 
-    const amountPaise = Math.round(amountInr * 100); // Razorpay works in smallest currency unit
-    const receiptId   = (receipt || `rcpt_${userType}_${userId}_${Date.now()}`).slice(0, 40);
+    const amountPaise = Math.round(amountInr * 100);
+    const receiptId = (receipt || `rcpt_${userType}_${userId}_${Date.now()}`).slice(0, 40);
 
     const payload = {
-      amount:   amountPaise,
+      amount: amountPaise,
       currency: this.currency,
-      receipt:  receiptId,
-      notes:    { userId, userType, ...notes },
+      receipt: receiptId,
+      notes: { userId, userType, ...notes },
     };
 
     try {
       const order = await this._apiCall('POST', '/v1/orders', payload);
       const entry = {
-        orderId:    order.id,
+        orderId: order.id,
         userId,
-        userType,   // 'rider' | 'driver'
+        userType,
         amountPaise,
         amountInr,
-        receipt:    receiptId,
-        status:     'created',   // created → paid | failed
-        paymentId:  null,
-        createdAt:  Date.now(),
-        paidAt:     null,
+        receipt: receiptId,
+        status: 'created',
+        paymentId: null,
+        createdAt: Date.now(),
+        paidAt: null,
       };
-      _storePendingOrder(entry);
-      this._stats.ordersCreated++;
+
+      await this._saveOrder(entry);
+      this._stats.ordersCreated += 1;
 
       logger.success('RAZORPAY', `Order created: ${order.id} | ₹${amountInr} | ${userType} ${userId}`);
       eventBus.publish('payment_order_created', {
-        orderId: order.id, userId, userType, amountInr,
+        orderId: order.id,
+        userId,
+        userType,
+        amountInr,
       });
 
       return {
-        success:    true,
-        orderId:    order.id,
-        amount:     amountPaise,   // paise — needed by Razorpay Checkout SDK
-        currency:   this.currency,
-        keyId:      this.keyId,    // public key — safe to send to client
-        receipt:    receiptId,
+        success: true,
+        orderId: order.id,
+        amount: amountPaise,
+        currency: this.currency,
+        keyId: this.keyId,
+        receipt: receiptId,
       };
     } catch (err) {
-      this._stats.paymentsFailed++;
+      this._stats.paymentsFailed += 1;
       logger.error('RAZORPAY', `Order creation failed: ${err.message}`);
       return { success: false, error: err.message };
     }
   }
 
-  // ─── Verify Client-Side Payment ───────────────────────────────────────────
-  // Called after the Razorpay Checkout popup completes.
-  // The client sends razorpayOrderId, razorpayPaymentId, razorpaySignature.
-  //
-  // Signature algorithm (from Razorpay docs):
-  //   HMAC-SHA256( orderId + "|" + paymentId, keySecret )
-  //
-  // Returns { success, orderId, paymentId, userId, userType, amountInr } on success.
-  verifyPayment({ razorpayOrderId, razorpayPaymentId, razorpaySignature }) {
+  async verifyPayment({ razorpayOrderId, razorpayPaymentId, razorpaySignature }) {
     if (!this.enabled) {
       return { success: false, error: 'Razorpay is not configured on this server.' };
     }
     if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
-      return { success: false, error: 'razorpayOrderId, razorpayPaymentId, and razorpaySignature are required' };
+      return {
+        success: false,
+        error: 'razorpayOrderId, razorpayPaymentId, and razorpaySignature are required',
+      };
     }
 
-    const order = pendingOrders.get(razorpayOrderId);
+    const order = await this._getOrderInternal(razorpayOrderId);
     if (!order) {
       return { success: false, error: 'Order not found or has expired' };
     }
@@ -140,7 +129,6 @@ class RazorpayService {
       return { success: false, error: 'Order already processed (duplicate verification attempt)' };
     }
 
-    // Constant-time HMAC comparison prevents timing attacks
     const expectedSig = crypto
       .createHmac('sha256', this.keySecret)
       .update(`${razorpayOrderId}|${razorpayPaymentId}`)
@@ -156,52 +144,50 @@ class RazorpayService {
     }
 
     if (!isValid) {
-      this._stats.paymentsFailed++;
+      this._stats.paymentsFailed += 1;
       logger.warn('RAZORPAY', `Signature mismatch for order ${razorpayOrderId} | payment ${razorpayPaymentId}`);
       eventBus.publish('payment_verification_failed', {
-        orderId: razorpayOrderId, paymentId: razorpayPaymentId,
+        orderId: razorpayOrderId,
+        paymentId: razorpayPaymentId,
       });
       return { success: false, error: 'Payment signature verification failed. Do not credit this payment.' };
     }
 
-    // Mark order as paid (idempotent guard is the status check above)
-    order.status    = 'paid';
+    order.status = 'paid';
     order.paymentId = razorpayPaymentId;
-    order.paidAt    = Date.now();
-    this._stats.paymentsVerified++;
+    order.paidAt = Date.now();
+    await this._saveOrder(order);
+
+    this._stats.paymentsVerified += 1;
     this._stats.totalCreditedInr += order.amountInr;
 
-    logger.success('RAZORPAY',
-      `Payment verified: ${razorpayPaymentId} | ₹${order.amountInr} | ${order.userType} ${order.userId}`);
+    logger.success('RAZORPAY', `Payment verified: ${razorpayPaymentId} | ₹${order.amountInr} | ${order.userType} ${order.userId}`);
     eventBus.publish('payment_verified', {
-      orderId:   razorpayOrderId,
+      orderId: razorpayOrderId,
       paymentId: razorpayPaymentId,
-      userId:    order.userId,
-      userType:  order.userType,
+      userId: order.userId,
+      userType: order.userType,
       amountInr: order.amountInr,
     });
 
     return {
-      success:   true,
-      orderId:   razorpayOrderId,
+      success: true,
+      orderId: razorpayOrderId,
       paymentId: razorpayPaymentId,
-      userId:    order.userId,
-      userType:  order.userType,
+      userId: order.userId,
+      userType: order.userType,
       amountInr: order.amountInr,
     };
   }
 
-  // ─── Verify Webhook Signature ─────────────────────────────────────────────
-  // Used by the webhook handler (POST /api/v1/payments/webhook).
-  // Razorpay signs the raw request body with the webhook secret.
-  //
-  // rawBody must be the original Buffer/string — NOT the parsed JSON object.
   verifyWebhookSignature(rawBody, signature) {
     if (!this.webhookSecret || !signature) return false;
+
     const expected = crypto
       .createHmac('sha256', this.webhookSecret)
       .update(rawBody)
       .digest('hex');
+
     try {
       const a = Buffer.from(expected, 'hex');
       const b = Buffer.from(signature, 'hex');
@@ -211,29 +197,35 @@ class RazorpayService {
     }
   }
 
-  // ─── Get Order ────────────────────────────────────────────────────────────
-  getOrder(orderId) {
-    const order = pendingOrders.get(orderId);
+  async getOrder(orderId) {
+    const order = await this._getOrderInternal(orderId);
     if (!order) return null;
-    // Never expose secret data
-    const { orderId: oid, userId, userType, amountInr, status, createdAt, paidAt } = order;
+
+    const {
+      orderId: oid,
+      userId,
+      userType,
+      amountInr,
+      status,
+      createdAt,
+      paidAt,
+    } = order;
+
     return { orderId: oid, userId, userType, amountInr, status, createdAt, paidAt };
   }
 
-  // ─── Stats ────────────────────────────────────────────────────────────────
   getStats() {
     return {
-      enabled:       this.enabled,
-      keyId:         this.enabled ? `${this.keyId.slice(0, 8)}...` : null,
-      pendingOrders: pendingOrders.size,
+      enabled: this.enabled,
+      keyId: this.enabled ? `${this.keyId.slice(0, 8)}...` : null,
+      pendingOrders: null,
       ...this._stats,
     };
   }
 
-  // ─── Internal: Razorpay REST API call ─────────────────────────────────────
   _apiCall(method, path, data) {
     return new Promise((resolve, reject) => {
-      const body    = JSON.stringify(data);
+      const body = JSON.stringify(data);
       const authB64 = Buffer.from(`${this.keyId}:${this.keySecret}`).toString('base64');
 
       const options = {
@@ -241,20 +233,24 @@ class RazorpayService {
         path,
         method,
         headers: {
-          'Authorization':  `Basic ${authB64}`,
-          'Content-Type':   'application/json',
+          Authorization: `Basic ${authB64}`,
+          'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
-          'User-Agent':     'GoApp/2.2 Node.js',
+          'User-Agent': 'GoApp/2.2 Node.js',
         },
       };
 
       const req = https.request(options, (res) => {
         const chunks = [];
-        res.on('data', chunk => chunks.push(chunk));
+        res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
           let parsed;
-          try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-          catch (_) { reject(new Error('Invalid JSON from Razorpay API')); return; }
+          try {
+            parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          } catch (_) {
+            reject(new Error('Invalid JSON from Razorpay API'));
+            return;
+          }
 
           if (res.statusCode >= 200 && res.statusCode < 300) {
             resolve(parsed);
@@ -266,7 +262,6 @@ class RazorpayService {
       });
 
       req.on('error', reject);
-      // 10-second timeout — Razorpay API is usually fast
       req.setTimeout(10_000, () => {
         req.destroy(new Error('Razorpay API request timed out after 10s'));
       });

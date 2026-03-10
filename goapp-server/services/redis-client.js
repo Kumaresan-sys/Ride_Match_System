@@ -29,6 +29,10 @@ client.connect().catch((err) => {
   logger.error('REDIS', `Initial connection failed: ${err.message} — will retry automatically`);
 });
 
+const nativeGeoSearch = typeof client.geoSearch === 'function'
+  ? client.geoSearch.bind(client)
+  : null;
+
 // ── Compatibility shims ────────────────────────────────────────────────────
 
 client.acquireLock = async (rideId, driverId, ttlSec = 60) => {
@@ -47,6 +51,21 @@ client.acquireLock = async (rideId, driverId, ttlSec = 60) => {
 
 client.releaseLock = async (rideId) => {
   return client.del(`ride_lock:${rideId}`);
+};
+
+client.releaseLockIfValueMatches = async (key, expectedValue) => {
+  if (!key || expectedValue == null) return 0;
+  const script = `
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+      return redis.call("DEL", KEYS[1])
+    else
+      return 0
+    end
+  `;
+  return client.eval(script, {
+    keys: [String(key)],
+    arguments: [String(expectedValue)],
+  });
 };
 
 client.checkIdempotency = async (idempotencyKey) => {
@@ -80,6 +99,7 @@ client.georemove = async (key, member) => {
 // georadius shim: Real Redis 7 uses GEOSEARCH (GEORADIUS is deprecated in Redis 6+).
 // Normalises output to [{ member, distance, lat, lng }]
 client.georadius = async (key, lng, lat, radiusKm, opts = {}) => {
+  if (!nativeGeoSearch) return [];
   const searchOpts = {
     SORT: 'ASC',
     WITHCOORD: true,
@@ -87,7 +107,7 @@ client.georadius = async (key, lng, lat, radiusKm, opts = {}) => {
   };
   if (opts.count) searchOpts.COUNT = { count: opts.count, any: false };
 
-  const raw = await client.geoSearch(
+  const raw = await nativeGeoSearch(
     key,
     { longitude: lng, latitude: lat },
     { radius: radiusKm, unit: 'km' },
@@ -99,6 +119,25 @@ client.georadius = async (key, lng, lat, radiusKm, opts = {}) => {
     distance: parseFloat(r.distance),
     lat:      parseFloat(r.coordinates?.latitude  ?? 0),
     lng:      parseFloat(r.coordinates?.longitude ?? 0),
+  }));
+};
+
+// Explicit GEOSEARCH helper used by distributed matching/location paths.
+client.geoSearch = async (key, lng, lat, radiusKm, opts = {}) => {
+  if (!nativeGeoSearch) return [];
+  const searchOpts = { SORT: 'ASC', WITHCOORD: true, WITHDIST: true };
+  if (opts.count) searchOpts.COUNT = { count: opts.count, any: false };
+  const raw = await nativeGeoSearch(
+    key,
+    { longitude: Number(lng), latitude: Number(lat) },
+    { radius: Number(radiusKm), unit: 'km' },
+    searchOpts
+  );
+  return (raw || []).map((r) => ({
+    member: r.member,
+    distance: parseFloat(r.distance),
+    lat: parseFloat(r.coordinates?.latitude ?? 0),
+    lng: parseFloat(r.coordinates?.longitude ?? 0),
   }));
 };
 

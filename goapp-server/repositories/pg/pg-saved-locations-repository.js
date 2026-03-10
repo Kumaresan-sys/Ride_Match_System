@@ -1,6 +1,6 @@
 'use strict';
 
-const db = require('../../services/db');
+const domainDb = require('../../infra/db/domain-db');
 
 /**
  * PostgreSQL repository for rider saved locations.
@@ -15,7 +15,7 @@ const db = require('../../services/db');
 class PgSavedLocationsRepository {
   // ── Private: resolve users.id → riders.id ───────────────────────────────
   async _resolveRiderId(userId) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id FROM riders WHERE user_id = $1 LIMIT 1`,
       [userId],
     );
@@ -46,7 +46,7 @@ class PgSavedLocationsRepository {
   // ── listByRider ──────────────────────────────────────────────────────────
   async listByRider(userId) {
     const riderId = await this._resolveRiderId(userId);
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id, label, address, latitude, longitude, icon,
               usage_count, last_used_at
        FROM rider_saved_places
@@ -63,7 +63,7 @@ class PgSavedLocationsRepository {
   // we mirror address into name so NOT NULL constraints are satisfied.
   async create({ userId, label, address, lat, lng, placeId, iconKey }) {
     const riderId = await this._resolveRiderId(userId);
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `INSERT INTO rider_saved_places
          (rider_id, label, name, address, latitude, longitude, place_id, icon)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -110,7 +110,7 @@ class PgSavedLocationsRepository {
     sets.push(`updated_at = NOW()`);
     params.push(id, riderId);
 
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `UPDATE rider_saved_places
        SET ${sets.join(', ')}
        WHERE id = $${n} AND rider_id = $${n + 1}
@@ -130,7 +130,7 @@ class PgSavedLocationsRepository {
   // ── remove ────────────────────────────────────────────────────────────────
   async remove(id, userId) {
     const riderId = await this._resolveRiderId(userId);
-    const { rowCount } = await db.query(
+    const { rowCount } = await domainDb.query('identity', 
       `DELETE FROM rider_saved_places WHERE id = $1 AND rider_id = $2`,
       [id, riderId],
     );
@@ -146,7 +146,7 @@ class PgSavedLocationsRepository {
   // Exposed through the service for future ride-request integration.
   async incrementUsage(id, userId) {
     const riderId = await this._resolveRiderId(userId);
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `UPDATE rider_saved_places
        SET usage_count  = usage_count + 1,
            last_used_at = NOW(),
@@ -167,7 +167,7 @@ class PgSavedLocationsRepository {
   // ── getById ───────────────────────────────────────────────────────────────
   async getById(id, userId) {
     const riderId = await this._resolveRiderId(userId);
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('identity', 
       `SELECT id, label, address, latitude, longitude, icon,
               usage_count, last_used_at
        FROM rider_saved_places

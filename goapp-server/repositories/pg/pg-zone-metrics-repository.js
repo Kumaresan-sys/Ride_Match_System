@@ -1,6 +1,6 @@
 'use strict';
 
-const db = require('../../services/db');
+const domainDb = require('../../infra/db/domain-db');
 
 class PgZoneMetricsRepository {
   async _upsertHourlyMetric({
@@ -14,7 +14,7 @@ class PgZoneMetricsRepository {
     waitSec = null,
     tripSec = null,
   }) {
-    await db.query(
+    await domainDb.query('rides', 
       `INSERT INTO zone_metrics_hourly
          (zone_id, hour_start, requested_count, completed_count, cancelled_count, no_driver_count,
           total_fare, total_wait_sec, total_trip_sec, fare_samples, wait_samples, trip_samples, updated_at)
@@ -77,7 +77,7 @@ class PgZoneMetricsRepository {
 
   async _upsertUniqueRider({ zoneId, eventTime, riderId }) {
     if (!riderId) return;
-    await db.query(
+    await domainDb.query('rides', 
       `WITH slot AS (
          SELECT (date_trunc('hour', ($2::timestamptz AT TIME ZONE 'Asia/Kolkata')) AT TIME ZONE 'Asia/Kolkata') AS hour_start
        ),
@@ -146,14 +146,14 @@ class PgZoneMetricsRepository {
       zoneWhere = `AND z.zone_id = $2`;
     }
 
-    await db.query(
+    await domainDb.query('rides', 
       `DELETE FROM zone_peak_windows_daily
        WHERE metric_date = $1
        ${zoneId ? 'AND zone_id = $2' : ''}`,
       params,
     );
 
-    await db.query(
+    await domainDb.query('rides', 
       `INSERT INTO zone_peak_windows_daily (
          zone_id, metric_date, hour_start,
          requested_count, completed_count, cancelled_count,
@@ -195,7 +195,7 @@ class PgZoneMetricsRepository {
   }
 
   async getHourly({ zoneId, from, to }) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `SELECT zmh.zone_id AS "zoneId",
               zc.zone_code AS "zoneCode",
               zc.zone_name AS "zoneName",
@@ -220,7 +220,7 @@ class PgZoneMetricsRepository {
   }
 
   async getSummaryByDate(metricDate) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `SELECT zc.id AS "zoneId",
               zc.zone_code AS "zoneCode",
               zc.zone_name AS "zoneName",
@@ -242,7 +242,7 @@ class PgZoneMetricsRepository {
   }
 
   async getPeaksByDate(metricDate) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `SELECT p.zone_id AS "zoneId",
               zc.zone_code AS "zoneCode",
               zc.zone_name AS "zoneName",
@@ -263,9 +263,9 @@ class PgZoneMetricsRepository {
   }
 
   async reconcileFromRides() {
-    await db.query(`TRUNCATE zone_metrics_hourly_riders, zone_metrics_hourly, zone_peak_windows_daily`);
+    await domainDb.query('rides', `TRUNCATE zone_metrics_hourly_riders, zone_metrics_hourly, zone_peak_windows_daily`);
 
-    await db.query(
+    await domainDb.query('rides', 
       `INSERT INTO zone_metrics_hourly (
          zone_id, hour_start, requested_count, completed_count, cancelled_count, no_driver_count,
          unique_riders, avg_fare, avg_wait_sec, avg_trip_sec,
@@ -278,7 +278,7 @@ class PgZoneMetricsRepository {
          COUNT(*) FILTER (WHERE r.status = 'completed')::int AS completed_count,
          COUNT(*) FILTER (WHERE r.status LIKE 'cancelled%')::int AS cancelled_count,
          COUNT(*) FILTER (WHERE r.status = 'no_drivers')::int AS no_driver_count,
-         COUNT(DISTINCT ri.user_id)::int AS unique_riders,
+         COUNT(DISTINCT r.rider_id)::int AS unique_riders,
          ROUND(AVG(r.actual_fare) FILTER (WHERE r.actual_fare IS NOT NULL), 2) AS avg_fare,
          ROUND(AVG(EXTRACT(EPOCH FROM (r.accepted_at - r.requested_at))) FILTER (WHERE r.accepted_at IS NOT NULL))::int AS avg_wait_sec,
          ROUND(AVG(r.actual_duration_s) FILTER (WHERE r.actual_duration_s IS NOT NULL))::int AS avg_trip_sec,
@@ -290,7 +290,6 @@ class PgZoneMetricsRepository {
          COUNT(*) FILTER (WHERE r.actual_duration_s IS NOT NULL)::int AS trip_samples,
          NOW()
        FROM rides r
-       JOIN riders ri ON ri.id = r.rider_id
        WHERE r.pickup_zone_id IS NOT NULL
        GROUP BY r.pickup_zone_id,
                 (date_trunc('hour', (r.requested_at AT TIME ZONE 'Asia/Kolkata')) AT TIME ZONE 'Asia/Kolkata')`,
@@ -299,4 +298,3 @@ class PgZoneMetricsRepository {
 }
 
 module.exports = new PgZoneMetricsRepository();
-

@@ -19,8 +19,14 @@ class ServiceIdentityRepository extends IdentityRepository {
 class ServiceRideRepository extends RideRepository {
   constructor(rideService) { super(); this.rideService = rideService; }
   createRide(payload) { return this.rideService.createRide(payload); }
-  getRide(rideId) { return this.rideService.getRide(rideId); }
+  getRide(rideId) {
+    if (typeof this.rideService.getRideAsync === 'function') {
+      return this.rideService.getRideAsync(rideId);
+    }
+    return this.rideService.getRide(rideId);
+  }
   getAllRides() { return this.rideService.getAllRides(); }
+  getRidesPage(options) { return this.rideService.getRidesPage(options); }
   cancelRide(rideId, cancelledBy, userId) { return this.rideService.cancelRide(rideId, cancelledBy, userId); }
   completeTrip(rideId, distanceKm, durationMin) { return this.rideService.completeTrip(rideId, distanceKm, durationMin); }
 }
@@ -39,13 +45,16 @@ class ServiceWalletRepository extends WalletRepository {
   getCoinsHistory(userId, page, limit) { return this.walletService.getCoinsHistory(userId, page, limit); }
   setCoinsAutoUse(userId, enabled) { return this.walletService.setCoinsAutoUse(userId, enabled); }
   previewRideDiscount(userId, fareInr, options = {}) { return this.walletService.previewRideDiscount(userId, fareInr, options); }
-  payRide(userId, fareInr, rideId, paymentId = null, method = null) {
-    return this.walletService.payWithWallet(userId, fareInr, rideId, paymentId, method);
+  payRide(userId, fareInr, rideId, paymentId = null, method = null, idempotencyKey = null) {
+    return this.walletService.payWithWallet(userId, fareInr, rideId, paymentId, method, idempotencyKey);
   }
-  refund(userId, amount, rideId, reason) { return this.walletService.refundToWallet(userId, amount, rideId, reason); }
+  refund(userId, amount, rideId, reason, idempotencyKey = null) {
+    return this.walletService.refundToWallet(userId, amount, rideId, reason, idempotencyKey);
+  }
   redeemCoins(userId, fareInr, coinsToUse) { return this.walletService.redeemCoins(userId, fareInr, coinsToUse); }
   getTransactions(userId, limit) { return this.walletService.getTransactions(userId, limit); }
   getRidePaymentInfo(userId, rideId) { return this.walletService.getRidePaymentInfo(userId, rideId); }
+  getRidePaymentInfoBatch(userId, rideIds) { return this.walletService.getRidePaymentInfoBatch(userId, rideIds); }
 }
 
 module.exports = {

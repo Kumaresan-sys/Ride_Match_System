@@ -45,6 +45,40 @@ class DriverWalletService {
     };
   }
 
+  // ─── Recharge driver wallet ───────────────────────────────────────────────
+  async rechargeWallet(driverId, amount, method = 'manual', referenceId = null, idempotencyKey = null) {
+    if (!amount || amount <= 0) return { success: false, error: 'Invalid recharge amount.' };
+
+    const tx = {
+      type: 'wallet_recharge',
+      amountInr: amount,
+      method,
+      referenceId,
+      idempotencyKey,
+      createdAt: new Date().toISOString(),
+    };
+
+    const row = await pgRepo.adjustAndRecord(driverId, amount, tx).catch(err => {
+      logger.warn('DRIVER_WALLET', `pg rechargeWallet failed: ${err.message}`);
+      return null;
+    });
+    const balance = row ? parseFloat(row.balance) : 0;
+
+    eventBus.publish('driver_wallet_recharged', { driverId, amount, method, balance });
+    logger.info('DRIVER_WALLET', `Driver ${driverId} recharged ₹${amount} via ${method}. Balance: ₹${balance}`);
+
+    if (balance >= DRIVER_MIN_BALANCE) {
+      eventBus.publish('driver_ride_eligible', { driverId });
+    }
+
+    return {
+      success: true,
+      transaction: { txId: `DRV-RCH-${Date.now()}`, ...tx },
+      balance,
+      canReceiveRide: balance >= DRIVER_MIN_BALANCE,
+    };
+  }
+
   // ─── Deduct commission/platform fee from driver wallet ───────────────────
   async deductCommission(driverId, amount, rideId, reason = 'platform_commission') {
     if (!amount || amount <= 0) return { success: false, error: 'Invalid deduction amount.' };
@@ -76,6 +110,47 @@ class DriverWalletService {
     eventBus.publish('driver_earnings_credited', { driverId, amount, rideId, balance });
     logger.info('DRIVER_WALLET', `Driver ${driverId} earned ₹${amount} (ride ${rideId})`);
     return { success: true, transaction: { txId: `DRV-EARN-${Date.now()}`, ...tx }, balance };
+  }
+
+  // ─── Atomic ride settlement (commission debit + earnings credit) ─────────
+  async settleRidePayout(driverId, { platformFee = 0, earnings = 0, rideId = null } = {}) {
+    const debit = Math.max(0, Number(platformFee) || 0);
+    const credit = Math.max(0, Number(earnings) || 0);
+    if (debit <= 0 && credit <= 0) return { success: true, balance: 0 };
+
+    const row = await pgRepo.settleRidePayoutAtomic(driverId, debit, credit, rideId).catch(err => {
+      logger.warn('DRIVER_WALLET', `pg settleRidePayout failed: ${err.message}`);
+      return null;
+    });
+    const balance = row ? parseFloat(row.balance) : 0;
+
+    if (debit > 0) eventBus.publish('driver_commission_debited', { driverId, amount: debit, rideId, balance });
+    if (credit > 0) eventBus.publish('driver_earnings_credited', { driverId, amount: credit, rideId, balance });
+
+    return {
+      success: true,
+      rideId,
+      platformFee: debit,
+      earnings: credit,
+      balance,
+      canReceiveRide: balance >= DRIVER_MIN_BALANCE,
+    };
+  }
+
+  async getTransactions(driverId, limit = 20) {
+    const rows = await pgRepo.getTransactions(driverId, Math.max(1, Math.min(Number(limit) || 20, 100)));
+    return {
+      driverId,
+      transactions: (rows || []).map((row) => ({
+        type: row.type,
+        amountInr: Number(row.amount || 0),
+        rideId: row.rideId || null,
+        metadata: row.metadata || null,
+        createdAt: typeof row.createdAt === 'number'
+          ? new Date(row.createdAt).toISOString()
+          : (row.createdAt || new Date().toISOString()),
+      })),
+    };
   }
 
   // ─── Global stats ─────────────────────────────────────────────────────────

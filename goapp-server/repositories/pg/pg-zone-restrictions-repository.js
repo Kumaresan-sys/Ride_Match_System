@@ -1,6 +1,6 @@
 'use strict';
 
-const db          = require('../../services/db');
+const domainDb          = require('../../infra/db/domain-db');
 const { haversine } = require('../../utils/formulas');
 
 /**
@@ -58,7 +58,7 @@ class PgZoneRestrictionsRepository {
 
   // ── list ──────────────────────────────────────────────────────────────────
   async list() {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `SELECT id, name, lat, lng, radius_km, applies_to, is_allowed, is_enabled,
               country, state, pincode, restriction_message, created_by, created_at, updated_at
        FROM zone_restrictions
@@ -69,7 +69,7 @@ class PgZoneRestrictionsRepository {
 
   // ── listEnabled ───────────────────────────────────────────────────────────
   async listEnabled(role) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `SELECT id, name, lat, lng, radius_km, applies_to, is_allowed, is_enabled,
               country, state, pincode, restriction_message
        FROM zone_restrictions
@@ -83,7 +83,7 @@ class PgZoneRestrictionsRepository {
   // ── create ────────────────────────────────────────────────────────────────
   async create({ name, lat, lng, radiusKm, appliesTo = 'both', isAllowed = false, country, state, pincode, restrictionMessage, createdBy }) {
     const geo = this._normalizeGeoInput({ country, state, pincode });
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `INSERT INTO zone_restrictions
          (name, lat, lng, radius_km, applies_to, is_allowed, country, state, pincode, restriction_message, created_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -132,7 +132,7 @@ class PgZoneRestrictionsRepository {
     sets.push(`updated_at = NOW()`);
     params.push(id);
 
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `UPDATE zone_restrictions SET ${sets.join(', ')}
        WHERE id = $${n}
        RETURNING id, name, lat, lng, radius_km, applies_to, is_allowed, is_enabled,
@@ -150,7 +150,7 @@ class PgZoneRestrictionsRepository {
 
   // ── setEnabled ────────────────────────────────────────────────────────────
   async setEnabled(id, enabled) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `UPDATE zone_restrictions
        SET is_enabled = $2, updated_at = NOW()
        WHERE id = $1
@@ -168,7 +168,7 @@ class PgZoneRestrictionsRepository {
 
   // ── remove ────────────────────────────────────────────────────────────────
   async remove(id) {
-    const { rowCount } = await db.query(
+    const { rowCount } = await domainDb.query('rides', 
       `DELETE FROM zone_restrictions WHERE id = $1`,
       [id],
     );

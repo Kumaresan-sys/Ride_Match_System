@@ -1,6 +1,6 @@
 'use strict';
 
-const db = require('../../services/db');
+const domainDb = require('../../infra/db/domain-db');
 
 class PgZoneCatalogRepository {
   _normalize(value) {
@@ -56,7 +56,7 @@ class PgZoneCatalogRepository {
     }
 
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `SELECT id, zone_code, zone_name, city, state, country, pincode,
               center_lat, center_lng, radius_km, zone_level, is_active,
               source_name, source_url, source_ref, created_at, updated_at
@@ -69,7 +69,7 @@ class PgZoneCatalogRepository {
   }
 
   async resolveByPoint({ lat, lng, city = 'Chennai', state = 'Tamil Nadu', country = 'IN' }) {
-    const { rows } = await db.query(
+    const { rows } = await domainDb.query('rides', 
       `SELECT id, zone_code, zone_name, city, state, country, pincode,
               center_lat, center_lng, radius_km, zone_level, is_active,
               source_name, source_url, source_ref, created_at, updated_at,
@@ -106,4 +106,3 @@ class PgZoneCatalogRepository {
 }
 
 module.exports = new PgZoneCatalogRepository();
-

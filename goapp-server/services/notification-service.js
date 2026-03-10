@@ -170,6 +170,27 @@ class NotificationService {
     });
   }
 
+  /** Driver offer broadcast — notify driver to accept an offer within TTL */
+  async notifyDriverRideOffer(driverId, { offerId, rideId, stage, etaMin, score, ttlSec }) {
+    await this.send(driverId, {
+      title: 'New Ride Offer',
+      body: `Tap to accept. Offer expires in ${Math.max(1, Number(ttlSec || 7))}s.`,
+      data: this._withNavigationData(
+        {
+          type: 'RIDE_OFFER',
+          offerId,
+          rideId,
+          stage,
+          etaMin,
+          score,
+          ttlSec: Math.max(1, Number(ttlSec || 7)),
+          screen: 'driver_ride_offer',
+        },
+        { route: 'home', deepLink: this._buildDeepLink(`/driver/offers/${rideId}`) }
+      ),
+    });
+  }
+
   /** Driver matched — notify both rider and driver */
   async notifyRideMatched(riderId, driverId, { rideId, driverName, vehicleType, vehicleNumber, etaMin, score }) {
     await Promise.all([
