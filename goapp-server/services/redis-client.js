@@ -33,6 +33,69 @@ const nativeGeoSearch = typeof client.geoSearch === 'function'
   ? client.geoSearch.bind(client)
   : null;
 
+function toFiniteOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeGeoEntry(entry) {
+  if (typeof entry === 'string' || typeof entry === 'number') {
+    return {
+      member: String(entry),
+      distance: null,
+      lat: null,
+      lng: null,
+    };
+  }
+
+  if (Array.isArray(entry)) {
+    const member = entry.length ? String(entry[0]) : null;
+    let distance = null;
+    let lat = null;
+    let lng = null;
+
+    if (entry.length > 1 && !Array.isArray(entry[1]) && typeof entry[1] !== 'object') {
+      distance = toFiniteOrNull(entry[1]);
+    }
+
+    const coord = entry.find((v) => Array.isArray(v) && v.length >= 2);
+    if (coord) {
+      lng = toFiniteOrNull(coord[0]);
+      lat = toFiniteOrNull(coord[1]);
+    }
+
+    return { member, distance, lat, lng };
+  }
+
+  if (entry && typeof entry === 'object') {
+    const member = entry.member != null
+      ? String(entry.member)
+      : (entry.value != null ? String(entry.value) : null);
+    const distance = toFiniteOrNull(entry.distance ?? entry.dist);
+    const lat = toFiniteOrNull(
+      entry.coordinates?.latitude
+      ?? entry.coordinates?.lat
+      ?? entry.coord?.latitude
+      ?? entry.coord?.lat
+    );
+    const lng = toFiniteOrNull(
+      entry.coordinates?.longitude
+      ?? entry.coordinates?.lng
+      ?? entry.coord?.longitude
+      ?? entry.coord?.lng
+    );
+
+    return { member, distance, lat, lng };
+  }
+
+  return {
+    member: null,
+    distance: null,
+    lat: null,
+    lng: null,
+  };
+}
+
 // ── Compatibility shims ────────────────────────────────────────────────────
 
 client.acquireLock = async (rideId, driverId, ttlSec = 60) => {
@@ -105,7 +168,7 @@ client.georadius = async (key, lng, lat, radiusKm, opts = {}) => {
     WITHCOORD: true,
     WITHDIST: true,
   };
-  if (opts.count) searchOpts.COUNT = { count: opts.count, any: false };
+  if (opts.count) searchOpts.COUNT = Number(opts.count);
 
   const raw = await nativeGeoSearch(
     key,
@@ -114,31 +177,25 @@ client.georadius = async (key, lng, lat, radiusKm, opts = {}) => {
     searchOpts
   );
 
-  return (raw || []).map((r) => ({
-    member:   r.member,
-    distance: parseFloat(r.distance),
-    lat:      parseFloat(r.coordinates?.latitude  ?? 0),
-    lng:      parseFloat(r.coordinates?.longitude ?? 0),
-  }));
+  return (raw || [])
+    .map((entry) => normalizeGeoEntry(entry))
+    .filter((entry) => entry.member);
 };
 
 // Explicit GEOSEARCH helper used by distributed matching/location paths.
 client.geoSearch = async (key, lng, lat, radiusKm, opts = {}) => {
   if (!nativeGeoSearch) return [];
   const searchOpts = { SORT: 'ASC', WITHCOORD: true, WITHDIST: true };
-  if (opts.count) searchOpts.COUNT = { count: opts.count, any: false };
+  if (opts.count) searchOpts.COUNT = Number(opts.count);
   const raw = await nativeGeoSearch(
     key,
     { longitude: Number(lng), latitude: Number(lat) },
     { radius: Number(radiusKm), unit: 'km' },
     searchOpts
   );
-  return (raw || []).map((r) => ({
-    member: r.member,
-    distance: parseFloat(r.distance),
-    lat: parseFloat(r.coordinates?.latitude ?? 0),
-    lng: parseFloat(r.coordinates?.longitude ?? 0),
-  }));
+  return (raw || [])
+    .map((entry) => normalizeGeoEntry(entry))
+    .filter((entry) => entry.member);
 };
 
 client.getStats = () => ({

@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$ROOT_DIR"
 
-echo "[1/5] Starting Docker services (api, postgres, redis, kafka)..."
+echo "[1/6] Starting Docker services (api, postgres, redis, kafka)..."
 docker compose up -d --build
 
 create_db_if_missing() {
@@ -21,12 +21,12 @@ create_db_if_missing() {
   fi
 }
 
-echo "[2/5] Ensuring domain databases exist..."
+echo "[2/6] Ensuring domain databases exist..."
 for db in identity_db drivers_db rides_db payments_db analytics_db; do
   create_db_if_missing "$db"
 done
 
-echo "[3/5] Ensuring required PostgreSQL extensions..."
+echo "[3/6] Ensuring required PostgreSQL extensions..."
 for db in identity_db drivers_db rides_db payments_db analytics_db; do
   docker exec -i goapp-postgres psql -U goapp -d "$db" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;" >/dev/null
   echo "  - pgcrypto: $db"
@@ -36,10 +36,13 @@ for db in drivers_db rides_db; do
   echo "  - postgis: $db"
 done
 
-echo "[4/5] Creating Kafka topics..."
+echo "[4/6] Running domain bootstrap migrations..."
+npm run domain:bootstrap
+
+echo "[5/6] Creating Kafka topics..."
 "$ROOT_DIR/enterprise-setup/scripts/init-topics.sh"
 
-echo "[5/5] Verifying stack status and API health..."
+echo "[6/6] Verifying stack status and API health..."
 docker compose ps
 curl -sSf http://localhost:3000/api/v1/health >/dev/null
 echo "Docker setup complete. API health endpoint is reachable."

@@ -6,12 +6,18 @@
 //          PUT  /api/v1/admin/vehicle-types/:id   — update type / pricing
 //          DELETE /api/v1/admin/vehicle-types/:id — deactivate (soft delete)
 
-const { validateSchema } = require('./validation');
+const { validateSchema, validationError } = require('./validation');
+const { badRequest, notFoundError, normalizeRouteError } = require('./response');
 const vehicleTypeService = require('../services/vehicle-type-service');
 
 function registerAdminVehicleRoutes(router, ctx) {
   const { requireAdmin } = ctx;
   const pricingService = ctx.services.pricingService;
+
+  function ensureAdmin(headers = {}) {
+    const err = requireAdmin(headers);
+    return err ? normalizeRouteError(err, 'ADMIN_AUTH_REQUIRED') : null;
+  }
 
   // ── Public: active vehicle types for the app ──────────────────────────────
   router.register('GET', '/api/v1/vehicle-types', async () => {
@@ -21,7 +27,7 @@ function registerAdminVehicleRoutes(router, ctx) {
 
   // ── Admin: list all (including inactive) ─────────────────────────────────
   router.register('GET', '/api/v1/admin/vehicle-types', async ({ headers }) => {
-    const err = requireAdmin(headers);
+    const err = ensureAdmin(headers);
     if (err) return err;
 
     const vehicleTypes = await vehicleTypeService.listAll();
@@ -30,7 +36,7 @@ function registerAdminVehicleRoutes(router, ctx) {
 
   // ── Admin: create ─────────────────────────────────────────────────────────
   router.register('POST', '/api/v1/admin/vehicle-types', async ({ headers, body }) => {
-    const err = requireAdmin(headers);
+    const err = ensureAdmin(headers);
     if (err) return err;
 
     const parsed = validateSchema(body, [
@@ -48,19 +54,19 @@ function registerAdminVehicleRoutes(router, ctx) {
       { key: 'iconUrl',       type: 'string',  required: false },
       { key: 'description',   type: 'string',  required: false },
     ]);
-    if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
+    if (!parsed.ok) return validationError(parsed.error);
 
     const vehicleType = await vehicleTypeService.create(parsed.data);
     return { status: 201, data: { vehicleType } };
   });
 
   // ── Admin: update ─────────────────────────────────────────────────────────
-  router.register('PUT', '/api/v1/admin/vehicle-types/:id', async ({ headers, body, params }) => {
-    const err = requireAdmin(headers);
+  router.register('PUT', '/api/v1/admin/vehicle-types/:id', async ({ headers, body, pathParams }) => {
+    const err = ensureAdmin(headers);
     if (err) return err;
 
-    const id = params?.id;
-    if (!id) return { status: 400, data: { error: 'Missing id' } };
+    const id = pathParams?.id;
+    if (!id) return badRequest('Missing id', 'VALIDATION_ERROR');
 
     const parsed = validateSchema(body, [
       { key: 'displayName',   type: 'string',  required: false, minLength: 1, maxLength: 100 },
@@ -77,48 +83,48 @@ function registerAdminVehicleRoutes(router, ctx) {
       { key: 'description',   type: 'string',  required: false },
       { key: 'isActive',      type: 'boolean', required: false },
     ]);
-    if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
+    if (!parsed.ok) return validationError(parsed.error);
 
     const result = await vehicleTypeService.update(id, parsed.data);
     if (result && result.reason === 'NO_FIELDS') {
-      return { status: 400, data: { error: 'No fields to update' } };
+      return badRequest('No fields to update', 'NO_FIELDS');
     }
-    if (!result) return { status: 404, data: { error: 'Vehicle type not found' } };
+    if (!result) return notFoundError('Vehicle type not found', 'VEHICLE_TYPE_NOT_FOUND');
     return { data: { vehicleType: result } };
   });
 
   // ── Admin: deactivate (soft delete) ──────────────────────────────────────
-  router.register('DELETE', '/api/v1/admin/vehicle-types/:id', async ({ headers, params }) => {
-    const err = requireAdmin(headers);
+  router.register('DELETE', '/api/v1/admin/vehicle-types/:id', async ({ headers, pathParams }) => {
+    const err = ensureAdmin(headers);
     if (err) return err;
 
-    const id = params?.id;
-    if (!id) return { status: 400, data: { error: 'Missing id' } };
+    const id = pathParams?.id;
+    if (!id) return badRequest('Missing id', 'VALIDATION_ERROR');
 
     const result = await vehicleTypeService.deactivate(id);
-    if (!result) return { status: 404, data: { error: 'Vehicle type not found' } };
+    if (!result) return notFoundError('Vehicle type not found', 'VEHICLE_TYPE_NOT_FOUND');
     return { data: { message: `Vehicle type '${result.name}' deactivated` } };
   });
 
   // ── Admin: pricing tax config ─────────────────────────────────────────────
   router.register('GET', '/api/v1/admin/pricing/tax', async ({ headers }) => {
-    const err = requireAdmin(headers);
+    const err = ensureAdmin(headers);
     if (err) return err;
     const taxConfig = await pricingService.getTaxConfig();
     return { data: { taxConfig } };
   });
 
   router.register('PUT', '/api/v1/admin/pricing/tax', async ({ headers, body }) => {
-    const err = requireAdmin(headers);
+    const err = ensureAdmin(headers);
     if (err) return err;
 
     const parsed = validateSchema(body, [
       { key: 'gstPct', type: 'number', required: false, min: 0, max: 100 },
       { key: 'platformCommissionPct', type: 'number', required: false, min: 0, max: 1 },
     ]);
-    if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
+    if (!parsed.ok) return validationError(parsed.error);
     if (parsed.data.gstPct === undefined && parsed.data.platformCommissionPct === undefined) {
-      return { status: 400, data: { error: 'At least one of gstPct or platformCommissionPct is required' } };
+      return badRequest('At least one of gstPct or platformCommissionPct is required', 'NO_FIELDS');
     }
 
     const updatedBy = headers['x-admin-id'] || headers['x-admin-email'] || 'admin';

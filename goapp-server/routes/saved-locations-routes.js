@@ -1,6 +1,7 @@
 'use strict';
 
 const { validateSchema, validationError } = require('./validation');
+const { buildError, getAuthenticatedSession } = require('./response');
 
 /**
  * Saved Locations routes — matches the Flutter ApiEndpoints constants exactly:
@@ -24,15 +25,15 @@ function registerSavedLocationsRoutes(router, ctx) {
   function handleServiceError(err) {
     switch (err.code) {
       case 'RIDER_NOT_FOUND':
-        return { status: 422, data: { success: false, error: err.message, code: err.code } };
+        return buildError(422, err.message, err.code);
       case 'LOCATIONS_LIMIT':
-        return { status: 422, data: { success: false, error: err.message, code: err.code } };
+        return buildError(422, err.message, err.code);
       case 'LABEL_DUPLICATE':
-        return { status: 409, data: { success: false, error: err.message, code: err.code } };
+        return buildError(409, err.message, err.code);
       case 'NOT_FOUND':
-        return { status: 404, data: { success: false, error: err.message, code: err.code } };
+        return buildError(404, err.message, err.code);
       case 'NO_FIELDS':
-        return { status: 400, data: { success: false, error: err.message, code: err.code } };
+        return buildError(400, err.message, err.code);
       default:
         throw err; // Unhandled — bubble to the global error handler in server.js
     }
@@ -40,7 +41,7 @@ function registerSavedLocationsRoutes(router, ctx) {
 
   // ── GET /api/v1/saved-locations ──────────────────────────────────────────
   router.register('GET', '/api/v1/saved-locations', async ({ headers }) => {
-    const authResult = await requireAuth(headers);
+    const authResult = await getAuthenticatedSession(requireAuth, headers);
     if (authResult.error) return authResult.error;
 
     const { userId } = authResult.session;
@@ -55,7 +56,7 @@ function registerSavedLocationsRoutes(router, ctx) {
 
   // ── POST /api/v1/saved-locations/add ─────────────────────────────────────
   router.register('POST', '/api/v1/saved-locations/add', async ({ body, headers }) => {
-    const authResult = await requireAuth(headers);
+    const authResult = await getAuthenticatedSession(requireAuth, headers);
     if (authResult.error) return authResult.error;
 
     const { userId } = authResult.session;
@@ -92,7 +93,7 @@ function registerSavedLocationsRoutes(router, ctx) {
   // usage_count and sets last_used_at = NOW() so the home screen chip order
   // reflects the most regularly used locations.
   router.register('POST', '/api/v1/saved-locations/use', async ({ body, headers }) => {
-    const authResult = await requireAuth(headers);
+    const authResult = await getAuthenticatedSession(requireAuth, headers);
     if (authResult.error) return authResult.error;
 
     const { userId } = authResult.session;
@@ -111,7 +112,7 @@ function registerSavedLocationsRoutes(router, ctx) {
   // ── DELETE /api/v1/saved-locations/delete ────────────────────────────────
   // id is sent in the request body (consistent with the safety contacts pattern)
   router.register('DELETE', '/api/v1/saved-locations/delete', async ({ body, headers }) => {
-    const authResult = await requireAuth(headers);
+    const authResult = await getAuthenticatedSession(requireAuth, headers);
     if (authResult.error) return authResult.error;
 
     const { userId } = authResult.session;
@@ -129,7 +130,7 @@ function registerSavedLocationsRoutes(router, ctx) {
 
   // ── PUT /api/v1/saved-locations/update ───────────────────────────────────
   router.register('PUT', '/api/v1/saved-locations/update', async ({ body, headers }) => {
-    const authResult = await requireAuth(headers);
+    const authResult = await getAuthenticatedSession(requireAuth, headers);
     if (authResult.error) return authResult.error;
 
     const { userId } = authResult.session;

@@ -5,15 +5,14 @@ const {
   validateSchema,
   validationError,
 } = require('./validation');
+const { getAuthenticatedSession } = require('./response');
 
 function registerCoinsRoutes(router, ctx) {
   const requireAuth = ctx.requireAuth;
   const coinsService = ctx.services.coinsService;
 
   async function getSession(headers = {}) {
-    const auth = await requireAuth(headers);
-    if (auth.error) return { error: auth.error };
-    return { session: auth.session };
+    return getAuthenticatedSession(requireAuth, headers);
   }
 
   router.register('GET', '/api/v1/coins/balance', async ({ headers }) => {

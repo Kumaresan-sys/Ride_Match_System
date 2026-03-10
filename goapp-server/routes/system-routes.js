@@ -1,11 +1,16 @@
 const { haversine, bearing } = require('../utils/formulas');
+const {
+  badRequest,
+  buildErrorFromResult,
+  normalizeRouteError,
+} = require('./response');
 
 function registerSystemRoutes(router, ctx) {
   const { enterpriseConfig, repositories, services, eventBus, requireAdmin, requireAuth, authRuntimeStats } = ctx;
 
   function ensureAdmin(headers = {}) {
     const adminCheck = requireAdmin(headers);
-    return adminCheck || null;
+    return adminCheck ? normalizeRouteError(adminCheck, 'ADMIN_AUTH_REQUIRED') : null;
   }
 
   async function optionalSession(headers = {}) {
@@ -93,7 +98,7 @@ function registerSystemRoutes(router, ctx) {
     const lat2 = parseFloat(params.get('lat2'));
     const lng2 = parseFloat(params.get('lng2'));
     if (![lat1, lng1, lat2, lng2].every(Number.isFinite)) {
-      return { status: 400, data: { error: 'lat1, lng1, lat2, lng2 required' } };
+      return badRequest('lat1, lng1, lat2, lng2 required', 'VALIDATION_ERROR');
     }
     return { data: { distanceKm: haversine(lat1, lng1, lat2, lng2) } };
   });
@@ -104,7 +109,7 @@ function registerSystemRoutes(router, ctx) {
     const lat2 = parseFloat(params.get('lat2'));
     const lng2 = parseFloat(params.get('lng2'));
     if (![lat1, lng1, lat2, lng2].every(Number.isFinite)) {
-      return { status: 400, data: { error: 'lat1, lng1, lat2, lng2 required' } };
+      return badRequest('lat1, lng1, lat2, lng2 required', 'VALIDATION_ERROR');
     }
     return { data: { bearingDeg: bearing(lat1, lng1, lat2, lng2) } };
   });
@@ -119,22 +124,35 @@ function registerSystemRoutes(router, ctx) {
     const lng = lngRaw != null ? parseFloat(lngRaw) : undefined;
     const sessionToken = params.get('sessionToken') || undefined;
     if (!input || input.length < 2) {
-      return { status: 400, data: { error: 'input query param required (min 2 chars)' } };
+      return badRequest('input query param required (min 2 chars)', 'VALIDATION_ERROR');
     }
     if ((latRaw != null && !Number.isFinite(lat)) || (lngRaw != null && !Number.isFinite(lng))) {
-      return { status: 400, data: { error: 'lat and lng must be valid numbers when provided' } };
+      return badRequest('lat and lng must be valid numbers when provided', 'VALIDATION_ERROR');
     }
     const result = await services.googleMapsService.autocomplete(input, sessionToken, lat, lng);
-    if (result.error) return { status: 503, data: result };
+    if (result.error) {
+      return buildErrorFromResult(result, {
+        status: 503,
+        defaultCode: 'MAPS_AUTOCOMPLETE_FAILED',
+        defaultMessage: 'Unable to fetch autocomplete suggestions.',
+        expose: ['suggestions'],
+      });
+    }
     return { data: result };
   });
 
   router.register('GET', '/api/v1/maps/place', async ({ params }) => {
     const placeId = String(params.get('placeId') || '').trim();
     const sessionToken = params.get('sessionToken') || undefined;
-    if (!placeId) return { status: 400, data: { error: 'placeId required' } };
+    if (!placeId) return badRequest('placeId required', 'VALIDATION_ERROR');
     const result = await services.googleMapsService.getPlaceCoordinates(placeId, sessionToken);
-    if (result.error) return { status: 503, data: result };
+    if (result.error) {
+      return buildErrorFromResult(result, {
+        status: 503,
+        defaultCode: 'MAPS_PLACE_LOOKUP_FAILED',
+        defaultMessage: 'Unable to fetch place details.',
+      });
+    }
     return { data: result };
   });
 
@@ -142,10 +160,16 @@ function registerSystemRoutes(router, ctx) {
     const lat = parseFloat(params.get('lat'));
     const lng = parseFloat(params.get('lng'));
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      return { status: 400, data: { error: 'lat and lng required' } };
+      return badRequest('lat and lng required', 'VALIDATION_ERROR');
     }
     const result = await services.googleMapsService.reverseGeocode(lat, lng);
-    if (result.error) return { status: 503, data: result };
+    if (result.error) {
+      return buildErrorFromResult(result, {
+        status: 503,
+        defaultCode: 'MAPS_REVERSE_GEOCODE_FAILED',
+        defaultMessage: 'Unable to reverse geocode location.',
+      });
+    }
     return { data: result };
   });
 
@@ -153,7 +177,7 @@ function registerSystemRoutes(router, ctx) {
     const pickupLat = parseFloat(body?.pickupLat);
     const pickupLng = parseFloat(body?.pickupLng);
     if (!Number.isFinite(pickupLat) || !Number.isFinite(pickupLng)) {
-      return { status: 400, data: { error: 'pickupLat and pickupLng must be valid coordinates' } };
+      return badRequest('pickupLat and pickupLng must be valid coordinates', 'VALIDATION_ERROR');
     }
     const estimates = await services.pricingService.getEstimates(pickupLat, pickupLng, body?.destLat, body?.destLng);
     const session = await optionalSession(headers || {});
@@ -201,28 +225,56 @@ function registerSystemRoutes(router, ctx) {
       lng: parseFloat(body?.lng),
       radiusKm: parseFloat(body?.radiusKm),
     });
-    return { status: result.success ? 201 : 400, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 400,
+        defaultCode: 'ZONE_CREATE_FAILED',
+        defaultMessage: 'Unable to create zone.',
+      });
+    }
+    return { status: 201, data: result };
   });
 
   router.register('PUT', '/api/v1/admin/zones/:zoneId/enable', async ({ pathParams, headers }) => {
     const adminError = ensureAdmin(headers);
     if (adminError) return adminError;
     const result = services.zoneService.setZoneEnabled(pathParams.zoneId, true);
-    return { status: result.success ? 200 : 404, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 404,
+        defaultCode: 'ZONE_NOT_FOUND',
+        defaultMessage: 'Zone not found.',
+      });
+    }
+    return { status: 200, data: result };
   });
 
   router.register('PUT', '/api/v1/admin/zones/:zoneId/disable', async ({ pathParams, headers }) => {
     const adminError = ensureAdmin(headers);
     if (adminError) return adminError;
     const result = services.zoneService.setZoneEnabled(pathParams.zoneId, false);
-    return { status: result.success ? 200 : 404, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 404,
+        defaultCode: 'ZONE_NOT_FOUND',
+        defaultMessage: 'Zone not found.',
+      });
+    }
+    return { status: 200, data: result };
   });
 
   router.register('DELETE', '/api/v1/admin/zones/:zoneId', async ({ pathParams, headers }) => {
     const adminError = ensureAdmin(headers);
     if (adminError) return adminError;
     const result = services.zoneService.deleteZone(pathParams.zoneId);
-    return { status: result.success ? 200 : 404, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 404,
+        defaultCode: 'ZONE_NOT_FOUND',
+        defaultMessage: 'Zone not found.',
+      });
+    }
+    return { status: 200, data: result };
   });
 
   router.register('GET', '/api/v1/admin/notifications/stats', async ({ headers }) => {

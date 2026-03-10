@@ -13,11 +13,33 @@ class MatchingWorker {
 
   async start() {
     const res = await this.consumer.subscribe(TOPICS.RIDE_REQUESTED, 'matching-worker', async (event) => {
-      logger.info('matching_worker_event', { topic: TOPICS.RIDE_REQUESTED, rideId: event.rideId });
-      const result = await this.rideService.processRideRequestedEvent(event);
-      logger.info('matching_worker_result', { rideId: event.rideId, success: Boolean(result?.success), reason: result?.reason || null });
+      const normalized = this._normalizeEvent(event);
+      logger.info('matching_worker_event', {
+        topic: TOPICS.RIDE_REQUESTED,
+        rideId: normalized.rideId || null,
+        aggregateId: normalized.aggregateId || null,
+      });
+      const result = await this.rideService.processRideRequestedEvent(normalized);
+      logger.info('matching_worker_result', {
+        rideId: normalized.rideId || normalized.aggregateId || null,
+        success: Boolean(result?.success),
+        reason: result?.reason || null,
+      });
     });
     return res;
+  }
+
+  _normalizeEvent(event) {
+    if (!event || typeof event !== 'object') return {};
+    if (event.payload && typeof event.payload === 'object') {
+      return {
+        ...event.payload,
+        eventId: event.eventId || event.payload.eventId,
+        eventType: event.eventType || event.payload.eventType,
+        aggregateId: event.aggregateId || event.payload.aggregateId,
+      };
+    }
+    return event;
   }
 }
 

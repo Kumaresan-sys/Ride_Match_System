@@ -12,6 +12,7 @@ const db = require('./db');
 const { logger } = require('../utils/logger');
 const ALLOWED_PLATFORMS = new Set(['ios', 'android', 'web']);
 const APP_DEEP_LINK_SCHEME = process.env.APP_DEEP_LINK_SCHEME || 'goapp://';
+const UUID_V4_LIKE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const TOKEN_CACHE_TTL_MS = 30_000; // re-fetch from DB at most every 30 s per user
 
@@ -59,8 +60,21 @@ class NotificationService {
   }
 
   // ─── Device Token Registry ────────────────────────────────────────────────
+  _normalizeUserId(userId) {
+    return String(userId || '').trim();
+  }
+
+  _isUuid(userId) {
+    return UUID_V4_LIKE_RE.test(this._normalizeUserId(userId));
+  }
+
   async registerToken(userId, token, platform = 'unknown', deviceRecordId = null) {
     if (!token) return { success: false, error: 'token is required' };
+    const normalizedUserId = this._normalizeUserId(userId);
+    if (!this._isUuid(normalizedUserId)) {
+      logger.warn('FCM', `Rejected token registration for invalid userId "${normalizedUserId}"`);
+      return { success: false, error: 'userId must be a valid UUID' };
+    }
     const normalizedPlatform = ALLOWED_PLATFORMS.has(platform) ? platform : 'web';
 
     const updateRes = await db.query(
@@ -71,55 +85,66 @@ class NotificationService {
            is_active = true,
            updated_at = NOW()
        WHERE token = $4`,
-      [userId, deviceRecordId, normalizedPlatform, token]
+      [normalizedUserId, deviceRecordId, normalizedPlatform, token]
     );
     if (!updateRes.rowCount) {
       await db.query(
         `INSERT INTO push_tokens (user_id, device_id, platform, token, is_active, updated_at)
          SELECT $1, $2, $3, $4, true, NOW()
          WHERE NOT EXISTS (SELECT 1 FROM push_tokens WHERE token = $4)`,
-        [userId, deviceRecordId, normalizedPlatform, token]
+        [normalizedUserId, deviceRecordId, normalizedPlatform, token]
       );
     }
 
-    this.deviceTokens.set(`${userId}:${token}`, {
-      userId,
+    this.deviceTokens.set(`${normalizedUserId}:${token}`, {
+      userId: normalizedUserId,
       token,
       platform: normalizedPlatform,
       updatedAt: Date.now(),
     });
     // Invalidate TTL so next send re-reads the full device list from DB
-    this._cacheTimestamps.delete(userId);
-    logger.info('FCM', `Registered token for user ${userId} (${normalizedPlatform})`);
-    return { success: true, userId, platform: normalizedPlatform };
+    this._cacheTimestamps.delete(normalizedUserId);
+    logger.info('FCM', `Registered token for user ${normalizedUserId} (${normalizedPlatform})`);
+    return { success: true, userId: normalizedUserId, platform: normalizedPlatform };
   }
 
   async removeToken(userId) {
+    const normalizedUserId = this._normalizeUserId(userId);
+    if (!this._isUuid(normalizedUserId)) {
+      logger.warn('FCM', `Skipping token removal for invalid userId "${normalizedUserId}"`);
+      return;
+    }
     await db.query(
       `UPDATE push_tokens
        SET is_active = false, updated_at = NOW()
        WHERE user_id = $1`,
-      [userId]
+      [normalizedUserId]
     );
 
     for (const key of [...this.deviceTokens.keys()]) {
-      if (key.startsWith(`${userId}:`)) {
+      if (key.startsWith(`${normalizedUserId}:`)) {
         this.deviceTokens.delete(key);
       }
     }
-    this._cacheTimestamps.delete(userId);
+    this._cacheTimestamps.delete(normalizedUserId);
   }
 
   // ─── Core send ────────────────────────────────────────────────────────────
   async send(userId, { title, body, data = {}, channelId = 'goapp_rides' }) {
+    const normalizedUserId = this._normalizeUserId(userId);
+    if (!this._isUuid(normalizedUserId)) {
+      logger.warn('FCM', `[SKIP — invalid userId] ${normalizedUserId}: "${title}"`);
+      return { sent: false, reason: 'invalid_user_id' };
+    }
+
     if (!this.initialized) {
-      logger.info('FCM', `[SKIP — not initialised] ${userId}: "${title}"`);
+      logger.info('FCM', `[SKIP — not initialised] ${normalizedUserId}: "${title}"`);
       return { sent: false, reason: 'not_initialized' };
     }
 
-    const devices = await this._getDevicesForUser(userId);
+    const devices = await this._getDevicesForUser(normalizedUserId);
     if (devices.length === 0) {
-      logger.info('FCM', `[SKIP — no token] ${userId}: "${title}"`);
+      logger.info('FCM', `[SKIP — no token] ${normalizedUserId}: "${title}"`);
       return { sent: false, reason: 'no_token' };
     }
 
@@ -141,10 +166,10 @@ class NotificationService {
               payload: { aps: { sound: 'default', badge: 1 } },
             },
           });
-          logger.info('FCM', `✓ Sent to ${userId} (${device.platform}): "${title}" [${messageId}]`);
+          logger.info('FCM', `✓ Sent to ${normalizedUserId} (${device.platform}): "${title}" [${messageId}]`);
           return messageId;
         } catch (err) {
-          await this._handleSendError(userId, device.token, err);
+          await this._handleSendError(normalizedUserId, device.token, err);
           return null;
         }
       })
@@ -432,14 +457,20 @@ class NotificationService {
 
   // ─── Silent / Data-only push (no banner shown to user) ────────────────────
   async sendSilent(userId, data = {}) {
+    const normalizedUserId = this._normalizeUserId(userId);
+    if (!this._isUuid(normalizedUserId)) {
+      logger.warn('FCM', `[SKIP — invalid userId] silent push to ${normalizedUserId}`);
+      return { sent: false, reason: 'invalid_user_id' };
+    }
+
     if (!this.initialized) {
-      logger.info('FCM', `[SKIP — not initialised] silent push to ${userId}`);
+      logger.info('FCM', `[SKIP — not initialised] silent push to ${normalizedUserId}`);
       return { sent: false, reason: 'not_initialized' };
     }
 
-    const devices = await this._getDevicesForUser(userId);
+    const devices = await this._getDevicesForUser(normalizedUserId);
     if (devices.length === 0) {
-      logger.info('FCM', `[SKIP — no token] silent push to ${userId}`);
+      logger.info('FCM', `[SKIP — no token] silent push to ${normalizedUserId}`);
       return { sent: false, reason: 'no_token' };
     }
 
@@ -457,10 +488,10 @@ class NotificationService {
               payload: { aps: { 'content-available': 1 } },
             },
           });
-          logger.info('FCM', `✓ Silent push to ${userId} (${device.platform}) [${messageId}]`);
+          logger.info('FCM', `✓ Silent push to ${normalizedUserId} (${device.platform}) [${messageId}]`);
           return messageId;
         } catch (err) {
-          await this._handleSendError(userId, device.token, err);
+          await this._handleSendError(normalizedUserId, device.token, err);
           return null;
         }
       })
@@ -485,7 +516,13 @@ class NotificationService {
   }
 
   async _getDevicesForUser(userId) {
-    const lastFetch = this._cacheTimestamps.get(userId) || 0;
+    const normalizedUserId = this._normalizeUserId(userId);
+    if (!this._isUuid(normalizedUserId)) {
+      logger.warn('FCM', `Skipping token lookup for invalid userId "${normalizedUserId}"`);
+      return [];
+    }
+
+    const lastFetch = this._cacheTimestamps.get(normalizedUserId) || 0;
     const cacheStale = (Date.now() - lastFetch) > TOKEN_CACHE_TTL_MS;
 
     if (cacheStale) {
@@ -496,26 +533,26 @@ class NotificationService {
          WHERE user_id = $1
            AND is_active = true
          ORDER BY updated_at DESC`,
-        [userId]
+        [normalizedUserId]
       );
 
       // Clear stale entries for this user before repopulating
       for (const key of this.deviceTokens.keys()) {
-        if (key.startsWith(`${userId}:`)) this.deviceTokens.delete(key);
+        if (key.startsWith(`${normalizedUserId}:`)) this.deviceTokens.delete(key);
       }
       rows.forEach((row) => {
-        this.deviceTokens.set(`${userId}:${row.token}`, {
-          userId,
+        this.deviceTokens.set(`${normalizedUserId}:${row.token}`, {
+          userId: normalizedUserId,
           token: row.token,
           platform: row.platform,
           updatedAt: Date.now(),
         });
       });
-      this._cacheTimestamps.set(userId, Date.now());
+      this._cacheTimestamps.set(normalizedUserId, Date.now());
     }
 
     // Serve from in-memory cache
-    return [...this.deviceTokens.values()].filter((d) => d.userId === userId);
+    return [...this.deviceTokens.values()].filter((d) => d.userId === normalizedUserId);
   }
 
   _stringifyData(data = {}) {

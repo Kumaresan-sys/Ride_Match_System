@@ -27,7 +27,9 @@ class ServiceRideRepository extends RideRepository {
   }
   getAllRides() { return this.rideService.getAllRides(); }
   getRidesPage(options) { return this.rideService.getRidesPage(options); }
-  cancelRide(rideId, cancelledBy, userId) { return this.rideService.cancelRide(rideId, cancelledBy, userId); }
+  cancelRide(rideId, cancelledBy, userId, options) {
+    return this.rideService.cancelRide(rideId, cancelledBy, userId, options);
+  }
   completeTrip(rideId, distanceKm, durationMin) { return this.rideService.completeTrip(rideId, distanceKm, durationMin); }
 }
 

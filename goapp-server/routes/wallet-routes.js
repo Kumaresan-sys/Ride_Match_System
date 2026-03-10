@@ -2,13 +2,18 @@ function registerWalletRoutes(router, ctx) {
   const { repositories, services } = ctx;
   const requireAuth = ctx.requireAuth;
   const { redis } = services;
-  const { validateSchema } = require('./validation');
+  const { validateSchema, validationError } = require('./validation');
+  const {
+    forbiddenError,
+    buildErrorFromResult,
+    getAuthenticatedSession,
+  } = require('./response');
 
   async function ensureWalletOwner(headers, userId) {
-    const auth = await requireAuth(headers || {});
-    if (auth.error) return { error: auth.error };
+    const auth = await getAuthenticatedSession(requireAuth, headers);
+    if (auth.error) return auth;
     if (auth.session.userId !== userId) {
-      return { error: { status: 403, data: { error: 'Forbidden: cannot access another user wallet.' } } };
+      return { error: forbiddenError('Forbidden: cannot access another user wallet.', 'FORBIDDEN_WALLET_ACCESS') };
     }
     return { session: auth.session };
   }
@@ -44,7 +49,7 @@ function registerWalletRoutes(router, ctx) {
       { key: 'paymentId', type: 'string', required: false, maxLength: 255 },
       { key: 'method', type: 'string', required: false, maxLength: 64 },
     ]);
-    if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
+    if (!parsed.ok) return validationError(parsed.error);
     const result = await repositories.wallet.payRide(
       pathParams.userId,
       parsed.data.fareInr,
@@ -53,7 +58,14 @@ function registerWalletRoutes(router, ctx) {
       parsed.data.method,
       idempotencyKey
     );
-    return { status: result.success ? 200 : 400, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 400,
+        defaultCode: 'WALLET_PAY_FAILED',
+        defaultMessage: 'Wallet payment failed.',
+      });
+    }
+    return { status: 200, data: result };
   });
 
   router.register('POST', '/api/v1/wallet/:userId/refund', async ({ pathParams, body, headers }) => {
@@ -67,7 +79,7 @@ function registerWalletRoutes(router, ctx) {
       { key: 'rideId', type: 'string', required: false, maxLength: 255 },
       { key: 'reason', type: 'string', required: false, maxLength: 255 },
     ]);
-    if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
+    if (!parsed.ok) return validationError(parsed.error);
     const result = await repositories.wallet.refund(
       pathParams.userId,
       parsed.data.amount,
@@ -75,7 +87,14 @@ function registerWalletRoutes(router, ctx) {
       parsed.data.reason,
       idempotencyKey
     );
-    return { status: result.success ? 200 : 400, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 400,
+        defaultCode: 'WALLET_REFUND_FAILED',
+        defaultMessage: 'Wallet refund failed.',
+      });
+    }
+    return { status: 200, data: result };
   });
 
   router.register('POST', '/api/v1/wallet/:userId/topup', async ({ pathParams, body, headers }) => {
@@ -88,7 +107,7 @@ function registerWalletRoutes(router, ctx) {
       { key: 'referenceId', type: 'string', required: false, maxLength: 255 },
       { key: 'idempotencyKey', type: 'string', required: false, minLength: 8, maxLength: 128 },
     ]);
-    if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
+    if (!parsed.ok) return validationError(parsed.error);
 
     const idempotencyKey = String(
       parsed.data.idempotencyKey
@@ -114,7 +133,14 @@ function registerWalletRoutes(router, ctx) {
       await redis.setIdempotency(`wallet_topup:${pathParams.userId}:${idempotencyKey}`, result, 600);
     }
 
-    return { status: result.success ? 200 : 400, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 400,
+        defaultCode: 'WALLET_TOPUP_FAILED',
+        defaultMessage: 'Wallet top-up failed.',
+      });
+    }
+    return { status: 200, data: result };
   });
 
   router.register('POST', '/api/v1/wallet/:userId/redeem', async ({ pathParams, body, headers }) => {
@@ -125,13 +151,20 @@ function registerWalletRoutes(router, ctx) {
       { key: 'fareInr', type: 'number', required: true, min: 1 },
       { key: 'coinsToUse', type: 'number', required: false, min: 1 },
     ]);
-    if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
+    if (!parsed.ok) return validationError(parsed.error);
     const result = await services.walletService.redeemCoins(
       pathParams.userId,
       parsed.data.fareInr,
       parsed.data.coinsToUse
     );
-    return { status: result.success ? 200 : 400, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 400,
+        defaultCode: 'WALLET_REDEEM_FAILED',
+        defaultMessage: 'Wallet coin redemption failed.',
+      });
+    }
+    return { status: 200, data: result };
   });
 }
 

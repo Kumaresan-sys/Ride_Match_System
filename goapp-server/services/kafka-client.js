@@ -127,16 +127,57 @@ class RealKafkaBus {
       eachMessage: async ({ message }) => {
         try {
           if (!message || message.value == null) return;
-          const payload = JSON.parse(message.value.toString());
+          const payload = this._decodeMessagePayload(message.value, topic, groupId);
+          if (payload == null) return;
           await handler(payload);
         } catch (err) {
-          logger.error('KAFKA', `Consumer error [${topic}/${groupId}]: ${err.message}`);
+          logger.error('KAFKA', `Consumer error [${topic}/${groupId}]: ${err.message}`, {
+            stack: err?.stack || null,
+            valueType: message?.value == null ? null : typeof message.value,
+          });
         }
       },
     });
 
     this._consumers.set(`${topic}:${groupId}`, consumer);
     logger.info('KAFKA', `Subscribed to [${topic}] as group [${groupId}]`);
+  }
+
+  _decodeMessagePayload(rawValue, topic, groupId) {
+    if (rawValue == null) return null;
+
+    // Handle nested wrapper payloads from some producers/libraries.
+    if (rawValue && typeof rawValue === 'object' && rawValue.value != null) {
+      return this._decodeMessagePayload(rawValue.value, topic, groupId);
+    }
+
+    if (typeof rawValue === 'object' && !Buffer.isBuffer(rawValue) && !(rawValue instanceof Uint8Array)) {
+      // Handle JSON-serialized Buffer objects: { type: 'Buffer', data: [...] }
+      if (rawValue.type === 'Buffer' && Array.isArray(rawValue.data)) {
+        const text = Buffer.from(rawValue.data).toString('utf8');
+        const trimmed = text.trim();
+        if (!trimmed) return null;
+        return JSON.parse(trimmed);
+      }
+      return rawValue;
+    }
+
+    let text;
+    if (Buffer.isBuffer(rawValue) || rawValue instanceof Uint8Array) {
+      text = Buffer.from(rawValue).toString('utf8');
+    } else if (typeof rawValue === 'string') {
+      text = rawValue;
+    } else {
+      logger.warn(
+        'KAFKA',
+        `Skipping message with unsupported payload type [${topic}/${groupId}]: ${typeof rawValue}`
+      );
+      return null;
+    }
+
+    const trimmed = text.trim();
+    if (!trimmed) return null;
+    return JSON.parse(trimmed);
   }
 
   async disconnect() {

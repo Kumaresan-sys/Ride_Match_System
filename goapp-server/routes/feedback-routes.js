@@ -1,14 +1,20 @@
 // GoApp Feedback Routes
 // Mutual post-trip ratings: rider → driver and driver → rider
 
+const {
+  badRequest,
+  forbiddenError,
+  notFoundError,
+  buildErrorFromResult,
+  getAuthenticatedSession,
+} = require('./response');
+
 function registerFeedbackRoutes(router, ctx) {
   const { services, repositories, requireAuth, requireAdmin } = ctx;
   const feedbackService = services.feedbackService;
 
   async function authenticate(headers = {}) {
-    const auth = await requireAuth(headers);
-    if (auth.error) return { error: auth.error };
-    return { session: auth.session };
+    return getAuthenticatedSession(requireAuth, headers);
   }
 
   function isAdmin(headers = {}) {
@@ -24,13 +30,19 @@ function registerFeedbackRoutes(router, ctx) {
     const { rideId } = pathParams;
     const { raterId, rating, comment } = body;
 
-    if (rating === undefined || rating === null) return { status: 400, data: { error: 'rating is required' } };
+    if (rating === undefined || rating === null) return badRequest('rating is required', 'VALIDATION_ERROR');
     if (raterId && raterId !== auth.session.userId) {
-      return { status: 403, data: { error: 'Forbidden: raterId must match authenticated user.' } };
+      return forbiddenError('Forbidden: raterId must match authenticated user.', 'FORBIDDEN_RATER_MISMATCH');
     }
 
     const result = feedbackService.submitRiderFeedback(rideId, auth.session.userId, rating, comment || '');
-    if (!result.success) return { status: result.status || 400, data: { error: result.error } };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: result.status || 400,
+        defaultCode: 'FEEDBACK_SUBMIT_FAILED',
+        defaultMessage: 'Unable to submit rider feedback.',
+      });
+    }
     return { data: result };
   });
 
@@ -42,13 +54,19 @@ function registerFeedbackRoutes(router, ctx) {
     const { rideId } = pathParams;
     const { raterId, rating, comment } = body;
 
-    if (rating === undefined || rating === null) return { status: 400, data: { error: 'rating is required' } };
+    if (rating === undefined || rating === null) return badRequest('rating is required', 'VALIDATION_ERROR');
     if (raterId && raterId !== auth.session.userId) {
-      return { status: 403, data: { error: 'Forbidden: raterId must match authenticated user.' } };
+      return forbiddenError('Forbidden: raterId must match authenticated user.', 'FORBIDDEN_RATER_MISMATCH');
     }
 
     const result = feedbackService.submitDriverFeedback(rideId, auth.session.userId, rating, comment || '');
-    if (!result.success) return { status: result.status || 400, data: { error: result.error } };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: result.status || 400,
+        defaultCode: 'FEEDBACK_SUBMIT_FAILED',
+        defaultMessage: 'Unable to submit driver feedback.',
+      });
+    }
     return { data: result };
   });
 
@@ -58,9 +76,9 @@ function registerFeedbackRoutes(router, ctx) {
     if (auth.error) return auth.error;
 
     const ride = await repositories.ride.getRide(pathParams.rideId);
-    if (!ride) return { status: 404, data: { error: 'Ride not found' } };
+    if (!ride) return notFoundError('Ride not found', 'RIDE_NOT_FOUND');
     if (!isAdmin(headers) && ride.riderId !== auth.session.userId && ride.driverId !== auth.session.userId) {
-      return { status: 403, data: { error: 'Forbidden: cannot access this ride feedback.' } };
+      return forbiddenError('Forbidden: cannot access this ride feedback.', 'FORBIDDEN_RIDE_ACCESS');
     }
 
     const result = feedbackService.getFeedbackForRide(pathParams.rideId);
@@ -73,7 +91,7 @@ function registerFeedbackRoutes(router, ctx) {
     if (auth.error) return auth.error;
 
     if (!isAdmin(headers) && auth.session.userId !== pathParams.driverId) {
-      return { status: 403, data: { error: 'Forbidden: cannot access another driver feedback.' } };
+      return forbiddenError('Forbidden: cannot access another driver feedback.', 'FORBIDDEN_DRIVER_FEEDBACK_ACCESS');
     }
 
     const limit = parseInt(params.get('limit') || '50', 10);
@@ -87,7 +105,7 @@ function registerFeedbackRoutes(router, ctx) {
     if (auth.error) return auth.error;
 
     if (!isAdmin(headers) && auth.session.userId !== pathParams.riderId) {
-      return { status: 403, data: { error: 'Forbidden: cannot access another rider feedback.' } };
+      return forbiddenError('Forbidden: cannot access another rider feedback.', 'FORBIDDEN_RIDER_FEEDBACK_ACCESS');
     }
 
     const limit = parseInt(params.get('limit') || '50', 10);

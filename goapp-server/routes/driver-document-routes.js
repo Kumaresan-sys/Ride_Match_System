@@ -1,6 +1,14 @@
 // Driver Document Routes
 // Endpoints for uploading, listing, verifying, and serving driver KYC documents.
 
+const {
+  badRequest,
+  forbiddenError,
+  buildErrorFromResult,
+  normalizeRouteError,
+  getAuthenticatedSession,
+} = require('./response');
+
 function registerDriverDocumentRoutes(router, ctx) {
   const { services, requireAdmin, requireAuth } = ctx;
   const docService = services.driverDocumentService;
@@ -13,14 +21,14 @@ function registerDriverDocumentRoutes(router, ctx) {
     const reqHeaders = headers || {};
     if (hasAdminToken(reqHeaders)) {
       const adminCheck = requireAdmin(reqHeaders);
-      if (adminCheck) return adminCheck;
+      if (adminCheck) return normalizeRouteError(adminCheck, 'ADMIN_AUTH_REQUIRED');
       return null;
     }
 
-    const auth = await requireAuth(reqHeaders);
+    const auth = await getAuthenticatedSession(requireAuth, reqHeaders);
     if (auth.error) return auth.error;
     if (auth.session.userId !== driverId) {
-      return { status: 403, data: { error: 'Forbidden: cannot access another driver documents.' } };
+      return forbiddenError('Forbidden: cannot access another driver documents.', 'FORBIDDEN_DRIVER_DOCUMENT_ACCESS');
     }
     return null;
   }
@@ -37,11 +45,11 @@ function registerDriverDocumentRoutes(router, ctx) {
     const documentNumber = body.document_number || null;
     const expiryDate = body.expiry_date || null;
 
-    if (!documentType) return { status: 400, data: { error: 'document_type field is required' } };
-    if (!files || files.length === 0) return { status: 400, data: { error: 'A file must be uploaded in the "file" field' } };
+    if (!documentType) return badRequest('document_type field is required', 'VALIDATION_ERROR');
+    if (!files || files.length === 0) return badRequest('A file must be uploaded in the "file" field', 'VALIDATION_ERROR');
 
     const uploaded = files.find(f => f.fieldName === 'file');
-    if (!uploaded) return { status: 400, data: { error: 'No "file" field found in upload' } };
+    if (!uploaded) return badRequest('No "file" field found in upload', 'VALIDATION_ERROR');
 
     const result = await docService.uploadDocument(driverId, {
       documentType,
@@ -52,7 +60,13 @@ function registerDriverDocumentRoutes(router, ctx) {
       buffer: uploaded.data,
     });
 
-    if (!result.success) return { status: result.status || 400, data: { error: result.error } };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: result.status || 400,
+        defaultCode: 'DRIVER_DOCUMENT_UPLOAD_FAILED',
+        defaultMessage: 'Unable to upload driver document.',
+      });
+    }
     return { status: 201, data: result.document };
   });
 
@@ -71,7 +85,13 @@ function registerDriverDocumentRoutes(router, ctx) {
     if (accessError) return accessError;
 
     const result = docService.getDocument(driverId, docId);
-    if (!result.success) return { status: result.status || 404, data: { error: result.error } };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: result.status || 404,
+        defaultCode: 'DRIVER_DOCUMENT_NOT_FOUND',
+        defaultMessage: 'Driver document not found.',
+      });
+    }
     return { data: result.document };
   });
 
@@ -83,7 +103,13 @@ function registerDriverDocumentRoutes(router, ctx) {
     if (accessError) return accessError;
 
     const result = await docService.getDocumentFile(driverId, docId);
-    if (!result.success) return { status: result.status || 404, data: { error: result.error } };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: result.status || 404,
+        defaultCode: 'DRIVER_DOCUMENT_FILE_NOT_FOUND',
+        defaultMessage: 'Driver document file not found.',
+      });
+    }
     return {
       raw: true,
       contentType: result.mimeType,
@@ -101,10 +127,16 @@ function registerDriverDocumentRoutes(router, ctx) {
     const { docId } = pathParams;
     const { status, rejection_reason, verified_by } = body;
 
-    if (!status) return { status: 400, data: { error: 'status is required' } };
+    if (!status) return badRequest('status is required', 'VALIDATION_ERROR');
 
     const result = docService.verifyDocument(docId, status, rejection_reason || null, verified_by || 'admin');
-    if (!result.success) return { status: result.status || 400, data: { error: result.error } };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: result.status || 400,
+        defaultCode: 'DRIVER_DOCUMENT_VERIFY_FAILED',
+        defaultMessage: 'Unable to verify driver document.',
+      });
+    }
     return { data: result.document };
   });
 
@@ -115,7 +147,13 @@ function registerDriverDocumentRoutes(router, ctx) {
     if (accessError) return accessError;
 
     const result = await docService.deleteDocument(driverId, docId);
-    if (!result.success) return { status: result.status || 400, data: { error: result.error } };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: result.status || 400,
+        defaultCode: 'DRIVER_DOCUMENT_DELETE_FAILED',
+        defaultMessage: 'Unable to delete driver document.',
+      });
+    }
     return { data: result };
   });
 }

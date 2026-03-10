@@ -12,6 +12,7 @@ const pricingService = require('./pricing-service');
 const notificationService = require('./notification-service');
 const zoneMappingService = require('./zone-mapping-service');
 const zoneMetricsService = require('./zone-metrics-service');
+const rideCancellationReasonService = require('./ride-cancellation-reason-service');
 const { haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
 const driverWalletService = require('./driver-wallet-service');
@@ -35,7 +36,17 @@ class RideService {
   // ═══════════════════════════════════════════
   // CREATE RIDE REQUEST (with idempotency)
   // ═══════════════════════════════════════════
-  async createRide({ riderId, pickupLat, pickupLng, destLat, destLng, rideType, idempotencyKey }) {
+  async createRide({
+    riderId,
+    pickupLat,
+    pickupLng,
+    destLat,
+    destLng,
+    pickupAddress = null,
+    destAddress = null,
+    rideType,
+    idempotencyKey,
+  }) {
     // ─── Idempotency Check ───
     if (idempotencyKey) {
       const check = await redis.checkIdempotency(idempotencyKey);
@@ -77,11 +88,15 @@ class RideService {
       driverId: null,
       pickupLat, pickupLng,
       destLat, destLng,
+      pickupAddress: pickupAddress || null,
+      destAddress: destAddress || null,
       pickupZoneId: zoneMatch.pickupZoneId,
       pickupZoneCode: zoneMatch.pickupZoneCode,
       dropZoneId: zoneMatch.dropZoneId,
       dropZoneCode: zoneMatch.dropZoneCode,
       rideType: rideType || 'sedan',
+      estimatedDistanceM: Math.round((fareEstimate.distanceKm || 0) * 1000),
+      estimatedDurationS: Math.round((fareEstimate.durationMin || 0) * 60),
       status: S.REQUESTED,
       fareEstimate,
       finalFare: null,
@@ -104,6 +119,11 @@ class RideService {
       rideType: rideType || 'sedan',
       pickupLat, pickupLng,
       destLat, destLng,
+      pickupAddress: pickupAddress || null,
+      destAddress: destAddress || null,
+      estimatedDistanceM: Math.round((fareEstimate.distanceKm || 0) * 1000),
+      estimatedDurationS: Math.round((fareEstimate.durationMin || 0) * 60),
+      fareEstimateDetails: fareEstimate,
       pickupZoneId: zoneMatch.pickupZoneId,
       dropZoneId: zoneMatch.dropZoneId,
       fareEstimate: fareEstimate.finalFare,
@@ -123,7 +143,23 @@ class RideService {
             pickupLng,
             destLat,
             destLng,
+            pickupAddress: pickupAddress || null,
+            destAddress: destAddress || null,
             rideType: ride.rideType,
+            estimatedDistanceM: Math.round((fareEstimate.distanceKm || 0) * 1000),
+            estimatedDurationS: Math.round((fareEstimate.durationMin || 0) * 60),
+            baseFare: fareEstimate.breakdown?.baseFare ?? null,
+            distanceCharge: fareEstimate.breakdown?.distanceCharge ?? null,
+            timeCharge: fareEstimate.breakdown?.timeCharge ?? null,
+            subtotal: fareEstimate.breakdown?.subtotal ?? null,
+            serviceCost: fareEstimate.breakdown?.serviceCost ?? fareEstimate.serviceCost ?? null,
+            gstPct: fareEstimate.breakdown?.gstPct ?? fareEstimate.gstPct ?? null,
+            gstAmount: fareEstimate.breakdown?.gstAmount ?? fareEstimate.gstAmount ?? null,
+            commissionPct:
+              fareEstimate.breakdown?.commissionPct ?? fareEstimate.commissionPct ?? null,
+            surgeMultiplier:
+              fareEstimate.breakdown?.surgeMultiplier ?? estimates.surgeMultiplier,
+            platformCommission: fareEstimate.platformCommission ?? null,
             requestedAt: now,
           },
         }
@@ -144,7 +180,11 @@ class RideService {
           pickupLng,
           destLat,
           destLng,
+          pickupAddress: pickupAddress || null,
+          destAddress: destAddress || null,
           rideType: ride.rideType,
+          estimatedDistanceM: Math.round((fareEstimate.distanceKm || 0) * 1000),
+          estimatedDurationS: Math.round((fareEstimate.durationMin || 0) * 60),
           createdAt: now,
         }, 4 * 3600);
       } else {
@@ -185,7 +225,23 @@ class RideService {
         pickupLng,
         destLat,
         destLng,
+        pickupAddress: pickupAddress || null,
+        destAddress: destAddress || null,
         rideType: ride.rideType,
+        estimatedDistanceM: Math.round((fareEstimate.distanceKm || 0) * 1000),
+        estimatedDurationS: Math.round((fareEstimate.durationMin || 0) * 60),
+        baseFare: fareEstimate.breakdown?.baseFare ?? null,
+        distanceCharge: fareEstimate.breakdown?.distanceCharge ?? null,
+        timeCharge: fareEstimate.breakdown?.timeCharge ?? null,
+        subtotal: fareEstimate.breakdown?.subtotal ?? null,
+        serviceCost: fareEstimate.breakdown?.serviceCost ?? fareEstimate.serviceCost ?? null,
+        gstPct: fareEstimate.breakdown?.gstPct ?? fareEstimate.gstPct ?? null,
+        gstAmount: fareEstimate.breakdown?.gstAmount ?? fareEstimate.gstAmount ?? null,
+        commissionPct:
+          fareEstimate.breakdown?.commissionPct ?? fareEstimate.commissionPct ?? null,
+        surgeMultiplier:
+          fareEstimate.breakdown?.surgeMultiplier ?? estimates.surgeMultiplier,
+        platformCommission: fareEstimate.platformCommission ?? null,
         requestedAt: now,
       }, rideId);
     }
@@ -201,7 +257,10 @@ class RideService {
   }
 
   async processRideRequestedEvent(event = {}) {
-    const rideId = event.rideId;
+    const normalizedEvent = (event && typeof event.payload === 'object' && !event.rideId)
+      ? { ...event, ...event.payload }
+      : event;
+    const rideId = normalizedEvent.rideId || normalizedEvent.aggregateId || null;
     if (!rideId) return { success: false, reason: 'MISSING_RIDE_ID' };
 
     let ride = this.rides.get(rideId);
@@ -255,7 +314,9 @@ class RideService {
       return { success: true, rideId, driverId: matchResult.driverId };
     }
 
-    this._updateStatus(rideId, S.NO_DRIVERS);
+    await this._finalizeNoDrivers(rideId, {
+      reasonCode: 'NO_DRIVERS_IN_ZONE',
+    });
     notificationService.notifyNoDrivers(ride.riderId, rideId);
     return { success: false, rideId, reason: matchResult.reason || 'NO_DRIVERS' };
   }
@@ -392,22 +453,51 @@ class RideService {
   // ═══════════════════════════════════════════
   // CANCELLATION
   // ═══════════════════════════════════════════
-  async cancelRide(rideId, cancelledBy, userId) {
+  async cancelRide(rideId, cancelledBy, userId, options = {}) {
     const ride = this.rides.get(rideId);
     if (!ride) return { success: false, reason: 'Ride not found' };
 
     const now = Date.now();
     let cancelFee = 0;
     let penalty = null;
+    let terminalCancellation = null;
+    const requestedReasonCode = String(options?.reasonCode || '').trim() || null;
+    const requestedReasonText = String(options?.reasonText || '').trim() || null;
 
     if (cancelledBy === 'rider') {
       if (ride.status === S.MATCHING || ride.status === S.BROADCAST) {
+        const resolvedReason = await rideCancellationReasonService.resolveReason({
+          actorType: 'rider',
+          reasonCode: requestedReasonCode,
+          note: requestedReasonText,
+          fallbackCode: 'CHANGE_OF_PLANS',
+        });
+
         // Cancel during matching - no penalty
         await matchingEngine.cancelMatching(rideId);
-        this._updateStatus(rideId, S.CANCELLED_BY_RIDER);
+        this._updateStatus(rideId, S.CANCELLED_BY_RIDER, { skipPg: true });
         eventBus.publish('ride_cancelled_by_rider', { rideId, phase: 'during_matching' });
+        terminalCancellation = {
+          cancelledBy: 'rider',
+          cancellerId: userId,
+          reasonCatalogId: resolvedReason.id,
+          reasonCode: resolvedReason.code,
+          reasonText: resolvedReason.reasonText,
+          cancellationFee: 0,
+          isFeeWaived: true,
+          waiverReason: 'cancelled_during_matching',
+          timeSinceRequest: Math.max(0, Math.round((now - (ride.createdAt || now)) / 1000)),
+          cancelledAt: now,
+        };
 
       } else if (ride.status === S.ACCEPTED || ride.status === S.DRIVER_ARRIVING) {
+        const resolvedReason = await rideCancellationReasonService.resolveReason({
+          actorType: 'rider',
+          reasonCode: requestedReasonCode,
+          note: requestedReasonText,
+          fallbackCode: 'CHANGE_OF_PLANS',
+        });
+
         // Cancel after accept
         const timeSinceAccept = (now - ride.acceptedAt) / 1000;
 
@@ -427,10 +517,23 @@ class RideService {
         if (this.redisStateV2) await this.stateStore.releaseRideAssignLock(rideId, ride.matchResult?.lockToken || ride.driverId || null);
         else await redis.releaseLock(rideId);
 
-        this._updateStatus(rideId, S.CANCELLED_BY_RIDER);
+        this._updateStatus(rideId, S.CANCELLED_BY_RIDER, { skipPg: true });
         eventBus.publish('ride_cancelled_by_rider', {
           rideId, phase: 'after_accept', cancelFee, driverId: ride.driverId,
         });
+        terminalCancellation = {
+          cancelledBy: 'rider',
+          cancellerId: userId,
+          reasonCatalogId: resolvedReason.id,
+          reasonCode: resolvedReason.code,
+          reasonText: resolvedReason.reasonText,
+          cancellationFee: cancelFee,
+          isFeeWaived: cancelFee <= 0,
+          waiverReason: cancelFee <= 0 ? 'grace_period' : null,
+          timeSinceRequest: Math.max(0, Math.round((now - (ride.createdAt || now)) / 1000)),
+          timeSinceAccept: Math.max(0, Math.round(timeSinceAccept)),
+          cancelledAt: now,
+        };
 
         // Notify the driver that the rider cancelled
         notificationService.notifyCancelledByRider(ride.driverId, rideId, cancelFee);
@@ -440,6 +543,13 @@ class RideService {
       penalty = await this._trackCancellation('rider', userId);
 
     } else if (cancelledBy === 'driver') {
+      const resolvedReason = await rideCancellationReasonService.resolveReason({
+        actorType: 'driver',
+        reasonCode: requestedReasonCode,
+        note: requestedReasonText,
+        fallbackCode: 'DRIVER_OTHER',
+      });
+
       // Driver cancels after accepting
       const lastStage = ride.matchResult?.stage || 1;
       const cancelledDriverId = ride.driverId;
@@ -453,8 +563,29 @@ class RideService {
       if (this.redisStateV2) await this.stateStore.releaseRideAssignLock(rideId, ride.matchResult?.lockToken || ride.driverId || null);
       else await redis.releaseLock(rideId);
 
-      this._updateStatus(rideId, S.CANCELLED_BY_DRIVER);
+      this._updateStatus(rideId, S.CANCELLED_BY_DRIVER, { skipPg: true });
       eventBus.publish('ride_cancelled_by_driver', { rideId, driverId: cancelledDriverId });
+      await this._persistCancellationRecord(rideId, {
+        cancelledBy: 'driver',
+        cancellerId: userId || cancelledDriverId || null,
+        reasonCatalogId: resolvedReason.id,
+        reasonCode: resolvedReason.code,
+        reasonText: resolvedReason.reasonText,
+        cancellationFee: 0,
+        isFeeWaived: true,
+        waiverReason: 'driver_cancelled',
+        timeSinceRequest: Math.max(0, Math.round((now - (ride.createdAt || now)) / 1000)),
+        timeSinceAccept: ride.acceptedAt
+          ? Math.max(0, Math.round((now - ride.acceptedAt) / 1000))
+          : null,
+        cancelledAt: now,
+      }, {
+        status: S.CANCELLED_BY_DRIVER,
+        eventType: 'ride_cancelled_by_driver',
+        actorType: 'driver',
+        actorId: userId || cancelledDriverId || null,
+        setCancelledAt: false,
+      });
 
       // Track driver cancellations
       penalty = await this._trackCancellation('driver', userId);
@@ -472,6 +603,10 @@ class RideService {
           ride.driverId  = matchResult.driverId;
           ride.acceptedAt = Date.now();
           ride.matchResult = matchResult;
+          ride.cancelledAt = null;
+          ride.cancelledBy = null;
+          ride.cancellationReasonCode = null;
+          ride.cancellationReasonText = null;
           this._updateStatus(rideId, S.ACCEPTED);
           this._updateStatus(rideId, S.DRIVER_ARRIVING);
 
@@ -484,48 +619,56 @@ class RideService {
             etaMin: matchResult.etaMin,
           });
         } else {
-          this._updateStatus(rideId, S.NO_DRIVERS);
-          zoneMetricsService.recordNoDriver({
-            zoneId: ride.pickupZoneId,
-            riderId: ride.riderId,
-            eventTime: new Date().toISOString(),
-          }).catch((err) => logger.warn('ZONE_METRICS', `recordNoDriver failed: ${err.message}`));
+          this._finalizeNoDrivers(rideId, {
+            reasonCode: 'NO_DRIVERS_IN_ZONE',
+          }).catch((err) => logger.warn('RIDE', `finalizeNoDrivers failed: ${err.message}`));
           notificationService.notifyNoDrivers(ride.riderId, rideId);
         }
       }).catch(err => {
         logger.error('RIDE', `Re-matching failed for ride ${rideId}: ${err.message}`);
-        this._updateStatus(rideId, S.NO_DRIVERS);
-        zoneMetricsService.recordNoDriver({
-          zoneId: ride.pickupZoneId,
-          riderId: ride.riderId,
-          eventTime: new Date().toISOString(),
-        }).catch((e) => logger.warn('ZONE_METRICS', `recordNoDriver failed: ${e.message}`));
+        this._finalizeNoDrivers(rideId, {
+          reasonCode: 'NO_DRIVERS_IN_ZONE',
+        }).catch((e) => logger.warn('RIDE', `finalizeNoDrivers failed: ${e.message}`));
         notificationService.notifyNoDrivers(ride.riderId, rideId);
       });
     }
 
-    ride.cancelledAt = now;
-    ride.cancelledBy = cancelledBy;
-    zoneMetricsService.recordCancelled({
-      zoneId: ride.pickupZoneId,
-      riderId: ride.riderId,
-      eventTime: new Date(now).toISOString(),
-    }).catch((err) => logger.warn('ZONE_METRICS', `recordCancelled failed: ${err.message}`));
-    if (ride.riderId) {
-      if (this.redisStateV2) await this.stateStore.clearRiderActiveRide(ride.riderId);
-      else await redis.del(`active_ride:${ride.riderId}`);
-    }
-    if (this.redisStateV2) {
-      await this.stateStore.setActiveRide(rideId, {
-        rideId,
-        riderId: ride.riderId,
-        driverId: ride.driverId,
+    if (terminalCancellation) {
+      ride.cancelledAt = now;
+      ride.cancelledBy = terminalCancellation.cancelledBy;
+      ride.reasonCatalogId = terminalCancellation.reasonCatalogId || null;
+      ride.cancellationReasonCode = terminalCancellation.reasonCode;
+      ride.cancellationReasonText = terminalCancellation.reasonText;
+      await this._persistCancellationRecord(rideId, terminalCancellation, {
         status: ride.status,
-        cancelledAt: ride.cancelledAt,
-        cancelledBy,
-      }, 3600);
+        eventType: 'ride_cancelled',
+        actorType: terminalCancellation.cancelledBy,
+        actorId: terminalCancellation.cancellerId || null,
+        setCancelledAt: true,
+      });
+      zoneMetricsService.recordCancelled({
+        zoneId: ride.pickupZoneId,
+        riderId: ride.riderId,
+        eventTime: new Date(now).toISOString(),
+      }).catch((err) => logger.warn('ZONE_METRICS', `recordCancelled failed: ${err.message}`));
+      if (ride.riderId) {
+        if (this.redisStateV2) await this.stateStore.clearRiderActiveRide(ride.riderId);
+        else await redis.del(`active_ride:${ride.riderId}`);
+      }
+      if (this.redisStateV2) {
+        await this.stateStore.setActiveRide(rideId, {
+          rideId,
+          riderId: ride.riderId,
+          driverId: ride.driverId,
+          status: ride.status,
+          cancelledAt: ride.cancelledAt,
+          cancelledBy: ride.cancelledBy,
+          cancellationReasonCode: ride.cancellationReasonCode,
+          cancellationReasonText: ride.cancellationReasonText,
+        }, 3600);
+      }
+      await rideSessionService.onRideEnded(ride.riderId);
     }
-    await rideSessionService.onRideEnded(ride.riderId);
 
     this._pruneOldRides();
 
@@ -610,18 +753,113 @@ class RideService {
     return penalty;
   }
 
+  _buildNoDriversReasonText(ride) {
+    const zone = String(
+      ride?.pickupZoneName ||
+      ride?.pickupZoneCode ||
+      ride?.pickupZoneId ||
+      ''
+    ).trim();
+    return zone
+      ? `No drivers found in pickup zone ${zone}.`
+      : 'No drivers found in your pickup zone.';
+  }
+
+  async _persistCancellationRecord(rideId, details, options = {}) {
+    try {
+      if (options.status || options.eventType) {
+        await pgRepo.recordCancellation(rideId, details, options);
+        return;
+      }
+      await pgRepo.insertRideCancellation(rideId, details);
+    } catch (err) {
+      logger.warn('RIDE', `pg insertRideCancellation failed (non-fatal): ${err.message}`);
+    }
+  }
+
+  async _finalizeNoDrivers(rideId, options = {}) {
+    const ride = this.rides.get(rideId);
+    if (!ride) return;
+
+    const now = Date.now();
+    const reasonCode = String(options.reasonCode || '').trim() || 'NO_DRIVERS_IN_ZONE';
+    const fallbackReasonText =
+      String(options.reasonText || '').trim() || this._buildNoDriversReasonText(ride);
+    const resolvedReason = await rideCancellationReasonService.resolveReason({
+      actorType: 'system',
+      reasonCode,
+      displayText: fallbackReasonText,
+      fallbackCode: 'NO_DRIVERS_IN_ZONE',
+    });
+
+    ride.cancelledAt = now;
+    ride.cancelledBy = 'system';
+    ride.reasonCatalogId = resolvedReason.id;
+    ride.cancellationReasonCode = resolvedReason.code;
+    ride.cancellationReasonText = resolvedReason.reasonText;
+
+    this._updateStatus(rideId, S.NO_DRIVERS, { cancelledAt: now, skipPg: true });
+    await this._persistCancellationRecord(rideId, {
+      cancelledBy: 'system',
+      cancellerId: null,
+      reasonCatalogId: resolvedReason.id,
+      reasonCode: resolvedReason.code,
+      reasonText: resolvedReason.reasonText,
+      cancellationFee: 0,
+      isFeeWaived: true,
+      waiverReason: 'no_driver_available',
+      timeSinceRequest: Math.max(0, Math.round((now - (ride.createdAt || now)) / 1000)),
+      cancelledAt: now,
+    }, {
+      status: S.NO_DRIVERS,
+      eventType: 'ride_cancelled_system',
+      actorType: 'system',
+      actorId: null,
+      setCancelledAt: true,
+    });
+
+    zoneMetricsService.recordNoDriver({
+      zoneId: ride.pickupZoneId,
+      riderId: ride.riderId,
+      eventTime: new Date(now).toISOString(),
+    }).catch((err) => logger.warn('ZONE_METRICS', `recordNoDriver failed: ${err.message}`));
+
+    if (ride.riderId) {
+      if (this.redisStateV2) await this.stateStore.clearRiderActiveRide(ride.riderId);
+      else await redis.del(`active_ride:${ride.riderId}`);
+    }
+
+    if (this.redisStateV2) {
+      await this.stateStore.setActiveRide(rideId, {
+        rideId,
+        riderId: ride.riderId,
+        driverId: ride.driverId,
+        status: ride.status,
+        cancelledAt: ride.cancelledAt,
+        cancelledBy: ride.cancelledBy,
+        cancellationReasonCode: ride.cancellationReasonCode,
+        cancellationReasonText: ride.cancellationReasonText,
+      }, 3600);
+    }
+
+    await rideSessionService.onRideEnded(ride.riderId);
+  }
+
   // ─── Status Management ───
   _updateStatus(rideId, newStatus, pgExtra = {}) {
     const ride = this.rides.get(rideId);
     if (!ride) return;
+    const { skipPg = false, ...persistExtra } = pgExtra || {};
     const prev = ride.statusHistory[ride.statusHistory.length - 1]?.status || 'NEW';
     ride.status = newStatus;
     ride.statusHistory.push({ status: newStatus, at: Date.now() });
     logger.info('RIDE', `Ride ${rideId}: ${prev} → ${newStatus}`);
 
     // Persist status change to PostgreSQL
-    pgRepo.updateStatus(rideId, newStatus, pgExtra)
-      .catch(err => logger.warn('RIDE', `pg updateStatus failed (non-fatal): ${err.message}`));
+    if (!skipPg) {
+      pgRepo.updateStatus(rideId, newStatus, persistExtra)
+        .catch(err => logger.warn('RIDE', `pg updateStatus failed (non-fatal): ${err.message}`));
+    }
 
     if (this.redisStateV2 && ride.riderId) {
       this.stateStore.setActiveRide(rideId, {

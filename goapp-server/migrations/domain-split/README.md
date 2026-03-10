@@ -70,7 +70,7 @@ node migrations/domain-split/run-domain-extraction.js \
   --execute true
 ```
 
-5. Run post-extract bootstrap (creates projection tables, outbox/idempotency safety tables, and split-safe payment preference table):
+5. Run post-extract bootstrap (creates projection tables, outbox/idempotency safety tables, split-safe payment preference tables, and the ride cancellation reason catalog in `rides_db`):
 
 ```bash
 npm run domain:bootstrap

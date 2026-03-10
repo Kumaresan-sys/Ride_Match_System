@@ -4,9 +4,12 @@
 
 require('../../config/env-loader');
 
+const fs = require('fs');
+const path = require('path');
 const { Client } = require('pg');
 
 const DOMAINS = ['identity', 'drivers', 'rides', 'payments', 'analytics'];
+const SQL_ROOT = path.resolve(__dirname, '../../enterprise-setup/sql');
 
 function parseArgs(argv) {
   const args = new Map();
@@ -436,10 +439,32 @@ function stepsByDomain(domain) {
   return [];
 }
 
+function loadSqlFile(relativePath) {
+  const absolutePath = path.resolve(SQL_ROOT, relativePath);
+  return fs.readFileSync(absolutePath, 'utf8');
+}
+
+function sqlFileStepsByDomain(domain) {
+  if (domain === 'rides') {
+    return [
+      {
+        name: 'sql_054_ride_cancellation_reason_catalog',
+        sql: loadSqlFile('054_ride_cancellation_reason_catalog.sql'),
+      },
+    ];
+  }
+
+  return [];
+}
+
 async function runDomainBootstrap({ domain, dryRun }) {
   const connectionConfig = buildDomainConnectionConfig(domain);
   const summary = summarizeConnection(connectionConfig);
-  const steps = [...commonSteps(), ...stepsByDomain(domain)];
+  const steps = [
+    ...commonSteps(),
+    ...stepsByDomain(domain),
+    ...sqlFileStepsByDomain(domain),
+  ];
 
   // eslint-disable-next-line no-console
   console.log(`# Bootstrap domain=${domain} target=${summary} steps=${steps.length}`);
@@ -501,4 +526,3 @@ main().catch((err) => {
   }, null, 2));
   process.exit(1);
 });
-

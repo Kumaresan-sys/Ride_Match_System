@@ -40,11 +40,13 @@ const safetyService = require('./services/safety-service');
 const zoneCatalogService = require('./services/zone-catalog-service');
 const zoneMappingService = require('./services/zone-mapping-service');
 const zoneMetricsService = require('./services/zone-metrics-service');
+const rideCancellationReasonService = require('./services/ride-cancellation-reason-service');
 const { applySecurityHeaders, parseJsonBody, readRawBody } = require('./middleware/http-middleware');
 const { parseMultipart } = require('./middleware/multipart-parser');
 const DocumentStorageService = require('./services/document-storage-service');
 const DriverDocumentService = require('./services/driver-document-service');
 const buildRouteDispatcher = require('./routes');
+const { buildError } = require('./routes/response');
 const validateConfig = require('./config/validate-config');
 const { bootstrapArchitecture } = require('./infra/bootstrap');
 const { bootstrapModules } = require('./modules');
@@ -176,7 +178,7 @@ function startAPIServer(port, runtime = {}) {
   };
   const modules = runtime.modules || bootstrapModules();
 
-  const dispatchRoute = buildRouteDispatcher({
+  const defaultDispatchRoute = buildRouteDispatcher({
     enterpriseConfig,
     repositories,
     eventBus,
@@ -209,12 +211,14 @@ function startAPIServer(port, runtime = {}) {
       zoneCatalogService,
       zoneMappingService,
       zoneMetricsService,
+      rideCancellationReasonService,
       googleMapsService,
       smsService,
       infra: runtime.infra || null,
       modules,
     },
   });
+  const dispatchRoute = runtime.dispatchRoute || defaultDispatchRoute;
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${port}`);
@@ -235,6 +239,17 @@ function startAPIServer(port, runtime = {}) {
     }
     applySecurityHeaders(req, res);
 
+    const defaultErrorCodeForStatus = (status, fallback = 'REQUEST_FAILED') => {
+      if (status === 400) return 'BAD_REQUEST';
+      if (status === 401) return 'AUTH_REQUIRED';
+      if (status === 403) return 'FORBIDDEN';
+      if (status === 404) return 'NOT_FOUND';
+      if (status === 409) return 'CONFLICT';
+      if (status === 429) return 'RATE_LIMITED';
+      if (status >= 500) return fallback || 'INTERNAL_ERROR';
+      return fallback || 'REQUEST_FAILED';
+    };
+
     const writeJson = (status, data) => {
       let payload = data;
       if (payload && typeof payload === 'object' && !Buffer.isBuffer(payload) && !Array.isArray(payload)) {
@@ -245,6 +260,18 @@ function startAPIServer(port, runtime = {}) {
       res.writeHead(status);
       const indent = process.env.NODE_ENV === 'production' ? 0 : 2;
       res.end(JSON.stringify(payload, null, indent));
+    };
+
+    const writeErrorJson = (status, message, errorCode = null, extra = {}) => {
+      writeJson(
+        status,
+        buildError(
+          status,
+          message,
+          errorCode || defaultErrorCodeForStatus(status),
+          extra,
+        ).data,
+      );
     };
 
     if (method === 'OPTIONS') {
@@ -263,14 +290,18 @@ function startAPIServer(port, runtime = {}) {
 
         if (!isValid) {
           logger.warn('RAZORPAY', `Webhook received with invalid signature — rejected (requestId=${requestId})`);
-          writeJson(400, { error: 'Invalid webhook signature', requestId });
+          writeErrorJson(400, 'Invalid webhook signature', 'INVALID_WEBHOOK_SIGNATURE');
           doneWebhook();
           return;
         }
 
         let event;
         try { event = JSON.parse(rawBody.toString('utf8')); }
-        catch (_) { writeJson(400, { error: 'Invalid JSON', requestId }); doneWebhook(); return; }
+        catch (_) {
+          writeErrorJson(400, 'Invalid JSON', 'INVALID_JSON');
+          doneWebhook();
+          return;
+        }
 
         // ── Webhook event processing ─────────────────────────────────────────
         const eventName  = event.event || '';
@@ -308,7 +339,11 @@ function startAPIServer(port, runtime = {}) {
       } catch (err) {
         doneWebhook();
         logger.error('API', `Webhook error (requestId=${requestId}): ${err.message}`);
-        writeJson(500, { error: err.message, requestId });
+        writeErrorJson(
+          500,
+          err.message || 'Webhook processing failed.',
+          err.code || 'WEBHOOK_PROCESSING_FAILED',
+        );
       }
       return;
     }
@@ -348,12 +383,16 @@ function startAPIServer(port, runtime = {}) {
     } catch (err) {
       doneRequest();
       if (err instanceof SyntaxError) {
-        writeJson(400, { error: 'Invalid JSON body', requestId });
+        writeErrorJson(400, 'Invalid JSON body', 'INVALID_JSON');
         return;
       }
       const status = err.statusCode || 500;
       logger.error('API', `Unhandled request error (requestId=${requestId}, path=${path}, method=${method}): ${err.message}`);
-      writeJson(status, { error: err.message, requestId });
+      writeErrorJson(
+        status,
+        err.message || 'Request failed.',
+        err.code || defaultErrorCodeForStatus(status, 'UNHANDLED_REQUEST_ERROR'),
+      );
     }
   });
 

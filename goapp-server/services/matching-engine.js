@@ -9,11 +9,13 @@ const redis = require('./redis-client');
 const locationService = require('./location-service');
 const { haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
+const observabilityLogger = require('../infra/observability/logger');
 const driverWalletService = require('./driver-wallet-service');
 const notificationService = require('./notification-service');
 const perfMonitor = require('./perf-monitor');
 const RedisStateStore = require('../infra/redis/state-store');
 const pgDriverRepo = require('../repositories/pg/pg-driver-repository');
+const pgRideRepo = require('../repositories/pg/pg-ride-repository');
 
 const OFFER_BATCH_SIZE = 5;
 const OFFER_TIMEOUT_SEC = 7;
@@ -22,6 +24,69 @@ const MAX_MATCH_WINDOW_MS = 30_000;
 class MatchingEngine {
   constructor() {
     this.stateStore = new RedisStateStore(redis);
+  }
+
+  _toFiniteNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  async _logDriverMissingInDb({ ride, stage, candidate, state }) {
+    const details = {
+      rideId: ride?.rideId || null,
+      driverId: candidate?.driverId || null,
+      stage: stage?.stage ?? null,
+      radiusKm: this._toFiniteNumber(stage?.radiusKm),
+      pickupZoneId: ride?.pickupZoneId || null,
+      pickupZoneCode: ride?.pickupZoneCode || null,
+      pickupZoneName: ride?.pickupZoneName || null,
+      pickupZoneCity: ride?.pickupZoneCity || null,
+      pickupZoneState: ride?.pickupZoneState || null,
+      pickupZoneCountry: ride?.pickupZoneCountry || null,
+      dropZoneId: ride?.dropZoneId || null,
+      dropZoneCode: ride?.dropZoneCode || null,
+      dropZoneName: ride?.dropZoneName || null,
+      dropZoneCity: ride?.dropZoneCity || null,
+      dropZoneState: ride?.dropZoneState || null,
+      dropZoneCountry: ride?.dropZoneCountry || null,
+      pickupLat: this._toFiniteNumber(ride?.pickupLat),
+      pickupLng: this._toFiniteNumber(ride?.pickupLng),
+      dropLat: this._toFiniteNumber(ride?.destLat),
+      dropLng: this._toFiniteNumber(ride?.destLng),
+      driverLat: this._toFiniteNumber(candidate?.lat ?? state?.lat),
+      driverLng: this._toFiniteNumber(candidate?.lng ?? state?.lng),
+      driverCity: state?.city || state?.homeCity || null,
+      driverStatus: state?.status || null,
+    };
+
+    observabilityLogger.warn('matching_driver_missing_db', details);
+    logger.warn(
+      'MATCHING',
+      `Driver ${details.driverId} missing in drivers DB; using Redis state fallback`,
+      details
+    );
+
+    try {
+      const persisted = await pgRideRepo.insertRideEvent(
+        details.rideId,
+        'matching_driver_missing_db',
+        details,
+        { actorType: 'system' }
+      );
+      if (!persisted) {
+        logger.warn(
+          'MATCHING',
+          `Unable to persist matching_driver_missing_db because ride ${details.rideId} was not found in rides DB`,
+          details
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        'MATCHING',
+        `Failed to persist matching_driver_missing_db for ride ${details.rideId}: ${err.message}`,
+        details
+      );
+    }
   }
 
   async registerDriver(driver) {
@@ -177,6 +242,9 @@ class MatchingEngine {
     const profiles = await Promise.all(candidates.map(async (candidate) => {
       const db = await pgDriverRepo.getDriver(candidate.driverId).catch(() => null);
       const state = await this.stateStore.getDriverState(candidate.driverId).catch(() => ({}));
+      if (!db) {
+        await this._logDriverMissingInDb({ ride, stage, candidate, state });
+      }
       return {
         driverId: candidate.driverId,
         name: db?.name || state?.name || `Driver-${String(candidate.driverId).slice(0, 6)}`,

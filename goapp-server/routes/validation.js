@@ -1,5 +1,7 @@
 'use strict';
 
+const { badRequest, forbiddenError: forbiddenResponse } = require('./response');
+
 function isFiniteNumber(value) {
   const n = typeof value === 'number' ? value : parseFloat(value);
   return Number.isFinite(n);
@@ -64,11 +66,11 @@ function validateSchema(input, schema) {
 }
 
 function validationError(message) {
-  return { status: 400, data: { error: message, code: 'VALIDATION_ERROR' } };
+  return badRequest(message, 'VALIDATION_ERROR');
 }
 
 function forbiddenError(message = 'Forbidden') {
-  return { status: 403, data: { error: message, code: 'FORBIDDEN' } };
+  return forbiddenResponse(message, 'FORBIDDEN');
 }
 
 function parseQueryNumber(params, key, { min = null, max = null, fallback = null } = {}) {

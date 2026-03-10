@@ -37,6 +37,8 @@ cd goapp-server
 ./scripts/setup-docker.sh
 ```
 
+This also runs `npm run domain:bootstrap`, so domain databases receive split-safe bootstrap tables such as projections, outbox/idempotency tables, and the ride cancellation reason catalog.
+
 ### 2) Verify infrastructure
 
 ```bash

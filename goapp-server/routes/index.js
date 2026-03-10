@@ -6,6 +6,7 @@ const registerWalletRoutes = require('./wallet-routes');
 const registerCoinsRoutes = require('./coins-routes');
 const registerFeedbackRoutes = require('./feedback-routes');
 const registerPaymentRoutes = require('./payment-routes');
+const registerCancelRideRoutes = require('./cancel-ride-routes');
 const registerDriverDocumentRoutes = require('./driver-document-routes');
 const registerProfileRoutes = require('./profile-routes');
 const registerSafetyRoutes  = require('./safety-routes');
@@ -21,6 +22,7 @@ const registerAdminVehicleRoutes = require('./admin-vehicle-routes');
 const registerSavedLocationsRoutes   = require('./saved-locations-routes');
 const registerZoneRestrictionRoutes  = require('./zone-restriction-routes');
 const registerZoneAnalyticsRoutes = require('./zone-analytics-routes');
+const { notFoundError } = require('./response');
 
 function buildRouteDispatcher(context) {
   const router = new SimpleRouter();
@@ -32,6 +34,7 @@ function buildRouteDispatcher(context) {
   registerDriverRoutes(router, context);
   registerTicketRoutes(router, context);
   registerRideRoutes(router, context);
+  registerCancelRideRoutes(router, context);
   registerCoinsRoutes(router, context);
   registerWalletRoutes(router, context);
   registerFeedbackRoutes(router, context);
@@ -50,7 +53,7 @@ function buildRouteDispatcher(context) {
   return async (method, path, body, params, headers, files, ip) => {
     const routed = await router.dispatch({ method, path, body, params, headers, files, ip });
     if (routed) return routed;
-    return { status: 404, data: { error: 'Not found', code: 'NOT_FOUND', path, method } };
+    return notFoundError('Not found', 'NOT_FOUND', { path, method });
   };
 }
 

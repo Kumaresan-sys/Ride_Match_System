@@ -10,6 +10,14 @@
 
 'use strict';
 
+const {
+  badRequest,
+  forbiddenError,
+  notFoundError,
+  buildErrorFromResult,
+  getAuthenticatedSession,
+} = require('./response');
+
 function registerPaymentRoutes(router, ctx) {
   const { services } = ctx;
   const eventBus = ctx.eventBus;
@@ -26,14 +34,16 @@ function registerPaymentRoutes(router, ctx) {
   // Body: { userId, amountInr }
   // Returns: { orderId, amount (paise), currency, keyId }
   router.register('POST', '/api/v1/payments/rider/create-order', async ({ body, headers }) => {
-    const auth = await requireAuth(headers);
+    const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
     const { userId, amountInr } = body;
-    if (!userId) return { status: 400, data: { error: 'userId is required' } };
-    if (auth.session.userId !== userId) return { status: 403, data: { error: 'Forbidden: userId must match authenticated user.' } };
+    if (!userId) return badRequest('userId is required', 'VALIDATION_ERROR');
+    if (auth.session.userId !== userId) {
+      return forbiddenError('Forbidden: userId must match authenticated user.', 'FORBIDDEN_USER_MISMATCH');
+    }
     if (!amountInr || amountInr < 1) {
-      return { status: 400, data: { error: 'amountInr must be ≥ 1' } };
+      return badRequest('amountInr must be ≥ 1', 'VALIDATION_ERROR');
     }
 
     const result = await razorpay.createOrder({
@@ -44,22 +54,29 @@ function registerPaymentRoutes(router, ctx) {
       notes: { purpose: 'wallet_recharge', platform: 'goapp' },
     });
 
-    return { status: result.success ? 200 : 400, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 400,
+        defaultCode: 'PAYMENT_ORDER_CREATE_FAILED',
+        defaultMessage: 'Unable to create Razorpay order.',
+      });
+    }
+    return { status: 200, data: result };
   });
 
   // POST /api/v1/payments/rider/verify
   // Body: { razorpayOrderId, razorpayPaymentId, razorpaySignature }
   // On success: credits rider's wallet cash balance, returns updated balance
   router.register('POST', '/api/v1/payments/rider/verify', async ({ body, headers }) => {
-    const auth = await requireAuth(headers);
+    const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
     const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = body;
     if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
-      return {
-        status: 400,
-        data: { error: 'razorpayOrderId, razorpayPaymentId, and razorpaySignature are required' },
-      };
+      return badRequest(
+        'razorpayOrderId, razorpayPaymentId, and razorpaySignature are required',
+        'VALIDATION_ERROR',
+      );
     }
 
     const verification = await razorpay.verifyPayment({
@@ -69,10 +86,14 @@ function registerPaymentRoutes(router, ctx) {
     });
 
     if (!verification.success) {
-      return { status: 400, data: verification };
+      return buildErrorFromResult(verification, {
+        status: 400,
+        defaultCode: 'PAYMENT_VERIFY_FAILED',
+        defaultMessage: 'Unable to verify rider payment.',
+      });
     }
     if (auth.session.userId !== verification.userId) {
-      return { status: 403, data: { error: 'Forbidden: cannot verify payment for another user.' } };
+      return forbiddenError('Forbidden: cannot verify payment for another user.', 'FORBIDDEN_PAYMENT_ACCESS');
     }
 
     // Credit rider wallet cash balance
@@ -111,16 +132,16 @@ function registerPaymentRoutes(router, ctx) {
   // POST /api/v1/payments/driver/create-order
   // Body: { driverId, amountInr }
   router.register('POST', '/api/v1/payments/driver/create-order', async ({ body, headers }) => {
-    const auth = await requireAuth(headers);
+    const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
     const { driverId, amountInr } = body;
-    if (!driverId) return { status: 400, data: { error: 'driverId is required' } };
+    if (!driverId) return badRequest('driverId is required', 'VALIDATION_ERROR');
     if (auth.session.userId !== driverId) {
-      return { status: 403, data: { error: 'Forbidden: driverId must match authenticated user.' } };
+      return forbiddenError('Forbidden: driverId must match authenticated user.', 'FORBIDDEN_DRIVER_MISMATCH');
     }
     if (!amountInr || amountInr < 1) {
-      return { status: 400, data: { error: 'amountInr must be ≥ 1' } };
+      return badRequest('amountInr must be ≥ 1', 'VALIDATION_ERROR');
     }
 
     const result = await razorpay.createOrder({
@@ -131,22 +152,29 @@ function registerPaymentRoutes(router, ctx) {
       notes:     { purpose: 'wallet_recharge', platform: 'goapp_driver' },
     });
 
-    return { status: result.success ? 200 : 400, data: result };
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: 400,
+        defaultCode: 'PAYMENT_ORDER_CREATE_FAILED',
+        defaultMessage: 'Unable to create driver Razorpay order.',
+      });
+    }
+    return { status: 200, data: result };
   });
 
   // POST /api/v1/payments/driver/verify
   // Body: { razorpayOrderId, razorpayPaymentId, razorpaySignature }
   // On success: credits driver wallet, returns updated balance + eligibility
   router.register('POST', '/api/v1/payments/driver/verify', async ({ body, headers }) => {
-    const auth = await requireAuth(headers);
+    const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
     const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = body;
     if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
-      return {
-        status: 400,
-        data: { error: 'razorpayOrderId, razorpayPaymentId, and razorpaySignature are required' },
-      };
+      return badRequest(
+        'razorpayOrderId, razorpayPaymentId, and razorpaySignature are required',
+        'VALIDATION_ERROR',
+      );
     }
 
     const verification = await razorpay.verifyPayment({
@@ -156,10 +184,14 @@ function registerPaymentRoutes(router, ctx) {
     });
 
     if (!verification.success) {
-      return { status: 400, data: verification };
+      return buildErrorFromResult(verification, {
+        status: 400,
+        defaultCode: 'PAYMENT_VERIFY_FAILED',
+        defaultMessage: 'Unable to verify driver payment.',
+      });
     }
     if (auth.session.userId !== verification.userId) {
-      return { status: 403, data: { error: 'Forbidden: cannot verify payment for another user.' } };
+      return forbiddenError('Forbidden: cannot verify payment for another user.', 'FORBIDDEN_PAYMENT_ACCESS');
     }
 
     // Credit driver wallet
@@ -201,15 +233,15 @@ function registerPaymentRoutes(router, ctx) {
 
   // GET /api/v1/payments/orders/:orderId
   router.register('GET', '/api/v1/payments/orders/:orderId', async ({ pathParams, headers }) => {
-    const auth = await requireAuth(headers);
+    const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
     const order = await razorpay.getOrder(pathParams.orderId);
     if (!order) {
-      return { status: 404, data: { error: 'Order not found' } };
+      return notFoundError('Order not found', 'ORDER_NOT_FOUND');
     }
     if (auth.session.userId !== order.userId) {
-      return { status: 403, data: { error: 'Forbidden: cannot access another user order.' } };
+      return forbiddenError('Forbidden: cannot access another user order.', 'FORBIDDEN_ORDER_ACCESS');
     }
     return { data: order };
   });
