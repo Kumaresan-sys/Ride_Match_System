@@ -11,6 +11,7 @@ class PgWalletRepository {
   constructor() {
     this.coinDriftWarnings = 0;
     this.userCoinPrefsTableExists = null;
+    this.enterpriseWalletLedgerExists = null;
   }
 
   // ─── Ensure wallet row exists ─────────────────────────────────────────────
@@ -81,10 +82,14 @@ class PgWalletRepository {
 
   async getBalance(userId) {
     await this._ensureWallet(userId);
-    const { rows } = await domainDb.query('payments', 
+    const isEnterpriseLedger = await this._hasEnterpriseWalletLedger();
+    const cashBalanceExpr = isEnterpriseLedger
+      ? 'COALESCE(NULLIF(w.balance, 0), NULLIF(rw.cash_balance, 0), 0)'
+      : 'COALESCE(NULLIF(rw.cash_balance, 0), NULLIF(w.balance, 0), 0)';
+    const { rows } = await domainDb.query('payments',
       `SELECT
          COALESCE(cw.balance, rw.coin_balance, 0) AS coin_balance,
-         COALESCE(rw.cash_balance, w.balance, 0) AS cash_balance,
+         ${cashBalanceExpr} AS cash_balance,
          cw.balance AS coin_wallet_balance,
          rw.coin_balance AS rider_wallet_coin_balance
        FROM (SELECT $1::uuid AS user_id) request_user
@@ -647,10 +652,14 @@ class PgWalletRepository {
   }
 
   async _getCoinCashSnapshot(client, userId) {
+    const isEnterpriseLedger = await this._hasEnterpriseWalletLedger(client);
+    const cashBalanceExpr = isEnterpriseLedger
+      ? 'COALESCE(NULLIF(w.balance, 0), NULLIF(rw.cash_balance, 0), 0)'
+      : 'COALESCE(NULLIF(rw.cash_balance, 0), NULLIF(w.balance, 0), 0)';
     const { rows } = await client.query(
       `SELECT
          COALESCE(cw.balance, rw.coin_balance, 0) AS coin_balance,
-         COALESCE(rw.cash_balance, w.balance, 0) AS cash_balance
+         ${cashBalanceExpr} AS cash_balance
        FROM (SELECT $1::uuid AS user_id) request_user
        LEFT JOIN coin_wallets cw ON cw.user_id = request_user.user_id
        LEFT JOIN wallets w ON w.user_id = request_user.user_id
@@ -663,6 +672,25 @@ class PgWalletRepository {
       coinBalance: Number(rows[0]?.coin_balance || 0),
       cashBalance: Number(rows[0]?.cash_balance || 0),
     };
+  }
+
+  async _hasEnterpriseWalletLedger(client = null) {
+    if (this.enterpriseWalletLedgerExists !== null) {
+      return this.enterpriseWalletLedgerExists;
+    }
+    try {
+      const columns = client
+        ? await this._getSchemaColumns(client, 'wallet_transactions')
+        : await this._getTableColumns('wallet_transactions');
+      this.enterpriseWalletLedgerExists = (
+        columns.has('wallet_id') &&
+        columns.has('balance_before') &&
+        columns.has('balance_after')
+      );
+    } catch (_) {
+      this.enterpriseWalletLedgerExists = false;
+    }
+    return this.enterpriseWalletLedgerExists;
   }
 
   async _syncRiderCoinMirror(client, userId, authoritativeCoinBalance) {
@@ -718,6 +746,17 @@ class PgWalletRepository {
     ) {
       const txType = this._toEnterpriseTxType(tx?.type);
       const amount = Math.abs(Number(cashDelta || tx?.amountInr || 0));
+      const columns = [
+        'wallet_id',
+        'transaction_type',
+        'amount',
+        'balance_before',
+        'balance_after',
+        'reference_type',
+        'reference_id',
+        'description',
+        'idempotency_key',
+      ];
       const params = [
         walletContext?.walletId || null,
         txType,
@@ -729,12 +768,15 @@ class PgWalletRepository {
         tx?.reason || tx?.type || 'wallet_tx',
         txId,
       ];
+      if (walletTxColumns.has('metadata')) {
+        columns.push('metadata');
+        params.push(JSON.stringify(tx || {}));
+      }
       await client.query(
         `INSERT INTO wallet_transactions
-           (wallet_id, transaction_type, amount, balance_before, balance_after,
-            reference_type, reference_id, description, idempotency_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        params
+           (${columns.join(', ')})
+         VALUES (${params.map((_, index) => `$${index + 1}`).join(', ')})`,
+        params,
       );
       return;
     }

@@ -15,19 +15,21 @@ class PgDriverRepository {
          d.id                                                       AS "driverId",
          dup.user_id                                                AS "userId",
          COALESCE(dup.display_name, dup.phone_number, d.id::text)  AS name,
-         d.onboarding_status                                        AS status,
+         dup.phone_number                                           AS "phoneNumber",
+         COALESCE(dup.onboarding_status, d.onboarding_status)       AS status,
          d.is_eligible,
          d.home_city,
-         v.vehicle_number                                           AS "vehicleNumber",
-         vt.name                                                    AS "vehicleType",
-         COALESCE(dr.average_rating, 5.0)                          AS rating,
-         COALESCE(dr.acceptance_rate, 1.0)                         AS "acceptanceRate",
-         COALESCE(dr.completion_rate, 1.0)                         AS "completionRate"
+         COALESCE(dup.vehicle_number, v.license_plate)              AS "vehicleNumber",
+         COALESCE(dup.vehicle_type, vt.name)                        AS "vehicleType",
+         dup.avatar_url                                             AS "avatarUrl",
+         COALESCE(dup.completed_rides_count, 0)                     AS "completedRides",
+         COALESCE(dup.average_rating, 5.0)                          AS rating,
+         COALESCE(dup.acceptance_rate, 1.0)                         AS "acceptanceRate",
+         COALESCE(dup.completion_rate, 1.0)                         AS "completionRate"
        FROM drivers d
        LEFT JOIN driver_user_projection dup ON dup.driver_id = d.id
        LEFT JOIN vehicles v       ON v.driver_id = d.id AND v.is_primary = true
        LEFT JOIN vehicle_types vt ON vt.id = v.vehicle_type_id
-       LEFT JOIN driver_ratings dr ON dr.driver_id = d.id
        WHERE d.onboarding_status = 'approved'
          AND COALESCE(dup.status, 'active') <> 'deleted'
        ORDER BY d.created_at DESC LIMIT $1`,
@@ -42,18 +44,20 @@ class PgDriverRepository {
          d.id                                                       AS "driverId",
          dup.user_id                                                AS "userId",
          COALESCE(dup.display_name, dup.phone_number, d.id::text)  AS name,
-         d.onboarding_status                                        AS status,
+         dup.phone_number                                           AS "phoneNumber",
+         COALESCE(dup.onboarding_status, d.onboarding_status)       AS status,
          d.is_eligible,
-         v.vehicle_number                                           AS "vehicleNumber",
-         vt.name                                                    AS "vehicleType",
-         COALESCE(dr.average_rating, 5.0)                          AS rating,
-         COALESCE(dr.acceptance_rate, 1.0)                         AS "acceptanceRate",
-         COALESCE(dr.completion_rate, 1.0)                         AS "completionRate"
+         COALESCE(dup.vehicle_number, v.license_plate)              AS "vehicleNumber",
+         COALESCE(dup.vehicle_type, vt.name)                        AS "vehicleType",
+         dup.avatar_url                                             AS "avatarUrl",
+         COALESCE(dup.completed_rides_count, 0)                     AS "completedRides",
+         COALESCE(dup.average_rating, 5.0)                          AS rating,
+         COALESCE(dup.acceptance_rate, 1.0)                         AS "acceptanceRate",
+         COALESCE(dup.completion_rate, 1.0)                         AS "completionRate"
        FROM drivers d
        LEFT JOIN driver_user_projection dup ON dup.driver_id = d.id
        LEFT JOIN vehicles v       ON v.driver_id = d.id AND v.is_primary = true
        LEFT JOIN vehicle_types vt ON vt.id = v.vehicle_type_id
-       LEFT JOIN driver_ratings dr ON dr.driver_id = d.id
        WHERE d.id::text = $1 OR dup.user_id::text = $1
        LIMIT 1`,
       [driverId]
@@ -63,17 +67,29 @@ class PgDriverRepository {
 
   async updateDriverStatus(driverId, status) {
     // status here maps to onboarding_status or is_eligible flag
-    const isAvailabilityStatus = ['online', 'offline', 'busy'].includes(status);
+    const normalizedStatus = String(status || '').trim().toLowerCase();
+    const isAvailabilityStatus = ['online', 'offline', 'busy', 'on_trip', 'on_ride'].includes(normalizedStatus);
 
     if (isAvailabilityStatus) {
-      // Track availability via driver_availability table if it exists, else no-op
+      const isAvailable = normalizedStatus === 'online';
+      const availabilityStatus = isAvailable ? 'active' : normalizedStatus;
+
       await domainDb.query('drivers', 
-        `INSERT INTO driver_availability (driver_id, is_online, updated_at)
+        `INSERT INTO driver_availability (driver_id, is_available, updated_at)
          VALUES ($1, $2, NOW())
          ON CONFLICT (driver_id)
-         DO UPDATE SET is_online = $2, updated_at = NOW()`,
-        [driverId, status === 'online']
+         DO UPDATE SET is_available = $2, updated_at = NOW()`,
+        [driverId, isAvailable]
       ).catch(() => {}); // non-fatal if table doesn't exist yet
+
+      await domainDb.query(
+        'drivers',
+        `UPDATE driver_user_projection
+         SET status = $2,
+             updated_at = NOW()
+         WHERE driver_id::text = $1 OR user_id::text = $1`,
+        [driverId, availabilityStatus]
+      ).catch(() => {});
     } else {
       await domainDb.query('drivers', 
         `UPDATE drivers SET onboarding_status = $2, updated_at = NOW()
@@ -85,10 +101,10 @@ class PgDriverRepository {
 
   async updateDriverRating(driverId, newRating) {
     await domainDb.query('drivers', 
-      `INSERT INTO driver_ratings (driver_id, average_rating)
-       VALUES ($1, $2)
-       ON CONFLICT (driver_id)
-       DO UPDATE SET average_rating = $2, updated_at = NOW()`,
+      `UPDATE driver_user_projection
+       SET average_rating = $2,
+           updated_at = NOW()
+       WHERE driver_id::text = $1 OR user_id::text = $1`,
       [driverId, newRating]
     ).catch(() => {}); // non-fatal if table doesn't exist yet
   }

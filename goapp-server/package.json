@@ -8,6 +8,9 @@
     "start:dev":        "NODE_ENV=development node server.js",
     "start:test":       "NODE_ENV=test node server.js",
     "start:prod":       "NODE_ENV=production node server.js",
+    "dev:seed-drivers": "node scripts/dev-seed-drivers.js",
+    "dev:reset-test-data": "node scripts/dev-reset-test-data.js",
+    "dev:reset-test-data:dry-run": "node scripts/dev-reset-test-data.js --dry-run true",
     "docker:setup":     "bash scripts/setup-docker.sh",
     "docker:up":        "docker compose up -d --build",
     "docker:down":      "docker compose down",
@@ -27,9 +30,12 @@
     "check:architecture": "node scripts/check-architecture.js",
     "check:secrets": "node scripts/check-secrets.js",
     "check:ci": "npm run check:architecture && npm run check:secrets",
-    "test":             "NODE_ENV=test node --require ./config/env-loader.js --test --test-force-exit tests/integration/*.test.js",
+    "test":             "npm run test:integration",
     "test:unit":        "echo \"Unit/mock tests removed. Use npm run test:integration\"",
-    "test:integration": "NODE_ENV=test node --require ./config/env-loader.js --test --test-force-exit tests/integration/*.test.js"
+    "test:integration": "npm run test:integration:base && npm run test:dev-verification",
+    "test:integration:all": "NODE_ENV=test node --require ./config/env-loader.js --test --test-force-exit tests/integration/*.test.js",
+    "test:integration:base": "NODE_ENV=test node --require ./config/env-loader.js --test --test-force-exit tests/integration/db.integration.test.js tests/integration/dev-reset-service.integration.test.js tests/integration/matching-engine-dev.integration.test.js tests/integration/redis.integration.test.js tests/integration/refresh-token-security.integration.test.js tests/integration/response-envelope.integration.test.js",
+    "test:dev-verification": "npm run dev:seed-drivers && NODE_ENV=test node --require ./config/env-loader.js --test --test-concurrency=1 --test-force-exit tests/integration/driver-avatar.integration.test.js tests/integration/ride-request-dev.integration.test.js"
   },
   "dependencies": {
     "@googlemaps/google-maps-services-js": "^3.4.0",

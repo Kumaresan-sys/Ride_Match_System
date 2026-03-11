@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+      <rect width="256" height="256" rx="40" fill="#E5E7EB"/>
+      <circle cx="128" cy="98" r="52" fill="#B91C1C"/>
+      <circle cx="128" cy="94" r="26" fill="#F8FAFC"/>
+      <path d="M58 214c9-38 39-60 70-60s61 22 70 60" fill="#B91C1C" opacity="0.92"/>
+      <text x="128" y="236" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#111827">MINI</text>
+      <text x="128" y="108" text-anchor="middle" font-family="Arial, sans-serif" font-size="26" font-weight="700" fill="#111827">EM</text>
+    </svg>

@@ -36,6 +36,14 @@ CREATE TABLE IF NOT EXISTS driver_documents (
                         CHECK (document_type IN ('license','rc_book','insurance','permit',
                                                  'aadhar','pan','profile_photo','vehicle_photo')),
     document_url        TEXT NOT NULL,
+    storage_backend     VARCHAR(32) NOT NULL DEFAULT 'local',
+    storage_key         TEXT,
+    stored_path         TEXT,
+    mime_type           VARCHAR(255),
+    file_size_bytes     BIGINT,
+    checksum_sha256     VARCHAR(128),
+    original_filename   VARCHAR(255),
+    is_active           BOOLEAN NOT NULL DEFAULT true,
     document_number     VARCHAR(100),
     expiry_date         DATE,
     verification_status VARCHAR(20) DEFAULT 'pending'
@@ -43,9 +51,13 @@ CREATE TABLE IF NOT EXISTS driver_documents (
     rejection_reason    TEXT,
     verified_by         UUID REFERENCES users(id),
     verified_at         TIMESTAMPTZ,
-    uploaded_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    uploaded_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_driver_docs ON driver_documents(driver_id, document_type);
+CREATE INDEX IF NOT EXISTS idx_driver_docs_profile_photo_active
+  ON driver_documents(driver_id, uploaded_at DESC)
+  WHERE document_type = 'profile_photo' AND is_active = true;
 
 CREATE TABLE IF NOT EXISTS driver_background_checks (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),

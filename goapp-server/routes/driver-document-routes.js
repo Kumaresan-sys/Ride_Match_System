@@ -27,7 +27,12 @@ function registerDriverDocumentRoutes(router, ctx) {
 
     const auth = await getAuthenticatedSession(requireAuth, reqHeaders);
     if (auth.error) return auth.error;
-    if (auth.session.userId !== driverId) {
+    const resolved = await docService.resolveDriverAccess(driverId).catch(() => null);
+    const ownerUserId = resolved?.userId || null;
+    if (
+      String(auth.session.userId || '') !== String(driverId || '') &&
+      String(auth.session.userId || '') !== String(ownerUserId || '')
+    ) {
       return forbiddenError('Forbidden: cannot access another driver documents.', 'FORBIDDEN_DRIVER_DOCUMENT_ACCESS');
     }
     return null;
@@ -74,7 +79,7 @@ function registerDriverDocumentRoutes(router, ctx) {
   router.register('GET', '/api/v1/drivers/:driverId/documents', async ({ pathParams, headers }) => {
     const accessError = await ensureDocumentAccess(headers, pathParams.driverId);
     if (accessError) return accessError;
-    const result = docService.listDocuments(pathParams.driverId);
+    const result = await docService.listDocuments(pathParams.driverId);
     return { data: result };
   });
 
@@ -84,7 +89,7 @@ function registerDriverDocumentRoutes(router, ctx) {
     const accessError = await ensureDocumentAccess(headers, driverId);
     if (accessError) return accessError;
 
-    const result = docService.getDocument(driverId, docId);
+    const result = await docService.getDocument(driverId, docId);
     if (!result.success) {
       return buildErrorFromResult(result, {
         status: result.status || 404,
@@ -129,7 +134,7 @@ function registerDriverDocumentRoutes(router, ctx) {
 
     if (!status) return badRequest('status is required', 'VALIDATION_ERROR');
 
-    const result = docService.verifyDocument(docId, status, rejection_reason || null, verified_by || 'admin');
+    const result = await docService.verifyDocument(docId, status, rejection_reason || null, verified_by || null);
     if (!result.success) {
       return buildErrorFromResult(result, {
         status: result.status || 400,

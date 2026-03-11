@@ -1,10 +1,13 @@
 'use strict';
 
 const pgRepo = require('../repositories/pg/pg-identity-repository');
+const domainProjectionService = require('./domain-projection-service');
+const { logger } = require('../utils/logger');
 
 class ProfileService {
-  upsertUserProfileWithEmail(payload) {
-    return pgRepo.upsertUserProfileWithEmail(payload);
+  async upsertUserProfileWithEmail(payload) {
+    await pgRepo.upsertUserProfileWithEmail(payload);
+    await this._syncRiderProjection(payload?.userId, 'profile_upsert');
   }
 
   getUserProfile(userId) {
@@ -15,8 +18,9 @@ class ProfileService {
     return pgRepo.getUserById(userId);
   }
 
-  updateProfileFields(payload) {
-    return pgRepo.updateProfileFields(payload);
+  async updateProfileFields(payload) {
+    await pgRepo.updateProfileFields(payload);
+    await this._syncRiderProjection(payload?.userId, 'profile_update');
   }
 
   awardWelcomeBonus(userId) {
@@ -25,6 +29,21 @@ class ProfileService {
 
   generateOrGetReferralCode(userId) {
     return pgRepo.generateOrGetReferralCode(userId);
+  }
+
+  async _syncRiderProjection(userId, source) {
+    if (!userId) return;
+    try {
+      const syncResult = await domainProjectionService.syncRiderByUserId(userId);
+      if (!syncResult?.synced) {
+        logger.warn(
+          'PROFILE',
+          `Rider projection sync incomplete after ${source} for user ${userId}: ${syncResult?.reason || 'unknown'}`,
+        );
+      }
+    } catch (err) {
+      logger.warn('PROFILE', `Rider projection sync failed after ${source} for user ${userId}: ${err.message}`);
+    }
   }
 }
 

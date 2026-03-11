@@ -8,6 +8,9 @@ const TOPICS = {
   RIDE_CANCELLED: 'ride_cancelled',
   DRIVER_LOCATION_UPDATED: 'driver_location_updated',
   PAYMENT_COMPLETED: 'payment_completed',
+  RIDE_CHAT_MESSAGE_CREATED: 'ride_chat_message_created',
+  RIDE_CHAT_RECEIPT_UPDATED: 'ride_chat_receipt_updated',
+  RIDE_CHAT_CONVERSATION_STATE_CHANGED: 'ride_chat_conversation_state_changed',
   WALLET_UPDATED: 'wallet_updated',
   IDENTITY_PROFILE_UPDATED: 'identity_profile_updated',
   DRIVER_PROFILE_UPDATED: 'driver_profile_updated',
@@ -21,10 +24,14 @@ const EVENT_TO_TOPIC = {
   ride_completed: TOPICS.RIDE_COMPLETED,
   ride_cancelled_by_rider: TOPICS.RIDE_CANCELLED,
   ride_cancelled_by_driver: TOPICS.RIDE_CANCELLED,
+  ride_chat_message_created: TOPICS.RIDE_CHAT_MESSAGE_CREATED,
+  ride_chat_receipt_updated: TOPICS.RIDE_CHAT_RECEIPT_UPDATED,
+  ride_chat_conversation_state_changed: TOPICS.RIDE_CHAT_CONVERSATION_STATE_CHANGED,
   driver_location_update: TOPICS.DRIVER_LOCATION_UPDATED,
   payment_verified: TOPICS.PAYMENT_COMPLETED,
   wallet_updated: TOPICS.WALLET_UPDATED,
   otp_verified: TOPICS.IDENTITY_PROFILE_UPDATED,
+  driver_profile_updated: TOPICS.DRIVER_PROFILE_UPDATED,
   driver_wallet_recharged: TOPICS.DRIVER_PROFILE_UPDATED,
   driver_wallet_low: TOPICS.DRIVER_PROFILE_UPDATED,
   driver_ride_eligible: TOPICS.DRIVER_PROFILE_UPDATED,
@@ -37,6 +44,7 @@ function mapEventToTopic(eventName) {
 }
 
 function keyForTopic(topic, payload = {}) {
+  if (topic.startsWith('ride_chat_')) return payload.conversationId || payload.rideId || null;
   if (topic.startsWith('ride_')) return payload.rideId || payload.riderId || null;
   if (topic.startsWith('driver_')) return payload.driverId || null;
   if (topic.startsWith('payment_')) return payload.paymentId || payload.orderId || null;

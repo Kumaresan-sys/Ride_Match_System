@@ -91,14 +91,37 @@ class PgLocationRepository {
 
   // ─── Ride live location ───────────────────────────────────────────────────
 
-  async recordRideLiveLocation(rideId, driverId, { lat, lng, speed, heading }) {
+  async recordRideLiveLocation(
+    rideId,
+    driverId,
+    { lat, lng, speed, heading },
+  ) {
     const driverDbId = await resolveDriverDbId(driverId);
     if (!driverDbId) return;
 
-    await domainDb.query('drivers', 
-      `INSERT INTO ride_live_locations (ride_id, driver_id, location, speed_kmh, heading)
-       VALUES ($1, $2, ST_SetSRID(ST_MakePoint($4, $3), 4326), $5, $6)`,
-      [rideId, driverDbId, lat, lng, speed || 0, heading || 0]
+    await domainDb.query('rides',
+      `INSERT INTO ride_live_locations (
+         ride_id,
+         driver_id,
+         location,
+         speed_kmh,
+         heading
+       )
+       VALUES (
+         $1,
+         $2,
+         ST_SetSRID(ST_MakePoint($4, $3), 4326),
+         $5,
+         $6
+       )`,
+      [
+        rideId,
+        driverDbId,
+        lat,
+        lng,
+        speed || 0,
+        heading || 0,
+      ]
     ).catch(() => {});
   }
 

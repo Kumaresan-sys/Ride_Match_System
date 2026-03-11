@@ -41,6 +41,9 @@ const zoneCatalogService = require('./services/zone-catalog-service');
 const zoneMappingService = require('./services/zone-mapping-service');
 const zoneMetricsService = require('./services/zone-metrics-service');
 const rideCancellationReasonService = require('./services/ride-cancellation-reason-service');
+const devDriverSeedService = require('./services/dev-driver-seed-service');
+const ChatMediaStorageService = require('./services/chat-media-storage-service');
+const RideChatService = require('./services/ride-chat-service');
 const { applySecurityHeaders, parseJsonBody, readRawBody } = require('./middleware/http-middleware');
 const { parseMultipart } = require('./middleware/multipart-parser');
 const DocumentStorageService = require('./services/document-storage-service');
@@ -70,6 +73,12 @@ const MAX_FILE_UPLOAD_BYTES = config.storage.maxFileSizeBytes || (10 * 1024 * 10
 // Instantiate document storage once at module load
 const documentStorageService = new DocumentStorageService(config);
 const driverDocumentService = new DriverDocumentService(documentStorageService);
+const chatMediaStorageService = new ChatMediaStorageService(config);
+const rideChatService = new RideChatService({
+  rideService,
+  notificationService,
+  storageService: chatMediaStorageService,
+});
 const authRuntimeStats = {
   legacyTokenAccepted: 0,
   metrics: {
@@ -205,6 +214,7 @@ function startAPIServer(port, runtime = {}) {
       perfMonitor,
       razorpayService,
       driverDocumentService,
+      rideChatService,
       notificationService,
       profileService,
       safetyService,
@@ -215,6 +225,7 @@ function startAPIServer(port, runtime = {}) {
       googleMapsService,
       smsService,
       infra: runtime.infra || null,
+      wsServer: runtime.wsServer || null,
       modules,
     },
   });
@@ -318,16 +329,40 @@ function startAPIServer(port, runtime = {}) {
 
         logger.info('RAZORPAY', `Webhook received: ${eventName} | order: ${orderId || 'n/a'}`);
 
-        if ((eventName === 'payment.captured' || eventName === 'payment.authorized') && orderId) {
-          const order = razorpayService.getOrder(orderId);
-          if (order && order.status !== 'paid') {
-            // Credit the appropriate wallet
-            if (order.userType === 'rider') {
-              walletService.topupWallet(order.userId, order.amountInr, 'razorpay_webhook', payment.id);
-              logger.success('RAZORPAY', `Webhook: credited ₹${order.amountInr} to rider ${order.userId}`);
-            } else if (order.userType === 'driver') {
-              driverWalletService.rechargeWallet(order.userId, order.amountInr, 'razorpay_webhook', payment.id);
-              logger.success('RAZORPAY', `Webhook: credited ₹${order.amountInr} to driver ${order.userId}`);
+        if (orderId) {
+          const riderResult = await walletService.processRazorpayWebhook(event, {
+            signature: sig,
+            requestId,
+          });
+          if (riderResult?.handled) {
+            await redis.setIdempotency(
+              `payment_webhook:${webhookEventId}`,
+              { event: eventName, orderId, handled: true },
+              24 * 3600
+            );
+            writeJson(200, {
+              received: true,
+              event: eventName,
+              duplicate: riderResult.duplicate === true,
+              requestId,
+            });
+            doneWebhook();
+            return;
+          }
+
+          if (eventName === 'payment.captured' || eventName === 'payment.authorized') {
+            const order = await razorpayService.getOrder(orderId);
+            if (order && order.status !== 'paid' && order.userType === 'driver') {
+              const recharge = await driverWalletService.rechargeWallet(
+                order.userId,
+                order.amountInr,
+                'razorpay_webhook',
+                payment.id,
+                `rzp_driver_webhook:${payment.id}`
+              );
+              if (recharge?.success) {
+                logger.success('RAZORPAY', `Webhook: credited ₹${order.amountInr} to driver ${order.userId}`);
+              }
             }
           }
         }
@@ -599,6 +634,13 @@ async function main() {
   const infrastructure = await bootstrapArchitecture({ eventBus });
   const modules = bootstrapModules();
 
+  const devSeedResult = await devDriverSeedService.seedDriversOnBoot();
+  if (devSeedResult?.success) {
+    logger.info('BOOT', `Development driver seed completed (${devSeedResult.count} drivers).`);
+  } else if (!devSeedResult?.skipped) {
+    logger.warn('BOOT', `Development driver seed returned without success: ${JSON.stringify(devSeedResult)}`);
+  }
+
   logger.info('BOOT', `Architecture flags => MATCHING_V2=${String(config.architecture.featureFlags.matchingV2)} REDIS_STATE_V2=${String(config.architecture.featureFlags.redisStateV2)} KAFKA_OUTBOX=${String(config.architecture.featureFlags.kafkaOutbox)} KAFKA_OUTBOX_RELAY_WORKER=${String(config.architecture.featureFlags.kafkaOutboxRelayWorker)} KAFKA_DOMAIN_PROJECTION_WORKER=${String(config.architecture.featureFlags.kafkaDomainProjectionWorker)}`);
   logger.info('BOOT', `Domain modules loaded: ${modules.modules.map(m => m.name).join(', ')}`);
 
@@ -628,24 +670,51 @@ async function main() {
     worker.start().catch((err) => logger.error('BOOT', `notification worker start failed: ${err.message}`));
   }
 
-  const apiServer = startAPIServer(config.server.port, { infra: infrastructure, modules });
-
   const wsServer = new WebSocketServer({
     authTimeoutMs: config.security.wsAuthTimeoutMs,
     authenticateToken: async (token) => {
+      const adminCheck = requireAdmin({ 'x-admin-token': token });
+      if (!adminCheck) {
+        return { userId: 'admin', userType: 'admin', isAdmin: true };
+      }
       const payload = tokenService.verifyAccessToken(token);
       if (!payload?.sessionToken) return null;
       const session = await identityService.validateSession(payload.sessionToken);
       if (!session) return null;
       if (String(session.userId) !== String(payload.userId)) return null;
-      return { userId: session.userId, sessionToken: session.sessionToken };
+      return { userId: session.userId, sessionToken: session.sessionToken, userType: 'rider', isAdmin: false };
     },
-    canAccessRide: (userId, rideId) => {
-      const ride = rideService.getRide(rideId);
+    canAccessRide: async (userId, rideId, options = {}) => {
+      if (options?.isAdmin) return true;
+      const ride = await rideService.getRideAsync(rideId).catch(() => null);
       if (!ride) return false;
       return String(ride.riderId) === String(userId) || String(ride.driverId) === String(userId);
     },
+    canAccessConversation: (userId, conversationId, options = {}) => {
+      return rideChatService.canUserAccessConversation(conversationId, userId, options);
+    },
   });
+  rideChatService.setWebSocketServer(wsServer);
+  wsServer.onMessage = (socketId, message) => {
+    rideChatService.handleWebSocketMessage(socketId, message);
+  };
+  wsServer.onSubscribe = (socketId, channel) => {
+    return Promise.allSettled([
+      rideChatService.handleChannelSubscribed(socketId, channel),
+    ]);
+  };
+  wsServer.onUnsubscribe = (socketId, channel) => {
+    return Promise.allSettled([
+      rideChatService.handleChannelUnsubscribed(socketId, channel),
+    ]);
+  };
+
+  const apiServer = startAPIServer(config.server.port, {
+    infra: infrastructure,
+    modules,
+    wsServer,
+  });
+
   wsServer.start(config.server.wsPort);
   if (wsServer.server && typeof wsServer.server.on === 'function') {
     wsServer.server.on('error', (err) => logger.error('WS', `WebSocket server error: ${err.message}`));

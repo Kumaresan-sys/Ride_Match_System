@@ -119,6 +119,15 @@ class RedisStateStore {
     }
     const current = await this.redis.get(lockKey);
     const holder = current ? String(current).split(':')[0] : null;
+    if (holder && String(holder) === String(ownerId)) {
+      return {
+        acquired: true,
+        holder,
+        lockValue: current,
+        lockToken: current,
+        reused: true,
+      };
+    }
     return { acquired: false, holder, lockValue: null, lockToken: null };
   }
 

@@ -2,6 +2,7 @@ const SimpleRouter = require('./simple-router');
 const registerSystemRoutes = require('./system-routes');
 const registerAuthRoutes = require('./auth-routes');
 const registerRideRoutes = require('./ride-routes');
+const registerRideChatRoutes = require('./ride-chat-routes');
 const registerWalletRoutes = require('./wallet-routes');
 const registerCoinsRoutes = require('./coins-routes');
 const registerFeedbackRoutes = require('./feedback-routes');
@@ -34,6 +35,7 @@ function buildRouteDispatcher(context) {
   registerDriverRoutes(router, context);
   registerTicketRoutes(router, context);
   registerRideRoutes(router, context);
+  registerRideChatRoutes(router, context);
   registerCancelRideRoutes(router, context);
   registerCoinsRoutes(router, context);
   registerWalletRoutes(router, context);

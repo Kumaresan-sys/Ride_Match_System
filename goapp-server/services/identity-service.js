@@ -8,6 +8,7 @@ const config = require('../config');
 const { logger, eventBus } = require('../utils/logger');
 
 const pgRepo = require('../repositories/pg/pg-identity-repository');
+const domainProjectionService = require('./domain-projection-service');
 
 // OTP rate limit constants
 const OTP_RATE_MAX           = 5;
@@ -163,6 +164,19 @@ class IdentityService {
       refreshTokenHash,
       sessionExpiresAt,
     });
+
+    try {
+      const syncResult = await domainProjectionService.syncRiderByUserId(user.id);
+      if (!syncResult?.synced) {
+        logger.warn(
+          'IDENTITY',
+          `Rider projection sync incomplete after login for user ${user.id}: ${syncResult?.reason || 'unknown'}`,
+        );
+      }
+    } catch (err) {
+      logger.warn('IDENTITY', `Rider projection sync failed after login for user ${user.id}: ${err.message}`);
+    }
+
     this._storeSession({
       sessionToken,
       refreshToken,

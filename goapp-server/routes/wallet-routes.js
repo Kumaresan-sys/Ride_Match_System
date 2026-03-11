@@ -32,9 +32,7 @@ function registerWalletRoutes(router, ctx) {
       pathParams.userId,
       parseInt(params.get('limit') || '50', 10)
     );
-    return {
-      data: { transactions },
-    };
+    return { data: transactions };
   });
 
   router.register('POST', '/api/v1/wallet/:userId/pay', async ({ pathParams, body, headers }) => {
@@ -98,9 +96,6 @@ function registerWalletRoutes(router, ctx) {
   });
 
   router.register('POST', '/api/v1/wallet/:userId/topup', async ({ pathParams, body, headers }) => {
-    const auth = await ensureWalletOwner(headers, pathParams.userId);
-    if (auth.error) return auth.error;
-
     const parsed = validateSchema(body, [
       { key: 'amount', type: 'number', required: true, min: 1, max: 50000 },
       { key: 'method', type: 'string', required: false, enum: ['upi', 'card', 'netbanking', 'razorpay', 'admin'] },
@@ -108,6 +103,24 @@ function registerWalletRoutes(router, ctx) {
       { key: 'idempotencyKey', type: 'string', required: false, minLength: 8, maxLength: 128 },
     ]);
     if (!parsed.ok) return validationError(parsed.error);
+
+    const adminErr = ctx.requireAdmin(headers);
+    if (adminErr) {
+      const auth = await ensureWalletOwner(headers, pathParams.userId);
+      if (auth.error) return auth.error;
+      return buildErrorFromResult(
+        {
+          success: false,
+          code: 'DIRECT_WALLET_TOPUP_DISABLED',
+          error: 'Direct wallet top-up is disabled. Use Razorpay order creation and verification endpoints.',
+        },
+        {
+          status: 409,
+          defaultCode: 'DIRECT_WALLET_TOPUP_DISABLED',
+          defaultMessage: 'Direct wallet top-up is disabled.',
+        }
+      );
+    }
 
     const idempotencyKey = String(
       parsed.data.idempotencyKey
