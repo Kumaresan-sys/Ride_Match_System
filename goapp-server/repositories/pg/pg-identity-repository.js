@@ -21,6 +21,31 @@ class PgIdentityRepository {
     };
   }
 
+  async _ensureRiderArtifacts(client, userId) {
+    const { rows } = await client.query(
+      `INSERT INTO riders (user_id)
+       VALUES ($1)
+       ON CONFLICT (user_id)
+       DO UPDATE SET user_id = EXCLUDED.user_id
+       RETURNING id`,
+      [userId]
+    );
+    const riderId = rows[0]?.id || null;
+    if (!riderId) return null;
+
+    await client.query(
+      `INSERT INTO rider_profiles (rider_id) VALUES ($1)
+       ON CONFLICT DO NOTHING`,
+      [riderId]
+    );
+    await client.query(
+      `INSERT INTO rider_loyalty_points (rider_id) VALUES ($1)
+       ON CONFLICT DO NOTHING`,
+      [riderId]
+    );
+    return riderId;
+  }
+
   _trackLogoutLookupFailure({ domain, lookup, userId, error }) {
     const key = `${domain}:${lookup}`;
     const current = Number(this._logoutLookupFailureMetrics[key] || 0);
@@ -187,6 +212,8 @@ class PgIdentityRepository {
 
   async upsertUserProfileWithEmail({ userId, name, gender, dateOfBirth, emergencyContact, email }) {
     const client = await domainDb.getClient('identity');
+    let riderId = null;
+    let committed = false;
     try {
       await client.query('BEGIN');
 
@@ -218,25 +245,37 @@ class PgIdentityRepository {
         }
       }
 
-      // Ensure GoCoins wallet exists with balance = 0 (reward points — not real money)
-      await client.query(
-        `INSERT INTO coin_wallets (user_id, balance, lifetime_earned)
-         VALUES ($1, 0, 0)
-         ON CONFLICT (user_id) DO NOTHING`,
-        [userId]
-      );
-
-      // Ensure real cash wallet exists with cash_balance = 0 (recharge + ride payments)
-      await client.query(
-        `INSERT INTO rider_wallets (rider_id, cash_balance, coin_balance)
-         SELECT id, 0.00, 0 FROM riders WHERE user_id = $1
-         ON CONFLICT (rider_id) DO NOTHING`,
-        [userId]
-      );
+      riderId = await this._ensureRiderArtifacts(client, userId);
 
       await client.query('COMMIT');
+      committed = true;
+
+      if (riderId) {
+        await domainDb.withTransaction('payments', async (paymentsClient) => {
+          await paymentsClient.query(
+            `INSERT INTO wallets (user_id, balance, promo_balance, currency, status)
+             VALUES ($1, 0, 0, 'INR', 'active')
+             ON CONFLICT (user_id) DO NOTHING`,
+            [userId]
+          );
+          await paymentsClient.query(
+            `INSERT INTO coin_wallets (user_id, balance, lifetime_earned, lifetime_redeemed)
+             VALUES ($1, 0, 0, 0)
+             ON CONFLICT (user_id) DO NOTHING`,
+            [userId]
+          );
+          await paymentsClient.query(
+            `INSERT INTO rider_wallets (rider_id, cash_balance, coin_balance)
+             VALUES ($1, 0.00, 0)
+             ON CONFLICT (rider_id) DO NOTHING`,
+            [riderId]
+          );
+        });
+      }
     } catch (err) {
-      await client.query('ROLLBACK');
+      if (!committed) {
+        await client.query('ROLLBACK');
+      }
       throw err;
     } finally {
       client.release();
@@ -330,24 +369,7 @@ class PgIdentityRepository {
 
       // Ensure a riders row (+ profile + loyalty) exists so wallet/ride FKs resolve
       if (user.user_type === 'rider') {
-        const { rows: riderRows } = await client.query(
-          `INSERT INTO riders (user_id) VALUES ($1)
-           ON CONFLICT (user_id) DO NOTHING
-           RETURNING id`,
-          [user.id]
-        );
-        if (riderRows[0]?.id) {
-          await client.query(
-            `INSERT INTO rider_profiles (rider_id) VALUES ($1)
-             ON CONFLICT DO NOTHING`,
-            [riderRows[0].id]
-          );
-          await client.query(
-            `INSERT INTO rider_loyalty_points (rider_id) VALUES ($1)
-             ON CONFLICT DO NOTHING`,
-            [riderRows[0].id]
-          );
-        }
+        await this._ensureRiderArtifacts(client, user.id);
       }
 
       await client.query('COMMIT');
@@ -438,24 +460,7 @@ class PgIdentityRepository {
       );
 
       if (user.user_type === 'rider') {
-        const { rows: riderRows } = await client.query(
-          `INSERT INTO riders (user_id) VALUES ($1)
-           ON CONFLICT (user_id) DO NOTHING
-           RETURNING id`,
-          [user.id]
-        );
-        if (riderRows[0]?.id) {
-          await client.query(
-            `INSERT INTO rider_profiles (rider_id) VALUES ($1)
-             ON CONFLICT DO NOTHING`,
-            [riderRows[0].id]
-          );
-          await client.query(
-            `INSERT INTO rider_loyalty_points (rider_id) VALUES ($1)
-             ON CONFLICT DO NOTHING`,
-            [riderRows[0].id]
-          );
-        }
+        await this._ensureRiderArtifacts(client, user.id);
       }
 
       let deviceRecord = null;
@@ -1008,9 +1013,16 @@ class PgIdentityRepository {
 
     const riderId = riderRows[0].id;
     const BONUS = 100;
-    const client = await domainDb.getClient('identity');
+    const client = await domainDb.getClient('payments');
     try {
       await client.query('BEGIN');
+
+      await client.query(
+        `INSERT INTO coin_wallets (user_id, balance, lifetime_earned, lifetime_redeemed)
+         VALUES ($1, 0, 0, 0)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [userId]
+      );
 
       // Lock the wallet row (wallet guaranteed to exist from upsertUserProfileWithEmail)
       const { rows: walletRows } = await client.query(
@@ -1046,15 +1058,18 @@ class PgIdentityRepository {
         [wallet.id, balanceAfter, BONUS]
       );
 
-      // Mark bonus claimed on rider if the column exists in this schema version.
+      await client.query('COMMIT');
+
+      // Mark bonus claimed on rider in identity_db after the wallet transaction commits.
       if (hasWelcomeBonusClaimed) {
-        await client.query(
+        await domainDb.query(
+          'identity',
           `UPDATE riders SET welcome_bonus_claimed = true WHERE id = $1`,
-          [riderId]
-        );
+          [riderId],
+          { role: 'writer', strongRead: true }
+        ).catch(() => {});
       }
 
-      await client.query('COMMIT');
       return { coinsAwarded: BONUS, alreadyClaimed: false };
     } catch (err) {
       await client.query('ROLLBACK');

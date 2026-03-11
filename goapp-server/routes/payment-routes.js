@@ -37,7 +37,7 @@ function registerPaymentRoutes(router, ctx) {
     const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
-    const { userId, amountInr } = body;
+    const { userId, amountInr, method, provider } = body;
     if (!userId) return badRequest('userId is required', 'VALIDATION_ERROR');
     if (auth.session.userId !== userId) {
       return forbiddenError('Forbidden: userId must match authenticated user.', 'FORBIDDEN_USER_MISMATCH');
@@ -46,12 +46,11 @@ function registerPaymentRoutes(router, ctx) {
       return badRequest('amountInr must be ≥ 1', 'VALIDATION_ERROR');
     }
 
-    const result = await razorpay.createOrder({
-      amountInr: parseFloat(amountInr),
-      userId,
-      userType: 'rider',
-      receipt: `rider_${userId}_${Date.now()}`,
-      notes: { purpose: 'wallet_recharge', platform: 'goapp' },
+    const result = await walletSvc.createRazorpayTopupOrder(userId, parseFloat(amountInr), {
+      method: method || 'upi',
+      provider: provider || null,
+      requestId: headers['x-request-id'] || null,
+      idempotencyKey: headers['idempotency-key'] || headers['x-idempotency-key'] || null,
     });
 
     if (!result.success) {
@@ -79,10 +78,11 @@ function registerPaymentRoutes(router, ctx) {
       );
     }
 
-    const verification = await razorpay.verifyPayment({
+    const verification = await walletSvc.verifyRazorpayTopup(auth.session.userId, {
       razorpayOrderId,
       razorpayPaymentId,
       razorpaySignature,
+      requestId: headers['x-request-id'] || null,
     });
 
     if (!verification.success) {
@@ -92,20 +92,8 @@ function registerPaymentRoutes(router, ctx) {
         defaultMessage: 'Unable to verify rider payment.',
       });
     }
-    if (auth.session.userId !== verification.userId) {
-      return forbiddenError('Forbidden: cannot verify payment for another user.', 'FORBIDDEN_PAYMENT_ACCESS');
-    }
-
-    // Credit rider wallet cash balance
-    const topup = await walletSvc.topupWallet(
-      verification.userId,
-      verification.amountInr,
-      'razorpay',
-      razorpayPaymentId,
-      `rzp_rider_verify:${razorpayPaymentId}`,
-    );
     eventBus.publish('payment_processed', {
-      userId: verification.userId,
+      userId: auth.session.userId,
       userType: 'rider',
       orderId: razorpayOrderId,
       paymentId: razorpayPaymentId,
@@ -114,14 +102,7 @@ function registerPaymentRoutes(router, ctx) {
 
     return {
       status: 200,
-      data: {
-        success:    true,
-        message:    `₹${verification.amountInr} credited to your wallet`,
-        orderId:    razorpayOrderId,
-        paymentId:  razorpayPaymentId,
-        amountInr:  verification.amountInr,
-        wallet:     topup,
-      },
+      data: verification,
     };
   });
 
@@ -236,7 +217,9 @@ function registerPaymentRoutes(router, ctx) {
     const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
-    const order = await razorpay.getOrder(pathParams.orderId);
+    const order =
+      await walletSvc.getRazorpayTopupOrder(pathParams.orderId)
+      || await razorpay.getOrder(pathParams.orderId);
     if (!order) {
       return notFoundError('Order not found', 'ORDER_NOT_FOUND');
     }

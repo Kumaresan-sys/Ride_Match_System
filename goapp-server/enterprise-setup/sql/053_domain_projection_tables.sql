@@ -30,9 +30,12 @@ CREATE TABLE IF NOT EXISTS ride_driver_projection (
     home_city           VARCHAR(120),
     vehicle_number      VARCHAR(64),
     vehicle_type        VARCHAR(80),
+    avatar_url          TEXT,
+    avatar_version      BIGINT,
     average_rating      NUMERIC(4,2),
     acceptance_rate     NUMERIC(6,4),
     completion_rate     NUMERIC(6,4),
+    completed_rides_count INTEGER DEFAULT 0,
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -66,9 +69,12 @@ CREATE TABLE IF NOT EXISTS payment_driver_projection (
     home_city           VARCHAR(120),
     vehicle_number      VARCHAR(64),
     vehicle_type        VARCHAR(80),
+    avatar_url          TEXT,
+    avatar_version      BIGINT,
     average_rating      NUMERIC(4,2),
     acceptance_rate     NUMERIC(6,4),
     completion_rate     NUMERIC(6,4),
+    completed_rides_count INTEGER DEFAULT 0,
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -87,9 +93,12 @@ CREATE TABLE IF NOT EXISTS driver_user_projection (
     home_city           VARCHAR(120),
     vehicle_number      VARCHAR(64),
     vehicle_type        VARCHAR(80),
+    avatar_url          TEXT,
+    avatar_version      BIGINT,
     average_rating      NUMERIC(4,2),
     acceptance_rate     NUMERIC(6,4),
     completion_rate     NUMERIC(6,4),
+    completed_rides_count INTEGER DEFAULT 0,
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

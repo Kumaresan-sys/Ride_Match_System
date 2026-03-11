@@ -20,10 +20,14 @@ const pgRideRepo = require('../repositories/pg/pg-ride-repository');
 const OFFER_BATCH_SIZE = 5;
 const OFFER_TIMEOUT_SEC = 7;
 const MAX_MATCH_WINDOW_MS = 30_000;
+const AGGREGATE_RIDE_MODES = new Set(['on_demand', 'scheduled', 'shared', 'rental', 'intercity']);
+const DEFAULT_DEV_TRACE_LIMIT = 200;
 
 class MatchingEngine {
   constructor() {
     this.stateStore = new RedisStateStore(redis);
+    this.devAutoAcceptTrace = [];
+    this.devAutoAcceptContext = new Map();
   }
 
   _toFiniteNumber(value) {
@@ -94,8 +98,16 @@ class MatchingEngine {
       status: driver.status || 'offline',
       vehicleType: driver.vehicleType || '',
       rating: Number(driver.rating || 0),
+      acceptanceRate: Number(driver.acceptanceRate || 1),
+      completionRate: Number(driver.completionRate || 1),
+      cancelRate: Number(driver.cancelRate || 0),
       name: driver.name || '',
+      phoneNumber: driver.phoneNumber || driver.phone || '',
       vehicleNumber: driver.vehicleNumber || '',
+      avatarUrl: driver.avatarUrl || null,
+      completedRides: Number(driver.completedRides || 0),
+      lastTripEndTime: Number(driver.lastTripEndTime || Date.now()),
+      homeCity: driver.homeCity || '',
     });
     await this.stateStore.setDriverEligibility(driver.driverId, {
       eligible: true,
@@ -114,9 +126,12 @@ class MatchingEngine {
     return {
       driverId,
       name: state.name || 'Driver',
+      phoneNumber: state.phoneNumber || null,
       vehicleType: state.vehicleType || 'sedan',
       vehicleNumber: state.vehicleNumber || null,
       rating: Number(state.rating || 0),
+      avatarUrl: state.avatarUrl || null,
+      completedRides: Number(state.completedRides || 0),
       status: state.status || 'offline',
     };
   }
@@ -190,7 +205,8 @@ class MatchingEngine {
   }
 
   async _findCandidates(ride, stage) {
-    const { pickupLat, pickupLng, rideType } = ride;
+    const { pickupLat, pickupLng } = ride;
+    const requestedServiceType = this._resolveRequestedServiceType(ride);
     const excluded = new Set(await this.stateStore.getExcludedDrivers(ride.rideId));
     const nearby = await locationService.findNearby(pickupLat, pickupLng, stage.radiusKm, stage.maxDrivers * 3);
 
@@ -214,12 +230,20 @@ class MatchingEngine {
     const candidates = nearby.filter((loc) => {
       const state = stateMap.get(loc.driverId) || {};
       if ((state.status || '').toLowerCase() !== 'online') return false;
-      if (rideType && state.vehicleType && state.vehicleType !== rideType) return false;
+      if (
+        requestedServiceType
+        && state.vehicleType
+        && String(state.vehicleType).trim().toLowerCase() !== requestedServiceType
+      ) return false;
       if (excluded.has(String(loc.driverId))) return false;
       return Boolean(eligibilityMap.get(loc.driverId)?.eligible);
     });
 
-    logger.info('MATCHING', `Found ${nearby.length} nearby -> ${candidates.length} eligible candidates`);
+    logger.info('MATCHING', `Found ${nearby.length} nearby -> ${candidates.length} eligible candidates`, {
+      rideId: ride.rideId,
+      requestedServiceType: requestedServiceType || null,
+      rideType: ride.rideType || null,
+    });
     return candidates;
   }
 
@@ -234,6 +258,63 @@ class MatchingEngine {
     const h = crypto.createHash('sha256').update(seed).digest('hex').slice(0, 8);
     const value = parseInt(h, 16) / 0xffffffff;
     return Math.max(0, Math.min(1, value));
+  }
+
+  _normalizeServiceType(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized || AGGREGATE_RIDE_MODES.has(normalized)) return null;
+    return normalized;
+  }
+
+  _resolveRequestedServiceType(ride) {
+    return this._normalizeServiceType(ride?.requestedServiceType)
+      || this._normalizeServiceType(ride?.serviceType)
+      || this._normalizeServiceType(ride?.rideType);
+  }
+
+  _getDevTraceLimit() {
+    const configured = Number(config.development?.autoAcceptTraceLimit || DEFAULT_DEV_TRACE_LIMIT);
+    return Math.max(20, configured);
+  }
+
+  _recordDevAutoAcceptTrace(entry = {}) {
+    const record = {
+      timestamp: new Date().toISOString(),
+      ...entry,
+    };
+
+    this.devAutoAcceptTrace.push(record);
+    const maxEntries = this._getDevTraceLimit();
+    if (this.devAutoAcceptTrace.length > maxEntries) {
+      this.devAutoAcceptTrace.splice(0, this.devAutoAcceptTrace.length - maxEntries);
+    }
+
+    observabilityLogger.info('dev_auto_accept_trace', record);
+    logger.info('MATCHING', 'Development auto-accept trace', record);
+    eventBus.publish('dev_auto_accept_trace', record);
+    return record;
+  }
+
+  getRecentDevAutoAcceptTrace({ limit = 50, rideId = null, driverId = null } = {}) {
+    const normalizedRideId = rideId ? String(rideId) : null;
+    const normalizedDriverId = driverId ? String(driverId) : null;
+    const maxItems = Math.max(1, Math.min(Number(limit) || 50, this._getDevTraceLimit()));
+
+    return this.devAutoAcceptTrace
+      .filter((entry) => {
+        if (normalizedRideId && String(entry.rideId) !== normalizedRideId) return false;
+        if (normalizedDriverId && String(entry.driverId) !== normalizedDriverId) return false;
+        return true;
+      })
+      .slice(-maxItems)
+      .reverse();
+  }
+
+  clearDevAutoAcceptTrace() {
+    const cleared = this.devAutoAcceptTrace.length;
+    this.devAutoAcceptTrace = [];
+    this.devAutoAcceptContext.clear();
+    return { success: true, cleared };
   }
 
   async _scoreAndRank(candidates, ride, stage) {
@@ -288,8 +369,14 @@ class MatchingEngine {
       return {
         driverId: candidate.driverId,
         driverName: candidate.name,
+        driverPhone: candidate.phoneNumber || candidate.phone || null,
         vehicleType: candidate.vehicleType,
         vehicleNumber: candidate.vehicleNumber,
+        driverRating: Number.isFinite(candidate.rating) ? candidate.rating : null,
+        completedRides: Number.isFinite(Number(candidate.completedRides))
+          ? Number(candidate.completedRides)
+          : null,
+        avatarUrl: candidate.avatarUrl || null,
         score: Math.round(score * 1000) / 1000,
         etaMin: Math.round(candidate._etaMin * 10) / 10,
         distKm: Math.round(candidate._distKm * 100) / 100,
@@ -371,17 +458,209 @@ class MatchingEngine {
     return new Promise((resolve) => {
       let settled = false;
       let pollTimer = null;
+      let autoAcceptTimer = null;
       const settle = (result) => {
         if (settled) return;
         settled = true;
         if (pollTimer) clearInterval(pollTimer);
+        if (autoAcceptTimer) clearTimeout(autoAcceptTimer);
+        this.devAutoAcceptContext.delete(String(rideId));
         resolve(result);
       };
 
       const timeout = setTimeout(async () => {
         await this.stateStore.clearAcceptedDriver(rideId).catch(() => {});
+        const autoContext = this.devAutoAcceptContext.get(String(rideId));
+        if (autoContext) {
+          this._recordDevAutoAcceptTrace({
+            rideId,
+            driverId: autoContext.driverId,
+            offerId: autoContext.offerId,
+            stage: stage.stage,
+            phase: 'batch_timeout',
+            reason: 'offer_window_elapsed_before_assignment',
+            score: autoContext.score,
+            etaMin: autoContext.etaMin,
+            distKm: autoContext.distKm,
+            vehicleType: autoContext.vehicleType,
+          });
+        }
         settle({ accepted: false, reason: 'TIMEOUT' });
       }, timeoutSec * 1000);
+
+      if (config.development?.autoAcceptMatches && drivers.length > 0) {
+        const topRankedDriver = drivers[0];
+        const topOffer = offers[0] || null;
+        this._recordDevAutoAcceptTrace({
+          rideId,
+          driverId: topRankedDriver.driverId,
+          offerId: topOffer?.offerId || null,
+          stage: stage.stage,
+          phase: 'scheduled',
+          reason: 'top_ranked_driver_in_batch',
+          score: topRankedDriver.score,
+          etaMin: topRankedDriver.etaMin,
+          distKm: topRankedDriver.distKm,
+          vehicleType: topRankedDriver.vehicleType,
+          vehicleNumber: topRankedDriver.vehicleNumber || null,
+          rankPosition: 1,
+          batchDriverIds: drivers.map((driver) => driver.driverId),
+          batchSize: drivers.length,
+          autoAcceptDelayMs: Math.max(100, Number(config.development?.autoAcceptDelayMs || 1000)),
+        });
+        autoAcceptTimer = setTimeout(async () => {
+          try {
+            if (settled) {
+              this._recordDevAutoAcceptTrace({
+                rideId,
+                driverId: topRankedDriver.driverId,
+                offerId: topOffer?.offerId || null,
+                stage: stage.stage,
+                phase: 'skipped',
+                reason: 'batch_already_settled',
+                score: topRankedDriver.score,
+                etaMin: topRankedDriver.etaMin,
+                distKm: topRankedDriver.distKm,
+                vehicleType: topRankedDriver.vehicleType,
+              });
+              return;
+            }
+
+            const matchState = await this.stateStore.getMatchState(rideId).catch(() => null);
+            if (matchState?.cancelled) {
+              this._recordDevAutoAcceptTrace({
+                rideId,
+                driverId: topRankedDriver.driverId,
+                offerId: topOffer?.offerId || null,
+                stage: stage.stage,
+                phase: 'skipped',
+                reason: 'ride_cancelled_before_auto_accept',
+                score: topRankedDriver.score,
+                etaMin: topRankedDriver.etaMin,
+                distKm: topRankedDriver.distKm,
+                vehicleType: topRankedDriver.vehicleType,
+              });
+              return;
+            }
+
+            const existingAcceptedDriver = await this.stateStore.getAcceptedDriver(rideId).catch(() => null);
+            if (existingAcceptedDriver) {
+              this._recordDevAutoAcceptTrace({
+                rideId,
+                driverId: topRankedDriver.driverId,
+                offerId: topOffer?.offerId || null,
+                stage: stage.stage,
+                phase: 'skipped',
+                reason: 'winner_already_exists',
+                acceptedDriverId: existingAcceptedDriver,
+                score: topRankedDriver.score,
+                etaMin: topRankedDriver.etaMin,
+                distKm: topRankedDriver.distKm,
+                vehicleType: topRankedDriver.vehicleType,
+              });
+              return;
+            }
+
+            const offer = await this.stateStore.getRideOffer(rideId, topRankedDriver.driverId).catch(() => null);
+            if (!offer) {
+              this._recordDevAutoAcceptTrace({
+                rideId,
+                driverId: topRankedDriver.driverId,
+                offerId: topOffer?.offerId || null,
+                stage: stage.stage,
+                phase: 'skipped',
+                reason: 'offer_missing',
+                score: topRankedDriver.score,
+                etaMin: topRankedDriver.etaMin,
+                distKm: topRankedDriver.distKm,
+                vehicleType: topRankedDriver.vehicleType,
+              });
+              return;
+            }
+
+            const driverState = await this.stateStore.getDriverState(topRankedDriver.driverId).catch(() => null);
+            if ((driverState?.status || '').toLowerCase() !== 'online') {
+              this._recordDevAutoAcceptTrace({
+                rideId,
+                driverId: topRankedDriver.driverId,
+                offerId: offer.offerId,
+                stage: stage.stage,
+                phase: 'skipped',
+                reason: 'driver_not_online',
+                driverStatus: driverState?.status || null,
+                score: topRankedDriver.score,
+                etaMin: topRankedDriver.etaMin,
+                distKm: topRankedDriver.distKm,
+                vehicleType: topRankedDriver.vehicleType,
+              });
+              return;
+            }
+
+            const acceptResult = await this.acceptOffer(
+              rideId,
+              topRankedDriver.driverId,
+              offer.offerId,
+            );
+            if (acceptResult?.success) {
+              this.devAutoAcceptContext.set(String(rideId), {
+                rideId,
+                driverId: topRankedDriver.driverId,
+                offerId: offer.offerId,
+                stage: stage.stage,
+                score: topRankedDriver.score,
+                etaMin: topRankedDriver.etaMin,
+                distKm: topRankedDriver.distKm,
+                vehicleType: topRankedDriver.vehicleType,
+                vehicleNumber: topRankedDriver.vehicleNumber || null,
+              });
+              this._recordDevAutoAcceptTrace({
+                rideId,
+                driverId: topRankedDriver.driverId,
+                offerId: offer.offerId,
+                stage: stage.stage,
+                phase: 'accepted',
+                reason: 'top_ranked_driver_auto_accepted',
+                score: topRankedDriver.score,
+                etaMin: topRankedDriver.etaMin,
+                distKm: topRankedDriver.distKm,
+                vehicleType: topRankedDriver.vehicleType,
+                vehicleNumber: topRankedDriver.vehicleNumber || null,
+              });
+              logger.info(
+                'MATCHING',
+                `Development auto-accepted driver ${topRankedDriver.driverId} for ride ${rideId}`,
+              );
+            } else {
+              this._recordDevAutoAcceptTrace({
+                rideId,
+                driverId: topRankedDriver.driverId,
+                offerId: offer.offerId,
+                stage: stage.stage,
+                phase: 'accept_failed',
+                reason: acceptResult?.error || 'auto_accept_failed',
+                score: topRankedDriver.score,
+                etaMin: topRankedDriver.etaMin,
+                distKm: topRankedDriver.distKm,
+                vehicleType: topRankedDriver.vehicleType,
+              });
+            }
+          } catch (err) {
+            this._recordDevAutoAcceptTrace({
+              rideId,
+              driverId: topRankedDriver.driverId,
+              offerId: topOffer?.offerId || null,
+              stage: stage.stage,
+              phase: 'accept_failed',
+              reason: err.message,
+              score: topRankedDriver.score,
+              etaMin: topRankedDriver.etaMin,
+              distKm: topRankedDriver.distKm,
+              vehicleType: topRankedDriver.vehicleType,
+            });
+            logger.warn('MATCHING', `Development auto-accept failed for ride ${rideId}: ${err.message}`);
+          }
+        }, Math.max(100, Number(config.development?.autoAcceptDelayMs || 1000)));
+      }
 
       pollTimer = setInterval(async () => {
         try {
@@ -396,8 +675,42 @@ class MatchingEngine {
           const lockResult = await this._claimRide(rideId, winner.driverId);
           await this.stateStore.clearAcceptedDriver(rideId);
           if (!lockResult.acquired) {
+            const autoContext = this.devAutoAcceptContext.get(String(rideId));
+            if (autoContext && String(autoContext.driverId) === String(winner.driverId)) {
+              this._recordDevAutoAcceptTrace({
+                rideId,
+                driverId: winner.driverId,
+                offerId: autoContext.offerId,
+                stage: stage.stage,
+                phase: 'claim_rejected',
+                reason: 'lock_contention',
+                holder: lockResult.holder || null,
+                score: autoContext.score,
+                etaMin: autoContext.etaMin,
+                distKm: autoContext.distKm,
+                vehicleType: autoContext.vehicleType,
+              });
+            }
             settle({ accepted: false, reason: 'LOCK_CONTENTION' });
             return;
+          }
+
+          const autoContext = this.devAutoAcceptContext.get(String(rideId));
+          if (autoContext && String(autoContext.driverId) === String(winner.driverId)) {
+            this._recordDevAutoAcceptTrace({
+              rideId,
+              driverId: winner.driverId,
+              offerId: autoContext.offerId,
+              stage: stage.stage,
+              phase: 'winner_selected',
+              reason: 'assignment_claim_succeeded',
+              lockToken: lockResult.lockToken,
+              score: autoContext.score,
+              etaMin: autoContext.etaMin,
+              distKm: autoContext.distKm,
+              vehicleType: autoContext.vehicleType,
+              vehicleNumber: autoContext.vehicleNumber,
+            });
           }
 
           await this.updateDriverStatus(winner.driverId, 'on_trip');
@@ -433,6 +746,21 @@ class MatchingEngine {
 
   async _claimRide(rideId, driverId) {
     const lockResult = await this.stateStore.acquireRideAssignLock(rideId, driverId, 60);
+    if (
+      !lockResult.acquired &&
+      lockResult.holder &&
+      String(lockResult.holder) === String(driverId)
+    ) {
+      const currentLockToken = await this.stateStore.getRideAssignLock(rideId).catch(() => null);
+      eventBus.publish('ride_accepted', { rideId, driverId });
+      return {
+        acquired: true,
+        holder: String(driverId),
+        lockValue: currentLockToken,
+        lockToken: currentLockToken,
+        reused: true,
+      };
+    }
     if (lockResult.acquired) {
       eventBus.publish('ride_accepted', { rideId, driverId });
     } else {

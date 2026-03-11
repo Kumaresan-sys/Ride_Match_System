@@ -22,6 +22,11 @@ const EXACT_TABLE_OWNERS = Object.freeze({
   // Projection tables
   ride_rider_projection: 'rides',
   ride_driver_projection: 'rides',
+  ride_chat_conversations: 'rides',
+  ride_chat_messages: 'rides',
+  ride_chat_attachments: 'rides',
+  ride_chat_message_receipts: 'rides',
+  ride_chat_events: 'rides',
   payment_rider_projection: 'payments',
   payment_driver_projection: 'payments',
   driver_user_projection: 'drivers',

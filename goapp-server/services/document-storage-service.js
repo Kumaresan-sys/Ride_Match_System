@@ -1,6 +1,5 @@
-// Driver Document Storage Service
-// Abstracts file storage: local filesystem (mock/dev) or S3 (production).
-// Current implementation: local filesystem under UPLOAD_DIR.
+// Driver media storage service.
+// Local filesystem now; adapter boundary kept for future S3 migration.
 
 const fs = require('fs');
 const path = require('path');
@@ -9,7 +8,7 @@ const crypto = require('crypto');
 class DocumentStorageService {
   constructor(config) {
     this.backend = config.storage.backend || 'local';
-    this.localPath = path.resolve(config.storage.localPath || './uploads/driver-docs');
+    this.localPath = path.resolve(config.storage.localPath || './uploads/driver-media');
   }
 
   // Sanitize driverId to prevent path traversal (e.g. ../../../etc)
@@ -20,13 +19,26 @@ class DocumentStorageService {
     return safe;
   }
 
-  // Ensure the directory for a driver exists
-  async _ensureDriverDir(driverId) {
+  _relativeStorageKey(driverId, documentType, filename) {
+    return path.posix.join('drivers', this._safeDriverSegment(driverId), documentType, filename);
+  }
+
+  _absolutePathForStorageKey(storageKey) {
+    const absolute = path.resolve(this.localPath, storageKey);
+    const localRoot = path.resolve(this.localPath);
+    if (absolute !== localRoot && !absolute.startsWith(`${localRoot}${path.sep}`)) {
+      throw Object.assign(new Error('Invalid storage key'), { statusCode: 400 });
+    }
+    return absolute;
+  }
+
+  async _ensureDriverDir(driverId, documentType) {
     const segment = this._safeDriverSegment(driverId);
-    const dir = path.join(this.localPath, segment);
-    // Verify resolved path stays inside localPath (double-check after resolution)
+    const safeType = String(documentType || 'misc').replace(/[^a-zA-Z0-9_-]/g, '_') || 'misc';
+    const dir = path.join(this.localPath, 'drivers', segment, safeType);
     const resolved = path.resolve(dir);
-    if (!resolved.startsWith(path.resolve(this.localPath) + path.sep)) {
+    const localRoot = path.resolve(this.localPath);
+    if (resolved !== localRoot && !resolved.startsWith(`${localRoot}${path.sep}`)) {
       throw Object.assign(new Error('Invalid driverId'), { statusCode: 400 });
     }
     await fs.promises.mkdir(dir, { recursive: true });
@@ -41,43 +53,66 @@ class DocumentStorageService {
   }
 
   /**
-   * Save a document file to storage.
-   * @param {string} driverId
-   * @param {string} documentType  e.g. 'license'
-   * @param {string} originalFilename
-   * @param {Buffer} buffer
-   * @returns {{ url: string, storedPath: string }}
+   * Save driver media.
    */
-  async saveDocument(driverId, documentType, originalFilename, buffer) {
+  async save(driverId, documentType, originalFilename, buffer) {
     if (this.backend === 'local') {
-      const dir = await this._ensureDriverDir(driverId);
-      const filename = `${documentType}_${this._uniqueFilename(originalFilename)}`;
+      const dir = await this._ensureDriverDir(driverId, documentType);
+      const filename = this._uniqueFilename(originalFilename || 'file');
+      const storageKey = this._relativeStorageKey(driverId, documentType, filename);
       const storedPath = path.join(dir, filename);
       await fs.promises.writeFile(storedPath, buffer);
-      return { storedPath, filename };
+      const checksum = crypto.createHash('sha256').update(buffer).digest('hex');
+      return {
+        storageKey,
+        storedPath,
+        filename,
+        checksumSha256: checksum,
+        fileSizeBytes: buffer.length,
+        storageBackend: 'local',
+      };
     }
     throw new Error(`Storage backend '${this.backend}' not implemented`);
   }
 
-  /**
-   * Read a stored document as a Buffer.
-   * @param {string} storedPath  Absolute path returned by saveDocument
-   * @returns {Buffer}
-   */
-  async readDocument(storedPath) {
-    return fs.promises.readFile(storedPath);
+  async read(storageKey, storedPath = null) {
+    const target = storageKey
+      ? this._absolutePathForStorageKey(storageKey)
+      : path.resolve(storedPath || '');
+    return fs.promises.readFile(target);
   }
 
-  /**
-   * Delete a stored document.
-   * @param {string} storedPath
-   */
-  async deleteDocument(storedPath) {
+  async delete(storageKey, storedPath = null) {
+    const target = storageKey
+      ? this._absolutePathForStorageKey(storageKey)
+      : path.resolve(storedPath || '');
     try {
-      await fs.promises.unlink(storedPath);
+      await fs.promises.unlink(target);
     } catch (err) {
       if (err.code !== 'ENOENT') throw err;
     }
+  }
+
+  buildDocumentUrl(driverId, documentId) {
+    return `/api/v1/drivers/${encodeURIComponent(driverId)}/documents/${encodeURIComponent(documentId)}/file`;
+  }
+
+  buildAvatarUrl(driverId, avatarVersion = null) {
+    const base = `/api/v1/drivers/${encodeURIComponent(driverId)}/avatar`;
+    if (avatarVersion == null) return base;
+    return `${base}?v=${encodeURIComponent(String(avatarVersion))}`;
+  }
+
+  async saveDocument(driverId, documentType, originalFilename, buffer) {
+    return this.save(driverId, documentType, originalFilename, buffer);
+  }
+
+  async readDocument(storageKeyOrPath, storedPath = null) {
+    return this.read(storageKeyOrPath, storedPath);
+  }
+
+  async deleteDocument(storageKeyOrPath, storedPath = null) {
+    return this.delete(storageKeyOrPath, storedPath);
   }
 }
 

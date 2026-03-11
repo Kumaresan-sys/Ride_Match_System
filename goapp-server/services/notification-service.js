@@ -250,6 +250,25 @@ class NotificationService {
     });
   }
 
+  async notifyRideChatMessage(recipientUserId, { rideId, conversationId, senderRole, senderName, preview }) {
+    const title = senderRole === 'driver' ? `${senderName || 'Driver'} sent a message` : 'Rider sent a message';
+    const body = String(preview || 'Open chat to reply.').slice(0, 140);
+    await this.send(recipientUserId, {
+      title,
+      body,
+      data: this._withNavigationData(
+        {
+          type: 'RIDE_CHAT_MESSAGE',
+          rideId,
+          conversationId,
+          senderRole,
+          screen: 'ride_chat',
+        },
+        { route: 'home', deepLink: this._buildDeepLink(`/ride/${rideId}/chat`) }
+      ),
+    });
+  }
+
   /** Trip started */
   async notifyTripStarted(riderId, rideId) {
     await this.send(riderId, {
@@ -562,18 +581,21 @@ class NotificationService {
   }
 
   _buildDeepLink(path, query = {}) {
-    const base = APP_DEEP_LINK_SCHEME.endsWith('://')
-      ? APP_DEEP_LINK_SCHEME.slice(0, -3)
-      : APP_DEEP_LINK_SCHEME.replace(/\/+$/, '');
+    const rawScheme = String(APP_DEEP_LINK_SCHEME || 'goapp://').trim();
+    const schemePrefix = rawScheme.endsWith('://')
+      ? rawScheme
+      : `${rawScheme.replace(/\/+$/, '')}://`;
     const normalizedPath = String(path || '/').startsWith('/') ? path : `/${path}`;
+    const pathWithoutLeadingSlash = normalizedPath.replace(/^\/+/, '');
     const queryEntries = Object.entries(query).filter(([, value]) => value != null && value !== '');
+    const base = `${schemePrefix}${pathWithoutLeadingSlash}`;
     if (queryEntries.length === 0) {
-      return `${base}${normalizedPath}`;
+      return base;
     }
     const qs = queryEntries
       .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
       .join('&');
-    return `${base}${normalizedPath}?${qs}`;
+    return `${base}?${qs}`;
   }
 
   _withNavigationData(data = {}, { route = 'home', deepLink = null } = {}) {

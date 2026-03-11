@@ -129,19 +129,11 @@ class RazorpayService {
       return { success: false, error: 'Order already processed (duplicate verification attempt)' };
     }
 
-    const expectedSig = crypto
-      .createHmac('sha256', this.keySecret)
-      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-      .digest('hex');
-
-    let isValid = false;
-    try {
-      const a = Buffer.from(expectedSig, 'hex');
-      const b = Buffer.from(razorpaySignature, 'hex');
-      isValid = a.length === b.length && crypto.timingSafeEqual(a, b);
-    } catch (_) {
-      isValid = false;
-    }
+    const isValid = this.verifyPaymentSignature({
+      razorpayOrderId,
+      razorpayPaymentId,
+      razorpaySignature,
+    });
 
     if (!isValid) {
       this._stats.paymentsFailed += 1;
@@ -178,6 +170,24 @@ class RazorpayService {
       userType: order.userType,
       amountInr: order.amountInr,
     };
+  }
+
+  verifyPaymentSignature({ razorpayOrderId, razorpayPaymentId, razorpaySignature }) {
+    if (!this.enabled) return false;
+    if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) return false;
+
+    const expectedSig = crypto
+      .createHmac('sha256', this.keySecret)
+      .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+      .digest('hex');
+
+    try {
+      const a = Buffer.from(expectedSig, 'hex');
+      const b = Buffer.from(razorpaySignature, 'hex');
+      return a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (_) {
+      return false;
+    }
   }
 
   verifyWebhookSignature(rawBody, signature) {

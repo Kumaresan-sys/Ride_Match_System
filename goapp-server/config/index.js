@@ -169,6 +169,18 @@ module.exports = {
     allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'],
   },
 
+  chat: {
+    uploadDir: process.env.CHAT_MEDIA_UPLOAD_DIR || './uploads/chat-media',
+    textMaxChars: parseInt(process.env.CHAT_TEXT_MAX_CHARS || '2000', 10),
+    maxAttachments: parseInt(process.env.CHAT_MAX_ATTACHMENTS || '5', 10),
+    maxImageSizeBytes: parseInt(process.env.CHAT_MAX_IMAGE_BYTES || String(5 * 1024 * 1024), 10),
+    maxVoiceSizeBytes: parseInt(process.env.CHAT_MAX_VOICE_BYTES || String(10 * 1024 * 1024), 10),
+    maxVoiceDurationMs: parseInt(process.env.CHAT_MAX_VOICE_DURATION_MS || String(120 * 1000), 10),
+    presenceTtlSec: parseInt(process.env.CHAT_PRESENCE_TTL_SEC || '60', 10),
+    typingTtlSec: parseInt(process.env.CHAT_TYPING_TTL_SEC || '10', 10),
+    defaultPageSize: parseInt(process.env.CHAT_DEFAULT_PAGE_SIZE || '50', 10),
+  },
+
   // ─── Google Maps ─────────────────────────────────────────────────────────
   googleMaps: {
     // Enable: set GOOGLE_MAPS_API_KEY in environment. Falls back to Haversine if unset.
@@ -341,6 +353,22 @@ module.exports = {
         },
       },
     },
+  },
+
+  development: {
+    seedDriversOnBoot: IS_DEVELOPMENT
+      ? process.env.DEV_SEED_DRIVERS_ON_BOOT !== 'false'
+      : process.env.DEV_SEED_DRIVERS_ON_BOOT === 'true',
+    autoAcceptMatches: IS_DEVELOPMENT
+      ? process.env.DEV_AUTO_ACCEPT_MATCHES !== 'false'
+      : process.env.DEV_AUTO_ACCEPT_MATCHES === 'true',
+    driverSeedCenterLat: parseFloat(process.env.DEV_DRIVER_SEED_CENTER_LAT || '13.0833913'),
+    driverSeedCenterLng: parseFloat(process.env.DEV_DRIVER_SEED_CENTER_LNG || '80.1499398'),
+    driverSeedCount: parseInt(process.env.DEV_DRIVER_SEED_COUNT || '6', 10),
+    driverSeedHeartbeatMs: parseInt(process.env.DEV_DRIVER_SEED_HEARTBEAT_MS || '5000', 10),
+    autoAcceptDelayMs: parseInt(process.env.DEV_AUTO_ACCEPT_DELAY_MS || '1000', 10),
+    autoAcceptTraceLimit: parseInt(process.env.DEV_AUTO_ACCEPT_TRACE_LIMIT || '200', 10),
+    driverWalletBalance: parseFloat(process.env.DEV_DRIVER_WALLET_BALANCE || '1500'),
   },
 
   // Runtime cutover controls. Defaults are hard-on for non-test flows.

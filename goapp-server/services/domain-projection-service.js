@@ -39,7 +39,11 @@ class DomainProjectionService {
       `SELECT
          r.id AS rider_id,
          u.id AS user_id,
-         COALESCE(up.display_name, CONCAT_WS(' ', up.first_name, up.last_name), u.phone_number) AS display_name,
+         COALESCE(
+           NULLIF(up.display_name, ''),
+           NULLIF(CONCAT_WS(' ', up.first_name, up.last_name), ''),
+           u.phone_number
+         ) AS display_name,
          u.phone_number,
          u.status,
          COALESCE(r.total_rides, 0) AS total_rides,
@@ -69,16 +73,52 @@ class DomainProjectionService {
          d.home_city,
          ${vehicleNumberExpr} AS vehicle_number,
          vt.name AS vehicle_type,
+         avatar.avatar_url,
+         avatar.avatar_version,
          COALESCE((
            SELECT ROUND(AVG(r.rating)::numeric, 2)
            FROM driver_ratings r
            WHERE r.driver_id = d.id
-         ), 5.0) AS average_rating,
-         1.0::numeric AS acceptance_rate,
-         1.0::numeric AS completion_rate
+         ), perf.avg_rating, 5.0) AS average_rating,
+         COALESCE(perf.acceptance_rate, 1.0)::numeric AS acceptance_rate,
+         COALESCE(
+           CASE
+             WHEN perf.total_rides_count > 0
+               THEN perf.completed_rides_count::numeric / perf.total_rides_count
+             ELSE 1.0::numeric
+           END,
+           1.0::numeric
+         ) AS completion_rate,
+         COALESCE(perf.completed_rides_count, 0) AS completed_rides_count
        FROM drivers d
        LEFT JOIN vehicles v ON v.driver_id = d.id AND v.is_primary = true
        LEFT JOIN vehicle_types vt ON vt.id = v.vehicle_type_id
+       LEFT JOIN LATERAL (
+         SELECT
+           CONCAT(
+             '/api/v1/drivers/',
+             d.id::text,
+             '/avatar?v=',
+             EXTRACT(EPOCH FROM COALESCE(dd.updated_at, dd.uploaded_at))::bigint
+           ) AS avatar_url,
+           EXTRACT(EPOCH FROM COALESCE(dd.updated_at, dd.uploaded_at))::bigint AS avatar_version
+         FROM driver_documents dd
+         WHERE dd.driver_id = d.id
+           AND dd.document_type = 'profile_photo'
+           AND dd.is_active = true
+           AND dd.verification_status = 'verified'
+         ORDER BY COALESCE(dd.updated_at, dd.uploaded_at) DESC, dd.uploaded_at DESC
+         LIMIT 1
+       ) avatar ON true
+       LEFT JOIN LATERAL (
+         SELECT
+           COALESCE(SUM(m.completed_rides), 0)::int AS completed_rides_count,
+           COALESCE(SUM(m.total_rides), 0)::int AS total_rides_count,
+           MAX(m.acceptance_rate) AS acceptance_rate,
+           ROUND(AVG(m.avg_rating)::numeric, 2) AS avg_rating
+         FROM driver_performance_metrics m
+         WHERE m.driver_id = d.id
+       ) perf ON true
        WHERE d.id::text = $1 OR d.user_id::text = $1
        LIMIT 1`,
       [lookup],
@@ -91,7 +131,11 @@ class DomainProjectionService {
       'identity',
       `SELECT
          u.id AS user_id,
-         COALESCE(up.display_name, CONCAT_WS(' ', up.first_name, up.last_name), u.phone_number) AS display_name,
+         COALESCE(
+           NULLIF(up.display_name, ''),
+           NULLIF(CONCAT_WS(' ', up.first_name, up.last_name), ''),
+           u.phone_number
+         ) AS display_name,
          u.phone_number,
          u.status
        FROM users u
@@ -164,11 +208,14 @@ class DomainProjectionService {
          home_city,
          vehicle_number,
          vehicle_type,
+         avatar_url,
+         avatar_version,
          average_rating,
          acceptance_rate,
          completion_rate,
+         completed_rides_count,
          updated_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
        ON CONFLICT (driver_id)
        DO UPDATE SET
          user_id = EXCLUDED.user_id,
@@ -180,9 +227,12 @@ class DomainProjectionService {
          home_city = EXCLUDED.home_city,
          vehicle_number = EXCLUDED.vehicle_number,
          vehicle_type = EXCLUDED.vehicle_type,
+         avatar_url = EXCLUDED.avatar_url,
+         avatar_version = EXCLUDED.avatar_version,
          average_rating = EXCLUDED.average_rating,
          acceptance_rate = EXCLUDED.acceptance_rate,
          completion_rate = EXCLUDED.completion_rate,
+         completed_rides_count = EXCLUDED.completed_rides_count,
          updated_at = NOW()`,
       [
         driver.driver_id,
@@ -195,9 +245,12 @@ class DomainProjectionService {
         driver.home_city || null,
         driver.vehicle_number || null,
         driver.vehicle_type || null,
+        driver.avatar_url || null,
+        driver.avatar_version != null ? Number(driver.avatar_version) : null,
         Number(driver.average_rating || 5),
         Number(driver.acceptance_rate || 1),
         Number(driver.completion_rate || 1),
+        Number(driver.completed_rides_count || 0),
       ],
       { role: 'writer', strongRead: true }
     );

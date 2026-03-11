@@ -218,6 +218,12 @@ function registerRideRoutes(router, ctx) {
     if (!ride || typeof ride !== 'object') return null;
 
     const status = normalizeStatus(ride.status);
+    const liveDriver = ride.driver && typeof ride.driver === 'object'
+      ? ride.driver
+      : null;
+    const matchResult = ride.matchResult && typeof ride.matchResult === 'object'
+      ? ride.matchResult
+      : null;
     const isCancelled =
       status === 'CANCELLED' ||
       status === 'CANCELLED_BY_RIDER' ||
@@ -386,6 +392,79 @@ function registerRideRoutes(router, ctx) {
     );
     const cancelledBy = deriveCancelledBy(status, ride);
     const cancellationReasonText = deriveCancellationReason(status, ride);
+    const driverId = ride.driverId ? String(ride.driverId) : null;
+    const driverName = String(
+      ride.driverName ||
+      liveDriver?.name ||
+      matchResult?.driverName ||
+      ''
+    ).trim() || null;
+    const driverPhone = String(
+      ride.driverPhone ||
+      liveDriver?.phone ||
+      liveDriver?.phoneNumber ||
+      matchResult?.driverPhone ||
+      ''
+    ).trim() || null;
+    const driverVehicleNumber = String(
+      ride.driverVehicleNumber ||
+      liveDriver?.vehicleNumber ||
+      matchResult?.vehicleNumber ||
+      ''
+    ).trim() || null;
+    const driverVehicleType = String(
+      ride.driverVehicleType ||
+      liveDriver?.vehicleType ||
+      matchResult?.vehicleType ||
+      serviceType ||
+      ride.rideType ||
+      ''
+    ).trim() || null;
+    const driverRating =
+      toNumber(ride.driverRating, null) ??
+      toNumber(liveDriver?.rating, null) ??
+      toNumber(matchResult?.driverRating, null);
+    const driverAvatarUrl = String(
+      ride.driverAvatarUrl ||
+      liveDriver?.avatarUrl ||
+      matchResult?.avatarUrl ||
+      ''
+    ).trim() || null;
+    const driverCompletedRides =
+      toNumber(ride.driverCompletedRides, null) ??
+      toNumber(liveDriver?.completedRides, null) ??
+      toNumber(matchResult?.completedRides, null);
+    const rideOtp = String(ride.otp || '').trim() || null;
+    const driverLat =
+      toNumber(ride.driverLat, null) ??
+      toNumber(liveDriver?.lat, null) ??
+      toNumber(matchResult?.driverLat, null);
+    const driverLng =
+      toNumber(ride.driverLng, null) ??
+      toNumber(liveDriver?.lng, null) ??
+      toNumber(matchResult?.driverLng, null);
+    const liveEtaMin =
+      toNumber(ride.etaMin, null) ??
+      toNumber(liveDriver?.etaMin, null) ??
+      toNumber(matchResult?.etaMin, null);
+    const normalizedMatchResult = matchResult
+      ? {
+        ...matchResult,
+        driverName: driverName || matchResult.driverName || null,
+        driverPhone: driverPhone || matchResult.driverPhone || null,
+        vehicleType: driverVehicleType || matchResult.vehicleType || null,
+        vehicleNumber: driverVehicleNumber || matchResult.vehicleNumber || null,
+        driverRating: driverRating ?? null,
+        avatarUrl: driverAvatarUrl || matchResult.avatarUrl || null,
+        driverLat: driverLat ?? matchResult.driverLat ?? null,
+        driverLng: driverLng ?? matchResult.driverLng ?? null,
+        etaMin: liveEtaMin ?? matchResult.etaMin ?? null,
+        completedRides:
+          driverCompletedRides != null
+            ? Math.round(driverCompletedRides)
+            : (matchResult.completedRides ?? null),
+      }
+      : null;
 
     const normalized = {
       rideId: String(ride.rideId || ride.id || ''),
@@ -397,7 +476,12 @@ function registerRideRoutes(router, ctx) {
       cancellationReasonText,
       cancellationFee,
       riderId: ride.riderId ? String(ride.riderId) : null,
-      driverId: ride.driverId ? String(ride.driverId) : null,
+      driverId,
+      driverName,
+      driverPhone,
+      driverAvatarUrl,
+      driverCompletedRides:
+        driverCompletedRides != null ? Math.round(driverCompletedRides) : null,
       pickupAddress: ride.pickupAddress || ride.requestedPickupAddress || null,
       destAddress: ride.destAddress || ride.dropoffAddress || ride.requestedDestAddress || null,
       pickupZoneCode: ride.pickupZoneCode || null,
@@ -417,10 +501,13 @@ function registerRideRoutes(router, ctx) {
       serviceType,
       distanceKm,
       durationMin,
+      driverLat,
+      driverLng,
+      etaMin: liveEtaMin,
       createdAt: toIso(ride.createdAt),
       acceptedAt: toIso(ride.acceptedAt),
       arrivedAt: toIso(ride.arrivedAt),
-      otpVerifiedAt: toIso(ride.otpVerifiedAt),
+      otp: rideOtp,
       startedAt,
       endedAt,
       finalFare,
@@ -441,7 +528,25 @@ function registerRideRoutes(router, ctx) {
       coinsDiscountAmount: toNumber(ride.coinsDiscountAmount, null),
       paymentMethod: ride.paymentMethod || null,
       paymentTransactionId: ride.paymentTransactionId || null,
-      matchResult: ride.matchResult || null,
+      matchResult: normalizedMatchResult,
+      driver: driverId
+        ? {
+          driverId,
+          name: driverName,
+          phone: driverPhone,
+          phoneNumber: driverPhone,
+          vehicleType: driverVehicleType,
+          vehicleNumber: driverVehicleNumber,
+          rating: driverRating,
+          avatarUrl: driverAvatarUrl,
+          completedRides:
+            driverCompletedRides != null ? Math.round(driverCompletedRides) : null,
+          etaMin: liveEtaMin,
+          lat: driverLat,
+          lng: driverLng,
+          otp: rideOtp,
+        }
+        : null,
     };
 
     if (!isCancelled &&
@@ -483,6 +588,10 @@ function registerRideRoutes(router, ctx) {
   router.register('POST', '/api/v1/rides/request', async ({ body, headers, ip }) => {
     const auth = await authenticate(headers);
     if (auth.error) return auth.error;
+    const authenticatedRiderId = String(auth.session.userId || '').trim();
+    if (!authenticatedRiderId) {
+      return forbiddenError('Authenticated rider context is missing.', 'AUTH_REQUIRED');
+    }
     if (!await checkRideRateLimit(`${ip || 'unknown'}:${auth.session.userId}`)) {
       return rateLimitError(
         'Rate limit exceeded for ride requests. Try again shortly.',
@@ -491,7 +600,7 @@ function registerRideRoutes(router, ctx) {
     }
 
     const parsed = validateSchema(body, [
-      { key: 'riderId', type: 'string', required: true },
+      { key: 'riderId', type: 'string', required: false },
       { key: 'pickupLat', type: 'number', required: true, min: -90, max: 90 },
       { key: 'pickupLng', type: 'number', required: true, min: -180, max: 180 },
       { key: 'destLat', type: 'number', required: true, min: -90, max: 90 },
@@ -500,23 +609,28 @@ function registerRideRoutes(router, ctx) {
       { key: 'destAddress', type: 'string', required: false, maxLength: 512 },
       { key: 'dropAddress', type: 'string', required: false, maxLength: 512 },
       { key: 'rideType', type: 'string', required: false },
+      { key: 'requestedServiceType', type: 'string', required: false },
       { key: 'idempotencyKey', type: 'string', required: false, minLength: 8, maxLength: 128 },
     ]);
     if (!parsed.ok) return validationError(parsed.error);
 
+    const requestedRideType = String(parsed.data.rideType || '').trim().toLowerCase();
+    const requestedServiceType = String(parsed.data.requestedServiceType || '').trim().toLowerCase();
+    const effectiveRideType = requestedServiceType || requestedRideType || 'sedan';
+
     // Validate rideType against active vehicle types from DB
-    if (parsed.data.rideType) {
+    if (effectiveRideType) {
       const validTypes = await services.pricingService.getVehicleTypes();
       const validNames = validTypes.map(t => t.name);
-      if (!validNames.includes(parsed.data.rideType)) {
+      if (!validNames.includes(effectiveRideType)) {
         return badRequest(
-          `Invalid rideType '${parsed.data.rideType}'. Valid types: ${validNames.join(', ')}`,
+          `Invalid rideType '${effectiveRideType}'. Valid types: ${validNames.join(', ')}`,
           'INVALID_RIDE_TYPE',
         );
       }
     }
 
-    if (parsed.data.riderId !== auth.session.userId) {
+    if (parsed.data.riderId && parsed.data.riderId !== authenticatedRiderId) {
       return forbiddenError('Forbidden: riderId must match authenticated user.', 'FORBIDDEN_RIDER_MISMATCH');
     }
 
@@ -547,20 +661,19 @@ function registerRideRoutes(router, ctx) {
     }
 
     let coinRedemptionPreview = null;
-    if (parsed.data.riderId && services?.coinsService) {
+    if (authenticatedRiderId && services?.coinsService) {
       const estimates = await services.pricingService.getEstimates(
         pickupLat,
         pickupLng,
         parsed.data.destLat,
         parsed.data.destLng
       );
-      const rideType = parsed.data.rideType || 'sedan';
-      const estimatedFare = estimates.estimates[rideType]?.finalFare;
+      const estimatedFare = estimates.estimates[effectiveRideType]?.finalFare;
       if (estimatedFare != null) {
         coinRedemptionPreview = await services.coinsService.toRideCoinsQuote(
-          parsed.data.riderId,
+          authenticatedRiderId,
           Number(estimatedFare),
-          { rideType }
+          { rideType: effectiveRideType }
         );
       }
     }
@@ -577,7 +690,10 @@ function registerRideRoutes(router, ctx) {
     const result = await repositories.ride.createRide({
       ...body,
       ...parsed.data,
+      riderId: authenticatedRiderId,
       destAddress: parsed.data.destAddress || parsed.data.dropAddress || null,
+      rideType: effectiveRideType,
+      requestedServiceType: requestedServiceType || null,
       rideId: crypto.randomUUID(),
       rideNumber: `RD${Date.now().toString(36).toUpperCase()}`,
       idempotencyKey: parsed.data.idempotencyKey || idempotencyHeader || crypto.randomUUID(),

@@ -18,6 +18,7 @@ const { logger, eventBus } = require('../utils/logger');
 const driverWalletService = require('./driver-wallet-service');
 const rideSessionService  = require('./ride-session-service');
 const pgRepo = require('../repositories/pg/pg-ride-repository');
+const domainProjectionService = require('./domain-projection-service');
 const RedisStateStore = require('../infra/redis/state-store');
 const KafkaProducer = require('../infra/kafka/producer');
 const { TOPICS } = require('../infra/kafka/topics');
@@ -31,6 +32,45 @@ class RideService {
     this.redisStateV2       = Boolean(config.architecture?.featureFlags?.redisStateV2);
     this.stateStore         = new RedisStateStore(redis);
     this.kafkaProducer      = new KafkaProducer();
+  }
+
+  _isDevelopmentAutoAcceptEnabled() {
+    return String(process.env.NODE_ENV || 'development').trim() === 'development'
+      && Boolean(config.development?.devAutoAcceptMatches);
+  }
+
+  _scheduleDevelopmentMatchingFallback(rideId) {
+    if (!this._isDevelopmentAutoAcceptEnabled() || !rideId) return;
+
+    setTimeout(async () => {
+      try {
+        const currentHotRide = this.rides.get(rideId);
+        const currentDbRide = await pgRepo.getRide(rideId).catch(() => null);
+        const effectiveStatus = String(
+          currentHotRide?.status ||
+          currentDbRide?.status ||
+          ''
+        ).trim().toUpperCase();
+
+        if ([S.ACCEPTED, S.DRIVER_ARRIVING, S.DRIVER_ARRIVED, S.TRIP_STARTED, S.TRIP_COMPLETED].includes(effectiveStatus)) {
+          return;
+        }
+
+        if (effectiveStatus === S.CANCELLED || effectiveStatus === S.NO_DRIVERS) {
+          return;
+        }
+
+        const result = await this.processRideRequestedEvent({ rideId });
+        logger.info('RIDE', `Development matching fallback processed ${rideId}`, {
+          rideId,
+          success: Boolean(result?.success),
+          reason: result?.reason || null,
+          driverId: result?.driverId || null,
+        });
+      } catch (err) {
+        logger.warn('RIDE', `Development matching fallback failed for ${rideId}: ${err.message}`);
+      }
+    }, 1200);
   }
 
   // ═══════════════════════════════════════════
@@ -109,10 +149,11 @@ class RideService {
       completedAt: null,
       cancelledAt: null,
       cancelledBy: null,
+      otp: null,
     };
 
     const outboxEnabled = Boolean(config.architecture?.featureFlags?.kafkaOutbox);
-    await pgRepo.createRide({
+    const rideWritePayload = {
       rideId: dbRideId,
       rideNumber: rideId,
       riderId,
@@ -164,7 +205,24 @@ class RideService {
           },
         }
         : null,
-    });
+    };
+
+    try {
+      await pgRepo.createRide(rideWritePayload);
+    } catch (err) {
+      const missingProjection = /Rider projection not found/i.test(String(err?.message || ''));
+      if (!missingProjection) throw err;
+
+      logger.warn('RIDE', `Rider projection missing for user ${riderId}; attempting on-demand sync.`);
+      const syncResult = await domainProjectionService.syncRiderByUserId(riderId).catch((syncErr) => {
+        logger.warn('RIDE', `Rider projection sync failed for user ${riderId}: ${syncErr.message}`);
+        return null;
+      });
+      if (!syncResult?.synced) {
+        throw err;
+      }
+      await pgRepo.createRide(rideWritePayload);
+    }
 
     this.rides.set(rideId, ride);
 
@@ -246,6 +304,8 @@ class RideService {
       }, rideId);
     }
 
+    this._scheduleDevelopmentMatchingFallback(rideId);
+
     return {
       rideId,
       pickupZoneId: ride.pickupZoneId,
@@ -254,6 +314,80 @@ class RideService {
       queuedForMatching: true,
       fareEstimate: fareEstimate.finalFare,
     };
+  }
+
+  _generateRideOtp() {
+    return String(crypto.randomInt(1000, 10000)).padStart(4, '0');
+  }
+
+  async _hydrateAssignedDriverDetails(ride, matchResult = {}) {
+    if (!ride || !matchResult?.driverId) return null;
+    const driverProfile = await matchingEngine.getDriver(matchResult.driverId).catch(() => null);
+    const rating = Number(driverProfile?.rating);
+
+    ride.driverName =
+      matchResult.driverName ||
+      driverProfile?.name ||
+      ride.driverName ||
+      null;
+    ride.driverPhone =
+      driverProfile?.phoneNumber ||
+      driverProfile?.phone ||
+      ride.driverPhone ||
+      null;
+    ride.driverVehicleType =
+      matchResult.vehicleType ||
+      driverProfile?.vehicleType ||
+      ride.driverVehicleType ||
+      null;
+    ride.driverVehicleNumber =
+      matchResult.vehicleNumber ||
+      driverProfile?.vehicleNumber ||
+      ride.driverVehicleNumber ||
+      null;
+    ride.driverRating = Number.isFinite(rating) ? rating : (ride.driverRating ?? null);
+    ride.driverAvatarUrl =
+      matchResult.avatarUrl ||
+      driverProfile?.avatarUrl ||
+      ride.driverAvatarUrl ||
+      null;
+    ride.driverCompletedRides =
+      Number.isFinite(Number(matchResult.completedRides))
+        ? Number(matchResult.completedRides)
+        : (Number.isFinite(Number(driverProfile?.completedRides))
+          ? Number(driverProfile.completedRides)
+          : (ride.driverCompletedRides ?? null));
+
+    ride.matchResult = {
+      ...matchResult,
+      driverName: ride.driverName || matchResult.driverName || null,
+      driverPhone: ride.driverPhone || matchResult.driverPhone || null,
+      vehicleType: ride.driverVehicleType || matchResult.vehicleType || null,
+      vehicleNumber: ride.driverVehicleNumber || matchResult.vehicleNumber || null,
+      driverRating: ride.driverRating ?? null,
+      avatarUrl: ride.driverAvatarUrl || matchResult.avatarUrl || null,
+      completedRides: ride.driverCompletedRides ?? matchResult.completedRides ?? null,
+    };
+
+    return driverProfile;
+  }
+
+  async _issueRideOtp(ride) {
+    if (!ride?.rideId) return null;
+    const otp = this._generateRideOtp();
+    try {
+      const persisted = await pgRepo.upsertRideOtp(
+        ride.dbRideId || ride.rideId,
+        otp,
+        { expiresAt: new Date(Date.now() + 30 * 60 * 1000) }
+      );
+      ride.otp = persisted?.otp || otp;
+      return ride.otp;
+    } catch (err) {
+      logger.warn('RIDE', `Failed to issue ride OTP for ${ride.rideId}: ${err.message}`);
+      ride.otp = otp;
+      return otp;
+    }
   }
 
   async processRideRequestedEvent(event = {}) {
@@ -284,10 +418,12 @@ class RideService {
     const matchResult = await matchingEngine.startMatching(ride);
 
     if (matchResult.success) {
+      const driverDbId = await pgRepo.resolveDriverDbId(matchResult.driverId).catch(() => null);
       ride.driverId = matchResult.driverId;
       ride.acceptedAt = Date.now();
-      ride.matchResult = matchResult;
-      this._updateStatus(rideId, S.ACCEPTED);
+      await this._hydrateAssignedDriverDetails(ride, matchResult);
+      await this._issueRideOtp(ride);
+      this._updateStatus(rideId, S.ACCEPTED, { driverDbId, acceptedAt: ride.acceptedAt });
       this._updateStatus(rideId, S.DRIVER_ARRIVING);
       eventBus.publish('ride_matched', {
         rideId,
@@ -328,7 +464,8 @@ class RideService {
     const ride = this.rides.get(rideId);
     if (!ride || ride.status !== S.DRIVER_ARRIVING) return null;
 
-    this._updateStatus(rideId, S.DRIVER_ARRIVED);
+    ride.arrivedAt = Date.now();
+    this._updateStatus(rideId, S.DRIVER_ARRIVED, { arrivedAt: ride.arrivedAt });
     eventBus.publish('driver_arrived', { rideId, driverId: ride.driverId, riderId: ride.riderId });
     logger.success('RIDE', `Driver arrived at pickup for ride ${rideId}`);
 
@@ -598,16 +735,18 @@ class RideService {
       // Resume matching asynchronously so the rider isn't left stranded
       ride.driverId = null;
       this._updateStatus(rideId, S.MATCHING);
-      matchingEngine.resumeMatching(ride, lastStage).then(matchResult => {
+      matchingEngine.resumeMatching(ride, lastStage).then(async (matchResult) => {
         if (matchResult.success) {
+          const driverDbId = await pgRepo.resolveDriverDbId(matchResult.driverId).catch(() => null);
           ride.driverId  = matchResult.driverId;
           ride.acceptedAt = Date.now();
-          ride.matchResult = matchResult;
+          await this._hydrateAssignedDriverDetails(ride, matchResult);
+          await this._issueRideOtp(ride);
           ride.cancelledAt = null;
           ride.cancelledBy = null;
           ride.cancellationReasonCode = null;
           ride.cancellationReasonText = null;
-          this._updateStatus(rideId, S.ACCEPTED);
+          this._updateStatus(rideId, S.ACCEPTED, { driverDbId, acceptedAt: ride.acceptedAt });
           this._updateStatus(rideId, S.DRIVER_ARRIVING);
 
           // Notify rider that a new driver was found
@@ -842,6 +981,7 @@ class RideService {
       }, 3600);
     }
 
+    eventBus.publish('ride_no_drivers', { rideId, riderId: ride.riderId });
     await rideSessionService.onRideEnded(ride.riderId);
   }
 
@@ -867,6 +1007,10 @@ class RideService {
         riderId: ride.riderId,
         driverId: ride.driverId,
         status: newStatus,
+        pickupLat: ride.pickupLat,
+        pickupLng: ride.pickupLng,
+        destLat: ride.destLat,
+        destLng: ride.destLng,
         updatedAt: Date.now(),
       }, 4 * 3600).catch((err) => logger.warn('RIDE', `REDIS_STATE_V2 setActiveRide failed: ${err.message}`));
     }
@@ -932,10 +1076,111 @@ class RideService {
     return this.rides.get(rideId) || null;
   }
 
+  _statusRank(status) {
+    switch (String(status || '').toUpperCase()) {
+      case 'REQUESTED':
+        return 1;
+      case 'MATCHING':
+      case 'BROADCAST':
+        return 2;
+      case 'ACCEPTED':
+        return 3;
+      case 'DRIVER_ARRIVING':
+        return 4;
+      case 'DRIVER_ARRIVED':
+        return 5;
+      case 'TRIP_STARTED':
+        return 6;
+      case 'TRIP_COMPLETED':
+        return 7;
+      case 'NO_DRIVERS':
+      case 'CANCELLED':
+      case 'CANCELLED_BY_RIDER':
+      case 'CANCELLED_BY_DRIVER':
+        return 8;
+      default:
+        return 0;
+    }
+  }
+
+  _mergeRideState(hot, fromDb) {
+    if (!hot) return fromDb || null;
+    if (!fromDb) return hot;
+
+    const hotRank = this._statusRank(hot.status);
+    const dbRank = this._statusRank(fromDb.status);
+    const dbIsFresher =
+      dbRank > hotRank ||
+      (!hot.driverId && !!fromDb.driverId) ||
+      (!hot.otp && !!fromDb.otp);
+
+    const preferred = dbIsFresher ? fromDb : hot;
+    const fallback = dbIsFresher ? hot : fromDb;
+
+    return {
+      ...fallback,
+      ...preferred,
+      rideId: preferred.rideId || fallback.rideId,
+      dbRideId: preferred.dbRideId || fallback.dbRideId,
+      riderId: preferred.riderId || fallback.riderId,
+      driverId: preferred.driverId || fallback.driverId,
+      driverName: preferred.driverName || fallback.driverName || fallback.matchResult?.driverName || null,
+      driverPhone: preferred.driverPhone || fallback.driverPhone || fallback.matchResult?.driverPhone || null,
+      driverVehicleNumber:
+        preferred.driverVehicleNumber ||
+        fallback.driverVehicleNumber ||
+        fallback.matchResult?.vehicleNumber ||
+        null,
+      driverVehicleType:
+        preferred.driverVehicleType ||
+        fallback.driverVehicleType ||
+        fallback.matchResult?.vehicleType ||
+        null,
+      driverRating:
+        preferred.driverRating ??
+        fallback.driverRating ??
+        fallback.matchResult?.driverRating ??
+        null,
+      driverAvatarUrl:
+        preferred.driverAvatarUrl ||
+        fallback.driverAvatarUrl ||
+        fallback.matchResult?.avatarUrl ||
+        null,
+      driverCompletedRides:
+        preferred.driverCompletedRides ??
+        fallback.driverCompletedRides ??
+        fallback.matchResult?.completedRides ??
+        null,
+      otp: preferred.otp || fallback.otp || null,
+      otpVerifiedAt: preferred.otpVerifiedAt || fallback.otpVerifiedAt || null,
+      matchResult: hot.matchResult || fromDb.matchResult || null,
+      statusHistory: hot.statusHistory || fromDb.statusHistory || [],
+      createdAt: hot.createdAt || fromDb.createdAt || Date.now(),
+      acceptedAt: hot.acceptedAt || fromDb.acceptedAt || null,
+      arrivedAt: hot.arrivedAt || fromDb.arrivedAt || null,
+      startedAt: hot.startedAt || fromDb.startedAt || null,
+      completedAt: hot.completedAt || fromDb.completedAt || null,
+      cancelledAt: hot.cancelledAt || fromDb.cancelledAt || null,
+      driverLat: hot.driverLat ?? fromDb.driverLat ?? null,
+      driverLng: hot.driverLng ?? fromDb.driverLng ?? null,
+      etaMin: hot.etaMin ?? fromDb.etaMin ?? null,
+      distanceKmRemaining: hot.distanceKmRemaining ?? fromDb.distanceKmRemaining ?? null,
+      durationMinRemaining: hot.durationMinRemaining ?? fromDb.durationMinRemaining ?? null,
+      trackingChannel: hot.trackingChannel || fromDb.trackingChannel || null,
+      trackingPhase: hot.trackingPhase || fromDb.trackingPhase || null,
+      currentLegPath: hot.currentLegPath || fromDb.currentLegPath || [],
+      polylineIndex: hot.polylineIndex ?? fromDb.polylineIndex ?? 0,
+    };
+  }
+
   async getRideAsync(rideId) {
     const hot = this.getRide(rideId);
-    if (hot) return hot;
-    return pgRepo.getRide(rideId);
+    const fromDb = await pgRepo.getRide(rideId).catch(() => null);
+    const merged = this._mergeRideState(hot, fromDb);
+    if (merged && rideId) {
+      this.rides.set(rideId, merged);
+    }
+    return merged;
   }
 
   getAllRides() {

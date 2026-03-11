@@ -40,6 +40,27 @@ function registerDriverRoutes(router, ctx) {
     return { data: { count: nearby.length, drivers: nearby } };
   });
 
+  router.register('GET', '/api/v1/drivers/:driverId/avatar', async ({ pathParams, headers }) => {
+    const auth = await getAuthenticatedSession(requireAuth, headers);
+    if (auth.error) return auth.error;
+
+    const result = await services.driverDocumentService.getDriverAvatar(pathParams.driverId);
+    if (!result.success) {
+      return buildErrorFromResult(result, {
+        status: result.status || 404,
+        defaultCode: 'DRIVER_AVATAR_NOT_FOUND',
+        defaultMessage: 'Driver avatar not found.',
+      });
+    }
+
+    return {
+      raw: true,
+      contentType: result.mimeType,
+      filename: result.filename,
+      buffer: result.buffer,
+    };
+  });
+
   router.register('PUT', '/api/v1/drivers/:driverId/location', async ({ pathParams, body, headers }) => {
     const owner = await requireOwnedResource({
       headers,

@@ -249,9 +249,12 @@ function stepsByDomain(domain) {
               home_city           VARCHAR(120),
               vehicle_number      VARCHAR(64),
               vehicle_type        VARCHAR(80),
+              avatar_url          TEXT,
+              avatar_version      BIGINT,
               average_rating      NUMERIC(4,2),
               acceptance_rate     NUMERIC(6,4),
               completion_rate     NUMERIC(6,4),
+              completed_rides_count INTEGER DEFAULT 0,
               updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
           );
         `,
@@ -305,9 +308,12 @@ function stepsByDomain(domain) {
               home_city           VARCHAR(120),
               vehicle_number      VARCHAR(64),
               vehicle_type        VARCHAR(80),
+              avatar_url          TEXT,
+              avatar_version      BIGINT,
               average_rating      NUMERIC(4,2),
               acceptance_rate     NUMERIC(6,4),
               completion_rate     NUMERIC(6,4),
+              completed_rides_count INTEGER DEFAULT 0,
               updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
           );
         `,
@@ -374,9 +380,12 @@ function stepsByDomain(domain) {
               home_city           VARCHAR(120),
               vehicle_number      VARCHAR(64),
               vehicle_type        VARCHAR(80),
+              avatar_url          TEXT,
+              avatar_version      BIGINT,
               average_rating      NUMERIC(4,2),
               acceptance_rate     NUMERIC(6,4),
               completion_rate     NUMERIC(6,4),
+              completed_rides_count INTEGER DEFAULT 0,
               updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
           );
         `,
@@ -451,7 +460,31 @@ function sqlFileStepsByDomain(domain) {
         name: 'sql_054_ride_cancellation_reason_catalog',
         sql: loadSqlFile('054_ride_cancellation_reason_catalog.sql'),
       },
+      {
+        name: 'sql_055_driver_media_projection',
+        sql: loadSqlFile('055_driver_media_projection.sql'),
+      },
+      {
+        name: 'sql_056_ride_chat',
+        sql: loadSqlFile('056_ride_chat.sql'),
+      },
     ];
+  }
+
+  if (domain === 'drivers' || domain === 'payments') {
+    const steps = [
+      {
+        name: 'sql_055_driver_media_projection',
+        sql: loadSqlFile('055_driver_media_projection.sql'),
+      },
+    ];
+    if (domain === 'payments') {
+      steps.push({
+        name: 'sql_057_wallet_topup_gateway_tracking',
+        sql: loadSqlFile('057_wallet_topup_gateway_tracking.sql'),
+      });
+    }
+    return steps;
   }
 
   return [];

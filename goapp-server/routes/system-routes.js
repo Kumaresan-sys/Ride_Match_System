@@ -3,10 +3,12 @@ const {
   badRequest,
   buildErrorFromResult,
   normalizeRouteError,
+  notFoundError,
 } = require('./response');
 
 function registerSystemRoutes(router, ctx) {
   const { enterpriseConfig, repositories, services, eventBus, requireAdmin, requireAuth, authRuntimeStats } = ctx;
+  const isDevelopmentRuntime = String(process.env.NODE_ENV || enterpriseConfig?.runtime || 'development') === 'development';
 
   function ensureAdmin(headers = {}) {
     const adminCheck = requireAdmin(headers);
@@ -287,6 +289,35 @@ function registerSystemRoutes(router, ctx) {
     const adminError = ensureAdmin(headers);
     if (adminError) return adminError;
     return { data: services.smsService.getStats() };
+  });
+
+  router.register('GET', '/api/v1/admin/dev/matching/auto-accepts', async ({ params, headers }) => {
+    const adminError = ensureAdmin(headers);
+    if (adminError) return adminError;
+    if (!isDevelopmentRuntime) {
+      return notFoundError('Not found', 'NOT_FOUND');
+    }
+
+    const limit = Math.max(1, Math.min(parseInt(params.get('limit') || '20', 10) || 20, 200));
+    const rideId = String(params.get('rideId') || '').trim() || null;
+    const driverId = String(params.get('driverId') || '').trim() || null;
+    const events = services.matchingEngine.getRecentDevAutoAcceptTrace({
+      limit,
+      rideId,
+      driverId,
+    });
+
+    return {
+      data: {
+        events,
+        count: events.length,
+        filters: {
+          limit,
+          rideId,
+          driverId,
+        },
+      },
+    };
   });
 }
 

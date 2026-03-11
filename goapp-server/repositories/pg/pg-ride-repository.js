@@ -182,6 +182,14 @@ class PgRideRepository {
               rfb.platform_commission AS "platformCommission",
               rrp.user_id AS "riderId",
               rdp.user_id AS "driverId",
+              rdp.display_name AS "driverName",
+              rdp.phone_number AS "driverPhone",
+              rdp.vehicle_number AS "driverVehicleNumber",
+              rdp.vehicle_type AS "driverVehicleType",
+              rdp.average_rating AS "driverRating",
+              rdp.avatar_url AS "driverAvatarUrl",
+              rdp.completed_rides_count AS "driverCompletedRides",
+              ro."otpCode" AS "otp",
               rc."cancelledBy",
               rc."cancellerId",
               rc."cancellationReasonCode",
@@ -204,6 +212,7 @@ class PgRideRepository {
               rfb.booking_fee AS "bookingFee",
               rfb.taxes AS "taxes",
               EXTRACT(EPOCH FROM rc."cancellationRecordedAt") * 1000 AS "cancellationRecordedAt",
+              EXTRACT(EPOCH FROM ro."verifiedAt") * 1000 AS "otpVerifiedAt",
               EXTRACT(EPOCH FROM r.arrived_at)    * 1000 AS "arrivedAt",
               EXTRACT(EPOCH FROM r.accepted_at)   * 1000 AS "acceptedAt",
               EXTRACT(EPOCH FROM r.started_at)    * 1000 AS "startedAt",
@@ -263,6 +272,17 @@ class PgRideRepository {
          ORDER BY created_at ASC
          LIMIT 1
        ) req_oe ON true
+       LEFT JOIN LATERAL (
+         SELECT
+           otp_code AS "otpCode",
+           is_verified AS "isVerified",
+           verified_at AS "verifiedAt",
+           created_at AS "createdAt"
+         FROM ride_otp
+         WHERE ride_id = r.id
+         ORDER BY CASE WHEN is_verified THEN 1 ELSE 0 END ASC, created_at DESC
+         LIMIT 1
+       ) ro ON true
        LEFT JOIN LATERAL (
          SELECT
            rc.cancelled_by AS "cancelledBy",
@@ -342,6 +362,14 @@ class PgRideRepository {
               rfb.platform_commission AS "platformCommission",
               rrp.user_id AS "riderId",
               rdp.user_id AS "driverId",
+              rdp.display_name AS "driverName",
+              rdp.phone_number AS "driverPhone",
+              rdp.vehicle_number AS "driverVehicleNumber",
+              rdp.vehicle_type AS "driverVehicleType",
+              rdp.average_rating AS "driverRating",
+              rdp.avatar_url AS "driverAvatarUrl",
+              rdp.completed_rides_count AS "driverCompletedRides",
+              ro."otpCode" AS "otp",
               rc."cancelledBy",
               rc."cancellerId",
               rc."cancellationReasonCode",
@@ -364,6 +392,7 @@ class PgRideRepository {
               rfb.booking_fee AS "bookingFee",
               rfb.taxes AS "taxes",
               EXTRACT(EPOCH FROM rc."cancellationRecordedAt") * 1000 AS "cancellationRecordedAt",
+              EXTRACT(EPOCH FROM ro."verifiedAt") * 1000 AS "otpVerifiedAt",
               EXTRACT(EPOCH FROM r.accepted_at)   * 1000 AS "acceptedAt",
               EXTRACT(EPOCH FROM r.arrived_at)    * 1000 AS "arrivedAt",
               EXTRACT(EPOCH FROM r.started_at)    * 1000 AS "startedAt",
@@ -425,6 +454,17 @@ class PgRideRepository {
        ) req_oe ON true
        LEFT JOIN LATERAL (
          SELECT
+           otp_code AS "otpCode",
+           is_verified AS "isVerified",
+           verified_at AS "verifiedAt",
+           created_at AS "createdAt"
+         FROM ride_otp
+         WHERE ride_id = r.id
+         ORDER BY CASE WHEN is_verified THEN 1 ELSE 0 END ASC, created_at DESC
+         LIMIT 1
+       ) ro ON true
+       LEFT JOIN LATERAL (
+         SELECT
            rc.cancelled_by AS "cancelledBy",
            rc.canceller_id AS "cancellerId",
            rc.reason_code AS "cancellationReasonCode",
@@ -470,7 +510,7 @@ class PgRideRepository {
 
   async updateStatus(rideId, status, extra = {}) {
     const {
-      driverDbId, acceptedAt, startedAt, completedAt,
+      driverDbId, acceptedAt, arrivedAt, startedAt, completedAt,
       cancelledAt, cancelledBy, finalFare, actualDistanceM, actualDurationS,
     } = extra;
 
@@ -483,12 +523,13 @@ class PgRideRepository {
            status       = $2,
            driver_id    = COALESCE($3, driver_id),
            accepted_at  = COALESCE($4, accepted_at),
-           started_at   = COALESCE($5, started_at),
-           completed_at = COALESCE($6, completed_at),
-           cancelled_at = COALESCE($7, cancelled_at),
-           actual_fare  = COALESCE($8, actual_fare),
-           actual_distance_m  = COALESCE($9,  actual_distance_m),
-           actual_duration_s  = COALESCE($10, actual_duration_s),
+           arrived_at   = COALESCE($5, arrived_at),
+           started_at   = COALESCE($6, started_at),
+           completed_at = COALESCE($7, completed_at),
+           cancelled_at = COALESCE($8, cancelled_at),
+           actual_fare  = COALESCE($9, actual_fare),
+           actual_distance_m  = COALESCE($10, actual_distance_m),
+           actual_duration_s  = COALESCE($11, actual_duration_s),
            updated_at   = NOW()
          WHERE id::text = $1 OR ride_number = $1
          RETURNING id, ride_number, status
@@ -502,6 +543,7 @@ class PgRideRepository {
         rideId, dbStatus,
         driverDbId   || null,
         acceptedAt   ? new Date(acceptedAt)   : null,
+        arrivedAt    ? new Date(arrivedAt)    : null,
         startedAt    ? new Date(startedAt)    : null,
         completedAt  ? new Date(completedAt)  : null,
         cancelledAt  ? new Date(cancelledAt)  : null,
@@ -722,6 +764,177 @@ class PgRideRepository {
       [driverExternalId]
     );
     return rows[0]?.id || null;
+  }
+
+  async upsertRideOtp(rideId, otpCode, { expiresAt = null } = {}) {
+    const rideRef = String(rideId || '').trim();
+    const normalizedOtp = String(otpCode || '').trim();
+    if (!rideRef || !normalizedOtp) return null;
+
+    return domainDb.withTransaction('rides', async (client) => {
+      const { rows: resolvedRows } = await client.query(
+        `SELECT id
+         FROM rides
+         WHERE id::text = $1 OR ride_number = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [rideRef]
+      );
+      if (!resolvedRows.length) {
+        return null;
+      }
+
+      const resolvedRideId = resolvedRows[0].id;
+      await client.query(
+        `UPDATE ride_otp
+         SET expires_at = NOW()
+         WHERE ride_id = $1
+           AND COALESCE(is_verified, false) = false
+           AND verified_at IS NULL`,
+        [resolvedRideId]
+      );
+
+      const effectiveExpiry = expiresAt instanceof Date
+        ? expiresAt
+        : new Date(Date.now() + 30 * 60 * 1000);
+
+      const { rows } = await client.query(
+        `INSERT INTO ride_otp (
+           ride_id,
+           otp_code,
+           is_verified,
+           attempts,
+           expires_at
+         )
+         VALUES ($1, $2, false, 0, $3)
+         RETURNING
+           id,
+           ride_id AS "dbRideId",
+           otp_code AS otp,
+           expires_at AS "expiresAt",
+           created_at AS "createdAt"`,
+        [resolvedRideId, normalizedOtp, effectiveExpiry]
+      );
+
+      return rows[0] || null;
+    });
+  }
+
+  async verifyRideOtp(rideId, otpCode) {
+    const rideRef = String(rideId || '').trim();
+    const normalizedOtp = String(otpCode || '').trim();
+    if (!rideRef || !normalizedOtp) {
+      return { success: false, errorCode: 'OTP_REQUIRED', message: 'Ride OTP is required.' };
+    }
+
+    return domainDb.withTransaction('rides', async (client) => {
+      const { rows: rideRows } = await client.query(
+        `SELECT id, ride_number, status
+         FROM rides
+         WHERE id::text = $1 OR ride_number = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [rideRef]
+      );
+      if (!rideRows.length) {
+        return { success: false, errorCode: 'RIDE_NOT_FOUND', message: 'Ride not found.' };
+      }
+
+      const ride = rideRows[0];
+      const { rows: otpRows } = await client.query(
+        `SELECT id,
+                otp_code AS "otpCode",
+                is_verified AS "isVerified",
+                attempts,
+                expires_at AS "expiresAt",
+                verified_at AS "verifiedAt"
+         FROM ride_otp
+         WHERE ride_id = $1
+         ORDER BY created_at DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [ride.id]
+      );
+      if (!otpRows.length) {
+        return { success: false, errorCode: 'OTP_NOT_FOUND', message: 'Ride OTP not found.' };
+      }
+
+      const otp = otpRows[0];
+      if (otp.isVerified || otp.verifiedAt) {
+        return {
+          success: false,
+          errorCode: 'OTP_ALREADY_VERIFIED',
+          message: 'Ride OTP has already been verified.',
+          verifiedAt: otp.verifiedAt,
+        };
+      }
+
+      if (otp.expiresAt && new Date(otp.expiresAt).getTime() < Date.now()) {
+        await client.query(
+          `UPDATE ride_otp
+           SET attempts = COALESCE(attempts, 0) + 1
+           WHERE id = $1`,
+          [otp.id]
+        );
+        return { success: false, errorCode: 'OTP_EXPIRED', message: 'Ride OTP has expired.' };
+      }
+
+      if (String(otp.otpCode || '').trim() !== normalizedOtp) {
+        await client.query(
+          `UPDATE ride_otp
+           SET attempts = COALESCE(attempts, 0) + 1
+           WHERE id = $1`,
+          [otp.id]
+        );
+        return { success: false, errorCode: 'OTP_MISMATCH', message: 'Ride OTP is invalid.' };
+      }
+
+      const verifiedAt = new Date();
+      await client.query(
+        `UPDATE ride_otp
+         SET is_verified = true,
+             verified_at = $2,
+             attempts = COALESCE(attempts, 0) + 1
+         WHERE id = $1`,
+        [otp.id, verifiedAt]
+      );
+      await client.query(
+        `UPDATE rides
+         SET otp_verified_at = $2,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [ride.id, verifiedAt]
+      );
+      await client.query(
+        `INSERT INTO ride_status_history (ride_id, new_status, metadata)
+         VALUES ($1, $2, $3::jsonb)`,
+        [
+          ride.id,
+          ride.status,
+          JSON.stringify({
+            event: 'ride_otp_verified',
+            verifiedAt: verifiedAt.toISOString(),
+          }),
+        ]
+      );
+      await client.query(
+        `INSERT INTO ride_events (ride_id, event_type, event_data)
+         VALUES ($1, 'ride_otp_verified', $2::jsonb)`,
+        [
+          ride.id,
+          JSON.stringify({
+            rideId: ride.ride_number,
+            verifiedAt: verifiedAt.toISOString(),
+          }),
+        ]
+      );
+
+      return {
+        success: true,
+        rideId: ride.ride_number,
+        verifiedAt: verifiedAt.toISOString(),
+      };
+    });
   }
 
   // ─── Stats ────────────────────────────────────────────────────────────────

@@ -20,6 +20,8 @@ const { logger, eventBus } = require('../utils/logger');
 const config = require('../config');
 const notificationService = require('./notification-service');
 const pgRepo = require('../repositories/pg/pg-wallet-repository');
+const riderTopupRepo = require('../repositories/pg/pg-rider-topup-repository');
+const razorpayService = require('./razorpay-service');
 
 class WalletService {
   async _getCoinPolicy() {
@@ -41,6 +43,16 @@ class WalletService {
   }
 
   _toClientTx(tx) {
+    const amountInr = typeof tx?.amountInr === 'number'
+      ? tx.amountInr
+      : (typeof tx?.amount === 'number'
+        ? tx.amount
+        : Number.parseFloat(tx?.amount || tx?.amountInr || 0) || 0);
+    const coins = typeof tx?.coins === 'number'
+      ? tx.coins
+      : (typeof tx?.coinAmount === 'number'
+        ? tx.coinAmount
+        : Number.parseInt(tx?.coins || tx?.coinAmount || 0, 10) || 0);
     let metadata = {};
     if (tx?.metadata && typeof tx.metadata === 'object') {
       metadata = tx.metadata;
@@ -57,15 +69,17 @@ class WalletService {
     return {
       txId: tx?.txId || tx?.id || metadata.txId || `txn_${Date.now()}`,
       type: tx?.type || metadata.type || 'cash_topup',
-      amountInr: typeof tx?.amountInr === 'number'
-        ? tx.amountInr
-        : (typeof tx?.amount === 'number' ? tx.amount : 0),
-      coins: typeof tx?.coins === 'number' ? tx.coins : (typeof tx?.coinAmount === 'number' ? tx.coinAmount : 0),
+      amountInr,
+      coins,
       rideId: tx?.rideId || metadata.rideId || null,
-      referenceId: tx?.rideId || metadata.rideId || null,
+      referenceId: tx?.referenceId || metadata.referenceId || tx?.rideId || metadata.rideId || null,
       paymentId: tx?.paymentId || metadata.paymentId || metadata.referenceId || metadata.gatewayReference || null,
       orderId: tx?.orderId || metadata.orderId || null,
       method: tx?.method || metadata.method || metadata.paymentMethod || null,
+      provider: tx?.provider || metadata.provider || null,
+      gateway: tx?.gateway || metadata.gateway || 'wallet',
+      paymentStatus: tx?.paymentStatus || metadata.paymentStatus || 'success',
+      reason: tx?.reason || metadata.reason || tx?.description || metadata.description || null,
       serviceType: tx?.serviceType || metadata.serviceType || null,
       createdAt: createdAtIso,
     };
@@ -95,6 +109,347 @@ class WalletService {
       paymentMethod: tx.method || metadata.method || metadata.paymentMethod || null,
       createdAt: tx.createdAt || null,
     };
+  }
+
+  _formatPaymentMethodLabel(method, provider = null) {
+    const normalizedMethod = String(method || '').trim().toLowerCase();
+    const normalizedProvider = String(provider || '').trim().toLowerCase();
+    if (normalizedMethod === 'upi' || normalizedMethod === 'razorpay') {
+      switch (normalizedProvider) {
+        case 'google_pay':
+          return 'UPI • Google Pay';
+        case 'phonepe':
+          return 'UPI • PhonePe';
+        case 'paytm':
+          return 'UPI • Paytm';
+        case 'bhim':
+          return 'UPI • BHIM';
+        case 'amazonpay':
+          return 'UPI • Amazon Pay';
+        default:
+          return 'UPI';
+      }
+    }
+    if (normalizedMethod === 'card') return 'Card';
+    if (normalizedMethod === 'netbanking') return 'Netbanking';
+    if (normalizedMethod === 'wallet') return 'Wallet';
+    return normalizedMethod ? normalizedMethod.toUpperCase() : 'Wallet';
+  }
+
+  async createRazorpayTopupOrder(userId, amountInr, {
+    method = 'upi',
+    provider = null,
+    requestId = null,
+    idempotencyKey = null,
+  } = {}) {
+    if (!amountInr || amountInr < 1) {
+      return { success: false, error: 'amountInr must be ≥ 1' };
+    }
+
+    const result = await razorpayService.createOrder({
+      amountInr: parseFloat(amountInr),
+      userId,
+      userType: 'rider',
+      receipt: `rider_wallet_${userId}_${Date.now()}`,
+      notes: {
+        purpose: 'wallet_recharge',
+        platform: 'goapp',
+        method,
+        provider,
+      },
+    });
+
+    if (!result.success) {
+      logger.error('WALLET', `Razorpay top-up order creation failed for user ${userId}: ${result.error}`);
+      return result;
+    }
+
+    await riderTopupRepo.createTopupRequest({
+      userId,
+      amountInr,
+      method,
+      provider,
+      orderId: result.orderId,
+      receipt: result.receipt,
+      requestId,
+      idempotencyKey,
+      orderResponse: result,
+    });
+
+    logger.info('WALLET', `Razorpay top-up order created for user ${userId}`, {
+      userId,
+      amountInr,
+      method,
+      provider,
+      orderId: result.orderId,
+      requestId,
+    });
+
+    return result;
+  }
+
+  async verifyRazorpayTopup(userId, {
+    razorpayOrderId,
+    razorpayPaymentId,
+    razorpaySignature,
+    requestId = null,
+  }) {
+    if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+      return {
+        success: false,
+        error: 'razorpayOrderId, razorpayPaymentId, and razorpaySignature are required',
+      };
+    }
+
+    const topupRequest = await riderTopupRepo.getTopupRequestByOrderId(razorpayOrderId);
+    if (!topupRequest) {
+      return { success: false, error: 'Top-up order not found.' };
+    }
+    if (String(topupRequest.userId) !== String(userId)) {
+      return { success: false, error: 'Forbidden: cannot verify payment for another user.' };
+    }
+
+    const signatureValid = razorpayService.verifyPaymentSignature({
+      razorpayOrderId,
+      razorpayPaymentId,
+      razorpaySignature,
+    });
+    if (!signatureValid) {
+      await riderTopupRepo.markTopupFailed({
+        orderId: razorpayOrderId,
+        paymentId: razorpayPaymentId,
+        source: 'client_verify',
+        requestId,
+        failureReason: 'Payment signature verification failed.',
+        failurePayload: {
+          orderId: razorpayOrderId,
+          paymentId: razorpayPaymentId,
+        },
+      });
+      logger.warn('WALLET', `Razorpay top-up signature mismatch for user ${userId}`, {
+        userId,
+        orderId: razorpayOrderId,
+        paymentId: razorpayPaymentId,
+        requestId,
+      });
+      return {
+        success: false,
+        error: 'Payment signature verification failed. Do not credit this payment.',
+      };
+    }
+
+    const method = topupRequest.method || 'upi';
+    const provider = topupRequest.provider || null;
+    const methodLabel = this._formatPaymentMethodLabel(method, provider);
+    const topup = await this.topupWallet(
+      userId,
+      Number(topupRequest.amountInr || 0),
+      methodLabel,
+      razorpayPaymentId,
+      `rzp_rider_verify:${razorpayPaymentId}`,
+      {
+        orderId: razorpayOrderId,
+        paymentId: razorpayPaymentId,
+        provider,
+        gateway: 'razorpay',
+        paymentStatus: 'success',
+        reason: `Wallet top-up via ${methodLabel}`,
+        topupRequestId: topupRequest.topupRequestId,
+      }
+    );
+    if (!topup.success) {
+      return topup;
+    }
+
+    await riderTopupRepo.markTopupCompleted({
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      signature: razorpaySignature,
+      provider,
+      source: 'client_verify',
+      requestId,
+      verificationPayload: {
+        orderId: razorpayOrderId,
+        paymentId: razorpayPaymentId,
+      },
+    });
+
+    logger.success('WALLET', `Razorpay top-up verified for user ${userId}`, {
+      userId,
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      amountInr: Number(topupRequest.amountInr || 0),
+      cashBalance: topup.cashBalance,
+      requestId,
+    });
+
+    return {
+      success: true,
+      message: `₹${Number(topupRequest.amountInr || 0)} credited to your wallet`,
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      amountInr: Number(topupRequest.amountInr || 0),
+      wallet: topup,
+    };
+  }
+
+  async processRazorpayWebhook(event, {
+    signature = null,
+    requestId = null,
+  } = {}) {
+    const eventName = event?.event || '';
+    const payment = event?.payload?.payment?.entity || null;
+    const orderId = payment?.order_id || null;
+    const paymentId = payment?.id || null;
+    const gatewayEventId = event?.id || paymentId || `${eventName}:${orderId || 'na'}`;
+
+    const webhook = await riderTopupRepo.recordWebhook({
+      gatewayEventId,
+      eventType: eventName,
+      payload: event,
+      signature,
+      isVerified: true,
+      referenceType: 'rider_topup',
+      referenceId: orderId,
+    });
+
+    if (webhook.duplicate && webhook.isProcessed) {
+      return { handled: true, duplicate: true, eventName, orderId, paymentId };
+    }
+
+    if (!orderId) {
+      await riderTopupRepo.finalizeWebhook({
+        webhookId: webhook.webhookId,
+        success: true,
+        processedResult: { handled: false, reason: 'missing_order_id' },
+      });
+      return { handled: false, duplicate: false, eventName, reason: 'missing_order_id' };
+    }
+
+    const topupRequest = await riderTopupRepo.getTopupRequestByOrderId(orderId);
+    if (!topupRequest) {
+      await riderTopupRepo.finalizeWebhook({
+        webhookId: webhook.webhookId,
+        success: true,
+        processedResult: { handled: false, reason: 'topup_order_not_found', orderId },
+      });
+      return { handled: false, duplicate: webhook.duplicate, eventName, orderId, reason: 'topup_order_not_found' };
+    }
+
+    if (eventName === 'payment.failed') {
+      await riderTopupRepo.markTopupFailed({
+        orderId,
+        paymentId,
+        source: 'webhook',
+        requestId,
+        failureReason: payment?.error_description || payment?.error_reason || 'Payment failed at gateway.',
+        failurePayload: event,
+      });
+      await riderTopupRepo.finalizeWebhook({
+        webhookId: webhook.webhookId,
+        success: true,
+        processedResult: { handled: true, status: 'failed', orderId, paymentId },
+      });
+      logger.warn('WALLET', `Razorpay webhook marked top-up failed for user ${topupRequest.userId}`, {
+        userId: topupRequest.userId,
+        orderId,
+        paymentId,
+        eventName,
+        requestId,
+      });
+      return { handled: true, duplicate: webhook.duplicate, eventName, orderId, paymentId, status: 'failed' };
+    }
+
+    if (eventName !== 'payment.captured' && eventName !== 'payment.authorized') {
+      await riderTopupRepo.finalizeWebhook({
+        webhookId: webhook.webhookId,
+        success: true,
+        processedResult: { handled: false, reason: 'unsupported_event', eventName, orderId },
+      });
+      return { handled: false, duplicate: webhook.duplicate, eventName, orderId, reason: 'unsupported_event' };
+    }
+
+    const method = topupRequest.method || 'upi';
+    const provider = topupRequest.provider || null;
+    const methodLabel = this._formatPaymentMethodLabel(method, provider);
+    const topup = await this.topupWallet(
+      topupRequest.userId,
+      Number(topupRequest.amountInr || 0),
+      methodLabel,
+      paymentId,
+      `rzp_rider_verify:${paymentId}`,
+      {
+        orderId,
+        paymentId,
+        provider,
+        gateway: 'razorpay',
+        paymentStatus: 'success',
+        reason: `Wallet top-up via ${methodLabel}`,
+        topupRequestId: topupRequest.topupRequestId,
+      }
+    );
+    if (!topup.success) {
+      await riderTopupRepo.finalizeWebhook({
+        webhookId: webhook.webhookId,
+        success: false,
+        errorMessage: topup.error || 'Wallet credit failed during webhook processing.',
+      });
+      return {
+        handled: true,
+        duplicate: webhook.duplicate,
+        eventName,
+        orderId,
+        paymentId,
+        status: 'credit_failed',
+        error: topup.error || 'Wallet credit failed during webhook processing.',
+      };
+    }
+
+    await riderTopupRepo.markTopupCompleted({
+      orderId,
+      paymentId,
+      signature: null,
+      provider,
+      source: 'webhook',
+      webhookEventId: gatewayEventId,
+      requestId,
+      verificationPayload: event,
+    });
+    await riderTopupRepo.finalizeWebhook({
+      webhookId: webhook.webhookId,
+      success: true,
+      processedResult: {
+        handled: true,
+        status: 'completed',
+        orderId,
+        paymentId,
+        amountInr: Number(topupRequest.amountInr || 0),
+      },
+    });
+
+    logger.success('WALLET', `Razorpay webhook credited wallet for user ${topupRequest.userId}`, {
+      userId: topupRequest.userId,
+      orderId,
+      paymentId,
+      amountInr: Number(topupRequest.amountInr || 0),
+      cashBalance: topup.cashBalance,
+      eventName,
+      requestId,
+    });
+
+    return {
+      handled: true,
+      duplicate: webhook.duplicate,
+      eventName,
+      orderId,
+      paymentId,
+      status: 'completed',
+      amountInr: Number(topupRequest.amountInr || 0),
+    };
+  }
+
+  async getRazorpayTopupOrder(orderId) {
+    return riderTopupRepo.getTopupOrderStatus(orderId);
   }
 
   async getBalance(userId) {
@@ -161,7 +516,7 @@ class WalletService {
   }
 
   // ─── Topup cash wallet (rider recharges) ─────────────────────────────────
-  async topupWallet(userId, amount, method = 'upi', referenceId = null, idempotencyKey = null) {
+  async topupWallet(userId, amount, method = 'upi', referenceId = null, idempotencyKey = null, details = {}) {
     if (!amount || amount <= 0)  return { success: false, error: 'Invalid topup amount.' };
     if (amount > 50000)          return { success: false, error: 'Max topup per transaction is ₹50,000.' };
 
@@ -171,7 +526,13 @@ class WalletService {
       amountInr: amount,
       method,
       referenceId,
-      paymentId: referenceId || null,
+      paymentId: details.paymentId || referenceId || null,
+      orderId: details.orderId || null,
+      provider: details.provider || null,
+      gateway: details.gateway || 'wallet',
+      paymentStatus: details.paymentStatus || 'success',
+      reason: details.reason || `Wallet top-up via ${method}`,
+      topupRequestId: details.topupRequestId || null,
       idempotencyKey,
       createdAt: new Date().toISOString(),
     };
@@ -196,6 +557,9 @@ class WalletService {
             amountInr: amount,
             method,
             referenceId: referenceId || null,
+            orderId: details.orderId || null,
+            paymentId: details.paymentId || referenceId || null,
+            provider: details.provider || null,
           },
         } : null,
       }
@@ -207,7 +571,15 @@ class WalletService {
       method,
       txId: tx.txId,
     }).catch(() => {});
-    logger.info('WALLET', `User ${userId} topped up ₹${amount} via ${method}`);
+    logger.info('WALLET', `User ${userId} topped up ₹${amount} via ${method}`, {
+      userId,
+      amountInr: amount,
+      method,
+      referenceId,
+      orderId: details.orderId || null,
+      paymentId: details.paymentId || referenceId || null,
+      provider: details.provider || null,
+    });
     return { success: true, transaction: tx, cashBalance: balances.cashBalance };
   }
 

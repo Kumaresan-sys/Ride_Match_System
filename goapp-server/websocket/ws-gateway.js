@@ -8,12 +8,18 @@ const { logger } = require('../utils/logger');
 const MAGIC_STRING = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
 class WebSocketServer {
-  constructor({ authenticateToken = null, canAccessRide = null, authTimeoutMs = 10000 } = {}) {
+  constructor({
+    authenticateToken = null,
+    canAccessRide = null,
+    canAccessConversation = null,
+    authTimeoutMs = 10000,
+  } = {}) {
     this.clients = new Map();       // socketId -> { socket, channels, userId, userType }
     this.channels = new Map();      // channelName -> Set of socketIds
     this.server = null;
     this.authenticateToken = authenticateToken;
     this.canAccessRide = canAccessRide;
+    this.canAccessConversation = canAccessConversation;
     this.authTimeoutMs = Number.isFinite(authTimeoutMs) ? authTimeoutMs : 10000;
     this.securityStats = {
       authTimeoutDisconnects: 0,
@@ -73,6 +79,7 @@ class WebSocketServer {
       connectedAt: Date.now(),
       authenticatedAt: null,
       authTimeout: null,
+      isAdmin: false,
     };
 
     this.clients.set(socketId, clientInfo);
@@ -192,7 +199,8 @@ class WebSocketServer {
             return;
           }
           client.userId = identity.userId;
-          client.userType = message.userType || 'rider';
+          client.userType = identity.userType || message.userType || 'rider';
+          client.isAdmin = Boolean(identity.isAdmin);
           client.authenticatedAt = Date.now();
           if (client.authTimeout) {
             clearTimeout(client.authTimeout);
@@ -204,11 +212,11 @@ class WebSocketServer {
         break;
 
       case 'subscribe':
-        this._subscribe(socketId, String(message.channel || '').trim());
+        await this._subscribe(socketId, String(message.channel || '').trim());
         break;
 
       case 'unsubscribe':
-        this._unsubscribe(socketId, message.channel);
+        await this._unsubscribe(socketId, message.channel);
         break;
 
       case 'driver:location':
@@ -224,7 +232,7 @@ class WebSocketServer {
 
       case 'reconnect':
         // Rider app reopened after kill — re-subscribe and push current state
-        this._handleReconnect(socketId, message);
+        await this._handleReconnect(socketId, message);
         break;
 
       case 'chat:message':
@@ -243,7 +251,7 @@ class WebSocketServer {
     }
   }
 
-  _subscribe(socketId, channel) {
+  async _subscribe(socketId, channel) {
     const client = this.clients.get(socketId);
     if (!client) return;
     const normalizedChannel = this._normalizeChannelName(channel);
@@ -253,7 +261,7 @@ class WebSocketServer {
       this.sendToClient(socketId, { type: 'subscribe:error', error: 'Authenticate before subscribing.', code: 'AUTH_REQUIRED' });
       return;
     }
-    if (!this._isAuthorizedForChannel(client, normalizedChannel)) {
+    if (!(await this._isAuthorizedForChannel(client, normalizedChannel))) {
       this._recordDeniedChannel(normalizedChannel);
       this.securityStats.subscriptionsDenied += 1;
       this._recordSubscriptionAudit(client, normalizedChannel, false);
@@ -266,12 +274,15 @@ class WebSocketServer {
       this.channels.set(normalizedChannel, new Set());
     }
     this.channels.get(normalizedChannel).add(socketId);
+    if (typeof this.onSubscribe === 'function') {
+      Promise.resolve(this.onSubscribe(socketId, normalizedChannel)).catch(() => {});
+    }
     this.securityStats.subscriptionsAccepted += 1;
     this._recordSubscriptionAudit(client, normalizedChannel, true);
     logger.info('WS-GATEWAY', `${socketId.substr(0, 8)} subscribed to ${normalizedChannel}`);
   }
 
-  _unsubscribe(socketId, channel) {
+  async _unsubscribe(socketId, channel) {
     const client = this.clients.get(socketId);
     if (!client) return;
     const normalizedChannel = this._normalizeChannelName(channel);
@@ -281,6 +292,9 @@ class WebSocketServer {
     if (ch) {
       ch.delete(socketId);
       if (ch.size === 0) this.channels.delete(normalizedChannel);
+    }
+    if (typeof this.onUnsubscribe === 'function') {
+      Promise.resolve(this.onUnsubscribe(socketId, normalizedChannel)).catch(() => {});
     }
   }
 
@@ -299,6 +313,9 @@ class WebSocketServer {
         ch.delete(socketId);
         if (ch.size === 0) this.channels.delete(channel);
       }
+      if (typeof this.onUnsubscribe === 'function') {
+        Promise.resolve(this.onUnsubscribe(socketId, channel)).catch(() => {});
+      }
     }
 
     this.clients.delete(socketId);
@@ -307,7 +324,7 @@ class WebSocketServer {
 
   // ─── Reconnect Handler ───
 
-  _handleReconnect(socketId, message) {
+  async _handleReconnect(socketId, message) {
     const { rideId } = message;
     const client = this.clients.get(socketId);
     if (!client || !rideId) return;
@@ -318,7 +335,7 @@ class WebSocketServer {
 
     // Subscribe to ride channel
     const channel = `ride_${rideId}`;
-    this._subscribe(socketId, channel);
+    await this._subscribe(socketId, channel);
 
     logger.info('WS-GATEWAY', `Reconnect: ${client.userId} → channel ${channel}`);
 
@@ -336,15 +353,25 @@ class WebSocketServer {
     }
   }
 
-  _isAuthorizedForChannel(client, channel) {
+  async _isAuthorizedForChannel(client, channel) {
     if (!channel) return false;
     if (channel === `rider_${client.userId}`) return true;
     if (channel === `driver_${client.userId}`) return true;
+    if (channel === 'admin_chat_monitor') return Boolean(client.isAdmin);
+    if (channel.startsWith('admin_chat_')) return Boolean(client.isAdmin);
+    if (channel.startsWith('ride_chat_')) {
+      const conversationId = channel.slice('ride_chat_'.length);
+      if (!conversationId || typeof this.canAccessConversation !== 'function') return false;
+      return Boolean(await this.canAccessConversation(client.userId, conversationId, { isAdmin: client.isAdmin }));
+    }
     if (channel.startsWith('ride_')) {
       const rideId = channel.slice('ride_'.length);
       if (!rideId) return false;
       if (typeof this.canAccessRide === 'function') {
-        return Boolean(this.canAccessRide(client.userId, rideId));
+        return Boolean(await this.canAccessRide(client.userId, rideId, {
+          isAdmin: client.isAdmin,
+          userType: client.userType,
+        }));
       }
       return false;
     }
@@ -365,7 +392,9 @@ class WebSocketServer {
   _channelPattern(channel) {
     if (String(channel).startsWith('rider_')) return 'rider';
     if (String(channel).startsWith('driver_')) return 'driver';
+    if (String(channel).startsWith('ride_chat_')) return 'ride';
     if (String(channel).startsWith('ride_')) return 'ride';
+    if (String(channel).startsWith('admin_chat_')) return 'other';
     return 'other';
   }
 
@@ -448,6 +477,7 @@ class WebSocketServer {
         socketId: id.substr(0, 8),
         userId: client.userId,
         userType: client.userType,
+        isAdmin: client.isAdmin,
         channels: [...client.channels],
         connectedSec: Math.round((Date.now() - client.connectedAt) / 1000),
       });
@@ -473,6 +503,29 @@ class WebSocketServer {
     this.clients.clear();
     this.channels.clear();
     if (this.server) this.server.close();
+  }
+
+  getClientInfo(socketId) {
+    const client = this.clients.get(socketId);
+    if (!client) return null;
+    return {
+      userId: client.userId,
+      userType: client.userType,
+      isAdmin: client.isAdmin,
+      channels: [...client.channels],
+    };
+  }
+
+  isUserSubscribedToChannel(userId, channel) {
+    const subscribers = this.channels.get(channel);
+    if (!subscribers || !userId) return false;
+    for (const socketId of subscribers) {
+      const client = this.clients.get(socketId);
+      if (client?.userId && String(client.userId) === String(userId)) {
+        return true;
+      }
+    }
+    return false;
   }
 }
 
