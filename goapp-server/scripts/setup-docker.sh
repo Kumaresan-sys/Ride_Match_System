@@ -22,12 +22,12 @@ create_db_if_missing() {
 }
 
 echo "[2/6] Ensuring domain databases exist..."
-for db in identity_db drivers_db rides_db payments_db analytics_db; do
+for db in identity_db drivers_db rides_db payments_db analytics_db support_db; do
   create_db_if_missing "$db"
 done
 
 echo "[3/6] Ensuring required PostgreSQL extensions..."
-for db in identity_db drivers_db rides_db payments_db analytics_db; do
+for db in identity_db drivers_db rides_db payments_db analytics_db support_db; do
   docker exec -i goapp-postgres psql -U goapp -d "$db" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;" >/dev/null
   echo "  - pgcrypto: $db"
 done
@@ -39,6 +39,9 @@ done
 echo "[4/6] Running domain bootstrap migrations..."
 npm run domain:bootstrap
 
+echo "[4b/6] Bootstrapping dedicated support database schema..."
+bash "$ROOT_DIR/scripts/apply-support-db.sh"
+
 echo "[5/6] Creating Kafka topics..."
 "$ROOT_DIR/enterprise-setup/scripts/init-topics.sh"
 
@@ -46,3 +49,4 @@ echo "[6/6] Verifying stack status and API health..."
 docker compose ps
 curl -sSf http://localhost:3000/api/v1/health >/dev/null
 echo "Docker setup complete. API health endpoint is reachable."
+echo "Next recommended check: npm run domain:verify:schema"

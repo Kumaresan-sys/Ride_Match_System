@@ -21,6 +21,7 @@ function registerSafetyRoutes(router, ctx) {
 
     const { userId } = authResult.session;
     const name        = String(body?.name        || '').trim();
+    const relationship = String(body?.relationship || '').trim();
     const phoneNumber = String(body?.phone_number || '').trim();
 
     if (!name || !phoneNumber) {
@@ -28,7 +29,11 @@ function registerSafetyRoutes(router, ctx) {
     }
 
     try {
-      const contact = await safetyService.addContact(userId, { name, phoneNumber });
+      const contact = await safetyService.addContact(userId, {
+        name,
+        relationship,
+        phoneNumber,
+      });
       const contacts = await safetyService.getContacts(userId);
       return { status: 200, data: { success: true, contact, contacts } };
     } catch (err) {
@@ -71,6 +76,7 @@ function registerSafetyRoutes(router, ctx) {
     const { userId } = authResult.session;
     const contactId   = String(body?.id           || '').trim();
     const name        = String(body?.name         || '').trim();
+    const relationship = String(body?.relationship || '').trim();
     const phoneNumber = String(body?.phone_number || '').trim();
 
     if (!contactId || !name || !phoneNumber) {
@@ -78,7 +84,11 @@ function registerSafetyRoutes(router, ctx) {
     }
 
     try {
-      await safetyService.updateContact(userId, contactId, { name, phoneNumber });
+      await safetyService.updateContact(userId, contactId, {
+        name,
+        relationship,
+        phoneNumber,
+      });
       const contacts = await safetyService.getContacts(userId);
       return { status: 200, data: { success: true, contacts } };
     } catch (err) {
@@ -120,7 +130,15 @@ function registerSafetyRoutes(router, ctx) {
 
     const { userId } = authResult.session;
     const prefs = await safetyService.getPreferences(userId);
-    return { status: 200, data: { success: true, ...prefs } };
+    return {
+      status: 200,
+      data: {
+        success: true,
+        ...prefs,
+        nightWindowStart: '22:00',
+        nightWindowEnd: '06:00',
+      },
+    };
   });
 
   // ── PUT /api/v1/safety/preferences ──────────────────────────────────────
@@ -142,7 +160,15 @@ function registerSafetyRoutes(router, ctx) {
       autoShare:    autoShare    ?? current.autoShare,
       shareAtNight: shareAtNight ?? current.shareAtNight,
     });
-    return { status: 200, data: { success: true, ...prefs } };
+    return {
+      status: 200,
+      data: {
+        success: true,
+        ...prefs,
+        nightWindowStart: '22:00',
+        nightWindowEnd: '06:00',
+      },
+    };
   });
 }
 

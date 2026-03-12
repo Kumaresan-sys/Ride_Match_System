@@ -23,7 +23,7 @@ const perfMonitor = require('./services/perf-monitor');
 const demandAggregationService = require('./services/demand-aggregation-service');
 const demandLogService = require('./services/demand-log-service');
 const incentiveService = require('./services/incentive-service');
-const ticketService = require('./services/ticket-service');
+const ticketService = require('./services/support-ticket-service');
 const rideSessionService = require('./services/ride-session-service');
 const sosService = require('./services/sos-service');
 const smsService = require('./services/sms-service');
@@ -37,6 +37,7 @@ const googleMapsService = require('./services/google-maps-service');
 const db = require('./services/db');
 const profileService = require('./services/profile-service');
 const safetyService = require('./services/safety-service');
+const tripShareService = require('./services/trip-share-service');
 const zoneCatalogService = require('./services/zone-catalog-service');
 const zoneMappingService = require('./services/zone-mapping-service');
 const zoneMetricsService = require('./services/zone-metrics-service');
@@ -44,6 +45,7 @@ const rideCancellationReasonService = require('./services/ride-cancellation-reas
 const devDriverSeedService = require('./services/dev-driver-seed-service');
 const ChatMediaStorageService = require('./services/chat-media-storage-service');
 const RideChatService = require('./services/ride-chat-service');
+const SupportTicketStorageService = require('./services/support-ticket-storage-service');
 const { applySecurityHeaders, parseJsonBody, readRawBody } = require('./middleware/http-middleware');
 const { parseMultipart } = require('./middleware/multipart-parser');
 const DocumentStorageService = require('./services/document-storage-service');
@@ -74,11 +76,13 @@ const MAX_FILE_UPLOAD_BYTES = config.storage.maxFileSizeBytes || (10 * 1024 * 10
 const documentStorageService = new DocumentStorageService(config);
 const driverDocumentService = new DriverDocumentService(documentStorageService);
 const chatMediaStorageService = new ChatMediaStorageService(config);
+const supportTicketStorageService = new SupportTicketStorageService(config);
 const rideChatService = new RideChatService({
   rideService,
   notificationService,
   storageService: chatMediaStorageService,
 });
+ticketService.setNotificationService(notificationService);
 const authRuntimeStats = {
   legacyTokenAccepted: 0,
   metrics: {
@@ -218,6 +222,7 @@ function startAPIServer(port, runtime = {}) {
       notificationService,
       profileService,
       safetyService,
+      tripShareService,
       zoneCatalogService,
       zoneMappingService,
       zoneMetricsService,
@@ -409,6 +414,15 @@ function startAPIServer(port, runtime = {}) {
           'Content-Length': response.buffer.length,
         });
         res.end(response.buffer);
+        doneRequest();
+        return;
+      }
+
+      if (typeof response.html === 'string') {
+        res.writeHead(response.status || 200, {
+          'Content-Type': 'text/html; charset=utf-8',
+        });
+        res.end(response.html);
         doneRequest();
         return;
       }
@@ -693,8 +707,14 @@ async function main() {
     canAccessConversation: (userId, conversationId, options = {}) => {
       return rideChatService.canUserAccessConversation(conversationId, userId, options);
     },
+    canAccessSupportTicket: (userId, ticketId, options = {}) => {
+      return ticketService.canUserAccessTicket(ticketId, userId, options);
+    },
   });
   rideChatService.setWebSocketServer(wsServer);
+  ticketService.setWebSocketServer(wsServer);
+  ticketService.storageService = supportTicketStorageService;
+  ticketService.redis = redis;
   wsServer.onMessage = (socketId, message) => {
     rideChatService.handleWebSocketMessage(socketId, message);
   };

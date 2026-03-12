@@ -13,6 +13,7 @@ const {
 } = require('./response');
 const RedisStateStore = require('../infra/redis/state-store');
 const redis = require('../services/redis-client');
+const zoneVehicleTypeAvailabilityService = require('../services/zone-vehicle-type-availability-service');
 
 const RIDE_RATE_WINDOW_SEC = 60;
 const RIDE_RATE_MAX = 20;
@@ -300,7 +301,12 @@ function registerRideRoutes(router, ctx) {
           serviceType,
           distanceKm,
           durationMin,
-          toNumber(ride.surgeMultiplier, 1) ?? 1
+          toNumber(ride.surgeMultiplier, 1) ?? 1,
+          {
+            pickupLat: toNumber(ride.pickupLat, null),
+            pickupLng: toNumber(ride.pickupLng, null),
+            role: 'rider',
+          }
         );
       } catch (_) {
         estimatedBreakdown = null;
@@ -618,24 +624,31 @@ function registerRideRoutes(router, ctx) {
     const requestedServiceType = String(parsed.data.requestedServiceType || '').trim().toLowerCase();
     const effectiveRideType = requestedServiceType || requestedRideType || 'sedan';
 
-    // Validate rideType against active vehicle types from DB
-    if (effectiveRideType) {
-      const validTypes = await services.pricingService.getVehicleTypes();
-      const validNames = validTypes.map(t => t.name);
-      if (!validNames.includes(effectiveRideType)) {
-        return badRequest(
-          `Invalid rideType '${effectiveRideType}'. Valid types: ${validNames.join(', ')}`,
-          'INVALID_RIDE_TYPE',
-        );
-      }
-    }
-
     if (parsed.data.riderId && parsed.data.riderId !== authenticatedRiderId) {
       return forbiddenError('Forbidden: riderId must match authenticated user.', 'FORBIDDEN_RIDER_MISMATCH');
     }
 
     const pickupLat = parsed.data.pickupLat;
     const pickupLng = parsed.data.pickupLng;
+
+    // Validate rideType against active vehicle types from DB, filtered by pickup zone when available.
+    if (effectiveRideType) {
+      let validTypes = await services.pricingService.getVehicleTypes();
+      if (Number.isFinite(pickupLat) && Number.isFinite(pickupLng)) {
+        validTypes = await zoneVehicleTypeAvailabilityService.filterVehicleTypesForLocation(validTypes, {
+          pickupLat,
+          pickupLng,
+          role: 'rider',
+        });
+      }
+      const validNames = validTypes.map(t => t.name);
+      if (!validNames.includes(effectiveRideType)) {
+        return badRequest(
+          `Ride type '${effectiveRideType}' is not available in this zone. Allowed types: ${validNames.join(', ')}`,
+          'RIDE_TYPE_NOT_AVAILABLE_IN_ZONE',
+        );
+      }
+    }
 
     if (Number.isFinite(pickupLat) && Number.isFinite(pickupLng)) {
       // In-memory zone check (open-area validation)

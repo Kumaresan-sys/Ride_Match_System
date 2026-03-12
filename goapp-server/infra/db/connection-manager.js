@@ -4,7 +4,7 @@ const { Pool } = require('pg');
 const config = require('../../config');
 const log = require('../observability/logger');
 
-const DOMAINS = ['identity', 'drivers', 'rides', 'payments', 'analytics'];
+const DOMAINS = ['identity', 'drivers', 'rides', 'payments', 'analytics', 'support'];
 const ROLES = ['writer', 'reader'];
 const ISOLATION_LEVELS = new Set(['READ COMMITTED', 'REPEATABLE READ', 'SERIALIZABLE']);
 

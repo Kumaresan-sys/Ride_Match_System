@@ -95,6 +95,14 @@ class ZoneRestrictionsService {
     }
     return result;
   }
+
+  async getMatchingZones(lat, lng, role = 'rider') {
+    const location = await this._resolveLocationComponents(lat, lng);
+    if (!location) {
+      return [];
+    }
+    return repo.findMatchingZones(lat, lng, role, location);
+  }
 }
 
 module.exports = new ZoneRestrictionsService();

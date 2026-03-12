@@ -123,6 +123,30 @@ module.exports = {
     },
   },
 
+  whatsapp: {
+    enabled: process.env.WHATSAPP_ENABLED
+      ? process.env.WHATSAPP_ENABLED === 'true'
+      : IS_DEVELOPMENT,
+    provider: process.env.WHATSAPP_PROVIDER || (IS_DEVELOPMENT ? 'console' : 'twilio'),
+    from: process.env.WHATSAPP_FROM || process.env.TWILIO_WHATSAPP_FROM || '',
+    publicBaseUrl:
+      process.env.PUBLIC_BASE_URL ||
+      process.env.APP_PUBLIC_BASE_URL ||
+      `http://localhost:${parseInt(process.env.PORT || '3000', 10)}`,
+    twilio: {
+      accountSid: process.env.TWILIO_ACCOUNT_SID || '',
+      authToken: process.env.TWILIO_AUTH_TOKEN || '',
+    },
+  },
+
+  tripSharing: {
+    timezone: process.env.TRIP_SHARE_TIMEZONE || 'Asia/Kolkata',
+    nightWindowStartHour: parseInt(process.env.TRIP_SHARE_NIGHT_START_HOUR || '22', 10),
+    nightWindowEndHour: parseInt(process.env.TRIP_SHARE_NIGHT_END_HOUR || '6', 10),
+    shareTtlHours: parseInt(process.env.TRIP_SHARE_TTL_HOURS || '12', 10),
+    pollIntervalSec: parseInt(process.env.TRIP_SHARE_POLL_INTERVAL_SEC || '5', 10),
+  },
+
   // ─── Coins / Wallet ──────────────────────────────────────────────────────
   coins: {
     coinInrValue:     parseFloat(process.env.COIN_INR_VALUE     || '0.10'),  // ₹ per coin
@@ -350,6 +374,23 @@ module.exports = {
           user: process.env.ANALYTICS_DB_READER_USER || process.env.ANALYTICS_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
           password: process.env.ANALYTICS_DB_READER_PASSWORD || process.env.ANALYTICS_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
           database: process.env.ANALYTICS_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+      },
+      support: {
+        database: process.env.SUPPORT_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        writer: {
+          host: process.env.SUPPORT_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.SUPPORT_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.SUPPORT_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.SUPPORT_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.SUPPORT_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
+        },
+        reader: {
+          host: process.env.SUPPORT_DB_READER_HOST || process.env.SUPPORT_DB_WRITER_HOST || process.env.POSTGRES_HOST || 'localhost',
+          port: parseInt(process.env.SUPPORT_DB_READER_PORT || process.env.SUPPORT_DB_WRITER_PORT || process.env.POSTGRES_PORT || '5432', 10),
+          user: process.env.SUPPORT_DB_READER_USER || process.env.SUPPORT_DB_WRITER_USER || process.env.POSTGRES_USER || 'goapp',
+          password: process.env.SUPPORT_DB_READER_PASSWORD || process.env.SUPPORT_DB_WRITER_PASSWORD || process.env.POSTGRES_PASSWORD || 'goapp',
+          database: process.env.SUPPORT_DB_NAME || process.env.POSTGRES_DB || 'goapp_enterprise',
         },
       },
     },

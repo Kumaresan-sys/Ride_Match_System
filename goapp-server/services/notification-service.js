@@ -414,37 +414,40 @@ class NotificationService {
     });
   }
 
-  async notifyTicketCreated(userId, { ticketId, category, priority }) {
+  async notifyTicketCreated(userId, { ticketId, ticketCode = null, category, priority }) {
+    const reference = ticketCode || ticketId;
     await this.send(userId, {
       title: 'Support Ticket Created',
-      body: `Ticket ${ticketId} has been created (${category}, ${priority}).`,
+      body: `Ticket ${reference} has been created (${category}, ${priority}).`,
       channelId: 'goapp_support',
       data: this._withNavigationData(
-        { type: 'TICKET_CREATED', ticketId, category, priority, screen: 'support_ticket' },
+        { type: 'TICKET_CREATED', ticketId, ticketCode: reference, category, priority, screen: 'support_ticket' },
         { route: 'home', deepLink: this._buildDeepLink(`/support/tickets/${ticketId}`) }
       ),
     });
   }
 
-  async notifyTicketUpdated(userId, { ticketId, status }) {
+  async notifyTicketUpdated(userId, { ticketId, ticketCode = null, status }) {
+    const reference = ticketCode || ticketId;
     await this.send(userId, {
       title: 'Ticket Updated',
-      body: `Ticket ${ticketId} is now ${status}.`,
+      body: `Ticket ${reference} is now ${status}.`,
       channelId: 'goapp_support',
       data: this._withNavigationData(
-        { type: 'TICKET_UPDATED', ticketId, status, screen: 'support_ticket' },
+        { type: 'TICKET_UPDATED', ticketId, ticketCode: reference, status, screen: 'support_ticket' },
         { route: 'home', deepLink: this._buildDeepLink(`/support/tickets/${ticketId}`) }
       ),
     });
   }
 
-  async notifyTicketMessage(userId, { ticketId, senderRole }) {
+  async notifyTicketMessage(userId, { ticketId, ticketCode = null, senderRole }) {
+    const reference = ticketCode || ticketId;
     await this.send(userId, {
       title: 'New Support Message',
-      body: `New ${senderRole} message in ticket ${ticketId}.`,
+      body: `New ${senderRole} message in ticket ${reference}.`,
       channelId: 'goapp_support',
       data: this._withNavigationData(
-        { type: 'TICKET_MESSAGE', ticketId, senderRole, screen: 'support_ticket' },
+        { type: 'TICKET_MESSAGE', ticketId, ticketCode: reference, senderRole, screen: 'support_ticket' },
         { route: 'home', deepLink: this._buildDeepLink(`/support/tickets/${ticketId}`) }
       ),
     });

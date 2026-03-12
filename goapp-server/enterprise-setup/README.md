@@ -38,6 +38,7 @@ cd goapp-server
 ```
 
 This also runs `npm run domain:bootstrap`, so domain databases receive split-safe bootstrap tables such as projections, outbox/idempotency tables, and the ride cancellation reason catalog.
+For support flows, it also reapplies the dedicated `support_db` bootstrap and past-ride issue catalog repair scripts so existing Docker volumes stay aligned.
 
 ### 2) Verify infrastructure
 
@@ -74,6 +75,20 @@ Environment variables:
 - `DB_NAME` (default: goapp_enterprise)
 - `DB_USER` (default: goapp)
 - `DB_PASS` (default: goapp)
+
+### Support DB repair (existing support_db volume)
+
+```bash
+cd goapp-server
+npm run support:db:apply
+```
+
+This reapplies:
+- `065_support_db_bootstrap.sql`
+- `066_support_past_ride_issue_catalog.sql`
+- `067_support_db_repair.sql`
+
+The command is idempotent and intended for already-initialized `support_db` volumes.
 
 ### 5) Initialize Kafka topics
 

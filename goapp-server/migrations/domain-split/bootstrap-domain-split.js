@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { Client } = require('pg');
 
-const DOMAINS = ['identity', 'drivers', 'rides', 'payments', 'analytics'];
+const DOMAINS = ['identity', 'drivers', 'rides', 'payments', 'analytics', 'support'];
 const SQL_ROOT = path.resolve(__dirname, '../../enterprise-setup/sql');
 
 function parseArgs(argv) {
@@ -454,6 +454,23 @@ function loadSqlFile(relativePath) {
 }
 
 function sqlFileStepsByDomain(domain) {
+  if (domain === 'identity') {
+    return [
+      {
+        name: 'sql_033_rider_safety_preferences',
+        sql: loadSqlFile('033_rider_safety_preferences.sql'),
+      },
+      {
+        name: 'sql_058_emergency_contact_relationship_alignment',
+        sql: loadSqlFile('058_emergency_contact_relationship_alignment.sql'),
+      },
+      {
+        name: 'sql_059_trip_sharing_identity',
+        sql: loadSqlFile('059_trip_sharing_identity.sql'),
+      },
+    ];
+  }
+
   if (domain === 'rides') {
     return [
       {
@@ -467,6 +484,18 @@ function sqlFileStepsByDomain(domain) {
       {
         name: 'sql_056_ride_chat',
         sql: loadSqlFile('056_ride_chat.sql'),
+      },
+      {
+        name: 'sql_060_trip_sharing_rides',
+        sql: loadSqlFile('060_trip_sharing_rides.sql'),
+      },
+      {
+        name: 'sql_061_zone_vehicle_type_availability',
+        sql: loadSqlFile('061_zone_vehicle_type_availability.sql'),
+      },
+      {
+        name: 'sql_063_zone_vehicle_type_pricing',
+        sql: loadSqlFile('063_zone_vehicle_type_pricing.sql'),
       },
     ];
   }
@@ -547,6 +576,11 @@ async function main() {
     domains,
     results,
   }, null, 2));
+
+  if (!dryRun) {
+    // eslint-disable-next-line no-console
+    console.log('\nNext recommended check: npm run domain:verify:schema');
+  }
 }
 
 main().catch((err) => {

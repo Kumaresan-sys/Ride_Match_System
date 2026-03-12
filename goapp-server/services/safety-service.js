@@ -11,6 +11,7 @@ class SafetyService {
   getPreferences(userId) { return safetyRepo.getPreferences(userId); }
   updatePreferences(userId, payload) { return safetyRepo.updatePreferences(userId, payload); }
   seedProfileEmergencyContact(userId, emergencyContact) { return safetyRepo.seedProfileEmergencyContact(userId, emergencyContact); }
+  getPrimaryContact(userId) { return safetyRepo.getPrimaryContact(userId); }
 }
 
 module.exports = new SafetyService();

@@ -84,6 +84,10 @@ class DevResetService {
       riderIds: riderSnapshot.riderIds,
       riderUserIds: riderSnapshot.userIds,
     });
+    const supportSummary = await this._cleanupSupportDomain({
+      rideRows: rideSnapshot.rows,
+      riderUserIds: riderSnapshot.userIds,
+    });
     const paymentsSummary = await this._cleanupPaymentsDomain({
       riderIds: riderSnapshot.riderIds,
       riderUserIds: riderSnapshot.userIds,
@@ -111,6 +115,7 @@ class DevResetService {
       redis: redisSummary,
       cache: cacheSummary,
       rides: ridesSummary,
+      support: supportSummary,
       payments: paymentsSummary,
       identity: identitySummary,
       diagnostics,
@@ -341,6 +346,74 @@ class DevResetService {
       summary.deleted.rider_wallets = await this._deleteByIds(client, 'rider_wallets', 'rider_id', riderIds);
       summary.deleted.coin_wallets = await this._deleteByIds(client, 'coin_wallets', 'user_id', riderUserIds);
       summary.deleted.wallets = await this._deleteByIds(client, 'wallets', 'user_id', riderUserIds);
+      return summary;
+    });
+  }
+
+  async _cleanupSupportDomain({ rideRows = [], riderUserIds = [] } = {}) {
+    const rideDbIds = unique(rideRows.map((row) => row.dbRideId));
+    const summary = { deleted: {} };
+    if (!rideDbIds.length && !riderUserIds.length) {
+      return summary;
+    }
+
+    return this.domainDb.withTransaction('support', async (client) => {
+      const supportTicketIds = await this._selectTicketIds(client, rideDbIds, riderUserIds);
+
+      summary.deleted.support_ticket_read_state = await this._deleteByIds(
+        client,
+        'support_ticket_read_state',
+        'ticket_id',
+        supportTicketIds,
+      );
+      summary.deleted.support_ticket_attachments = await this._deleteByIds(
+        client,
+        'support_ticket_attachments',
+        'ticket_id',
+        supportTicketIds,
+      );
+      summary.deleted.ticket_ratings = await this._deleteByIds(
+        client,
+        'ticket_ratings',
+        'ticket_id',
+        supportTicketIds,
+      );
+      summary.deleted.support_csat = await this._deleteByIds(
+        client,
+        'support_csat',
+        'ticket_id',
+        supportTicketIds,
+      );
+      summary.deleted.ticket_escalations = await this._deleteByIds(
+        client,
+        'ticket_escalations',
+        'ticket_id',
+        supportTicketIds,
+      );
+      summary.deleted.ticket_status_history = await this._deleteByIds(
+        client,
+        'ticket_status_history',
+        'ticket_id',
+        supportTicketIds,
+      );
+      summary.deleted.ticket_messages = await this._deleteByIds(
+        client,
+        'ticket_messages',
+        'ticket_id',
+        supportTicketIds,
+      );
+      summary.deleted.support_ticket_messages = await this._deleteByIds(
+        client,
+        'support_ticket_messages',
+        'ticket_id',
+        supportTicketIds,
+      );
+      summary.deleted.support_tickets = await this._deleteByIds(
+        client,
+        'support_tickets',
+        'id',
+        supportTicketIds,
+      );
       return summary;
     });
   }

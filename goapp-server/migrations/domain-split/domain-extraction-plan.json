@@ -6,9 +6,10 @@
     "byDomain": {
       "identity": 41,
       "drivers": 43,
-      "rides": 104,
+      "rides": 92,
       "payments": 37,
-      "analytics": 46
+      "analytics": 46,
+      "support": 12
     },
     "unknown": 0,
     "ignored": 1
@@ -187,18 +188,10 @@
       "sos_notifications_sent",
       "sos_response_logs",
       "sos_triggers",
-      "support_agents",
-      "support_categories",
-      "support_csat",
-      "support_faq",
-      "support_ticket_messages",
-      "support_tickets",
       "surge_history",
       "surge_multipliers",
       "surge_zones",
       "tax_jurisdiction_rules",
-      "ticket_escalations",
-      "ticket_status_history",
       "time_rates",
       "toll_rates",
       "traffic_conditions",
@@ -207,6 +200,20 @@
       "zone_metrics_hourly_riders",
       "zone_peak_windows_daily",
       "zone_restrictions"
+    ],
+    "support": [
+      "support_agents",
+      "support_categories",
+      "support_csat",
+      "support_faq",
+      "support_ticket_attachments",
+      "support_ticket_messages",
+      "support_ticket_read_state",
+      "support_tickets",
+      "ticket_escalations",
+      "ticket_messages",
+      "ticket_ratings",
+      "ticket_status_history"
     ],
     "payments": [
       "coin_config",

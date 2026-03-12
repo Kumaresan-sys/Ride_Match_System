@@ -5,6 +5,7 @@ const {
   normalizeRouteError,
   notFoundError,
 } = require('./response');
+const zoneVehicleTypeAvailabilityService = require('../services/zone-vehicle-type-availability-service');
 
 function registerSystemRoutes(router, ctx) {
   const { enterpriseConfig, repositories, services, eventBus, requireAdmin, requireAuth, authRuntimeStats } = ctx;
@@ -182,6 +183,16 @@ function registerSystemRoutes(router, ctx) {
       return badRequest('pickupLat and pickupLng must be valid coordinates', 'VALIDATION_ERROR');
     }
     const estimates = await services.pricingService.getEstimates(pickupLat, pickupLng, body?.destLat, body?.destLng);
+    const allowedVehicleTypes = await zoneVehicleTypeAvailabilityService.filterVehicleTypesForLocation(
+      await services.pricingService.getVehicleTypes(),
+      { pickupLat, pickupLng, role: 'rider' },
+    );
+    const allowedNames = new Set(allowedVehicleTypes.map((item) => String(item.name).toLowerCase()));
+    if (estimates?.estimates && typeof estimates.estimates === 'object' && allowedNames.size > 0) {
+      estimates.estimates = Object.fromEntries(
+        Object.entries(estimates.estimates).filter(([key]) => allowedNames.has(String(key).toLowerCase())),
+      );
+    }
     const session = await optionalSession(headers || {});
     if (session?.userId && services?.coinsService) {
       const rideType = String(body?.rideType || '').trim().toLowerCase();

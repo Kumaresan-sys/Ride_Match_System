@@ -125,6 +125,37 @@ class PgLocationRepository {
     ).catch(() => {});
   }
 
+  async getLatestRideLiveLocation(rideId) {
+    const { rows } = await domainDb.query(
+      'rides',
+      `WITH resolved AS (
+         SELECT id
+         FROM rides
+         WHERE id::text = $1 OR ride_number = $1
+         LIMIT 1
+       )
+       SELECT ST_Y(rll.location::geometry) AS lat,
+              ST_X(rll.location::geometry) AS lng,
+              rll.speed_kmh AS speed,
+              rll.heading,
+              rll.distance_remaining_m AS "distanceRemainingM",
+              rll.eta_remaining_s AS "etaRemainingS",
+              EXTRACT(EPOCH FROM rll.recorded_at) * 1000 AS "recordedAt"
+       FROM ride_live_locations rll
+       JOIN resolved ON resolved.id = rll.ride_id
+       ORDER BY rll.recorded_at DESC
+       LIMIT 1`,
+      [rideId]
+    );
+    if (!rows[0]) return null;
+    return {
+      ...rows[0],
+      etaMin: typeof rows[0].etaRemainingS === 'number'
+        ? Number((rows[0].etaRemainingS / 60).toFixed(1))
+        : null,
+    };
+  }
+
   // ─── History ──────────────────────────────────────────────────────────────
 
   async getDriverLocationHistory(driverId, limitHours = 1) {

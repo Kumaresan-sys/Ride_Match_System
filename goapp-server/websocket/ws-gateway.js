@@ -12,6 +12,7 @@ class WebSocketServer {
     authenticateToken = null,
     canAccessRide = null,
     canAccessConversation = null,
+    canAccessSupportTicket = null,
     authTimeoutMs = 10000,
   } = {}) {
     this.clients = new Map();       // socketId -> { socket, channels, userId, userType }
@@ -20,6 +21,7 @@ class WebSocketServer {
     this.authenticateToken = authenticateToken;
     this.canAccessRide = canAccessRide;
     this.canAccessConversation = canAccessConversation;
+    this.canAccessSupportTicket = canAccessSupportTicket;
     this.authTimeoutMs = Number.isFinite(authTimeoutMs) ? authTimeoutMs : 10000;
     this.securityStats = {
       authTimeoutDisconnects: 0,
@@ -364,6 +366,11 @@ class WebSocketServer {
       if (!conversationId || typeof this.canAccessConversation !== 'function') return false;
       return Boolean(await this.canAccessConversation(client.userId, conversationId, { isAdmin: client.isAdmin }));
     }
+    if (channel.startsWith('support_ticket_')) {
+      const ticketId = channel.slice('support_ticket_'.length);
+      if (!ticketId || typeof this.canAccessSupportTicket !== 'function') return false;
+      return Boolean(await this.canAccessSupportTicket(client.userId, ticketId, { isAdmin: client.isAdmin }));
+    }
     if (channel.startsWith('ride_')) {
       const rideId = channel.slice('ride_'.length);
       if (!rideId) return false;
@@ -393,6 +400,7 @@ class WebSocketServer {
     if (String(channel).startsWith('rider_')) return 'rider';
     if (String(channel).startsWith('driver_')) return 'driver';
     if (String(channel).startsWith('ride_chat_')) return 'ride';
+    if (String(channel).startsWith('support_ticket_')) return 'other';
     if (String(channel).startsWith('ride_')) return 'ride';
     if (String(channel).startsWith('admin_chat_')) return 'other';
     return 'other';

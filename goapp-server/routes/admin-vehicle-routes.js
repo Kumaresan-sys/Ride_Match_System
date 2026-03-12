@@ -9,6 +9,9 @@
 const { validateSchema, validationError } = require('./validation');
 const { badRequest, notFoundError, normalizeRouteError } = require('./response');
 const vehicleTypeService = require('../services/vehicle-type-service');
+const zoneVehicleTypeAvailabilityService = require('../services/zone-vehicle-type-availability-service');
+const zoneVehicleTypePricingService = require('../services/zone-vehicle-type-pricing-service');
+const zoneRestrictionsService = require('../services/zone-restrictions-service');
 
 function registerAdminVehicleRoutes(router, ctx) {
   const { requireAdmin } = ctx;
@@ -20,8 +23,22 @@ function registerAdminVehicleRoutes(router, ctx) {
   }
 
   // ── Public: active vehicle types for the app ──────────────────────────────
-  router.register('GET', '/api/v1/vehicle-types', async () => {
-    const vehicleTypes = await vehicleTypeService.listActive();
+  router.register('GET', '/api/v1/vehicle-types', async ({ params }) => {
+    const pickupLat = Number.parseFloat(params?.get('pickupLat') || '');
+    const pickupLng = Number.parseFloat(params?.get('pickupLng') || '');
+    let vehicleTypes = await vehicleTypeService.listActive();
+    if (Number.isFinite(pickupLat) && Number.isFinite(pickupLng)) {
+      vehicleTypes = await zoneVehicleTypeAvailabilityService.filterVehicleTypesForLocation(vehicleTypes, {
+        pickupLat,
+        pickupLng,
+        role: 'rider',
+      });
+      vehicleTypes = await zoneVehicleTypePricingService.applyZonePricingForLocation(vehicleTypes, {
+        pickupLat,
+        pickupLng,
+        role: 'rider',
+      });
+    }
     return { data: { vehicleTypes } };
   });
 
@@ -32,6 +49,23 @@ function registerAdminVehicleRoutes(router, ctx) {
 
     const vehicleTypes = await vehicleTypeService.listAll();
     return { data: { vehicleTypes } };
+  });
+
+  router.register('GET', '/api/v1/admin/zones/:zoneId/vehicle-types', async ({ headers, pathParams }) => {
+    const err = ensureAdmin(headers);
+    if (err) return err;
+
+    const zoneId = pathParams?.zoneId;
+    if (!zoneId) return badRequest('Missing zoneId', 'VALIDATION_ERROR');
+
+    const zones = await zoneRestrictionsService.list();
+    const zone = zones.find((item) => String(item.id) === String(zoneId));
+    if (!zone) return notFoundError('Zone not found', 'ZONE_NOT_FOUND');
+
+    const vehicleTypes = await vehicleTypeService.listAll();
+    const availability = await zoneVehicleTypeAvailabilityService.listZoneAvailability(zoneId, vehicleTypes);
+    const merged = await zoneVehicleTypePricingService.listZonePricing(zoneId, availability);
+    return { data: { zone, vehicleTypes: merged } };
   });
 
   // ── Admin: create ─────────────────────────────────────────────────────────
@@ -104,6 +138,189 @@ function registerAdminVehicleRoutes(router, ctx) {
     const result = await vehicleTypeService.deactivate(id);
     if (!result) return notFoundError('Vehicle type not found', 'VEHICLE_TYPE_NOT_FOUND');
     return { data: { message: `Vehicle type '${result.name}' deactivated` } };
+  });
+
+  router.register('PUT', '/api/v1/admin/zones/:zoneId/vehicle-types/:vehicleTypeId', async ({ headers, pathParams, body }) => {
+    const err = ensureAdmin(headers);
+    if (err) return err;
+
+    const zoneId = pathParams?.zoneId;
+    const vehicleTypeId = pathParams?.vehicleTypeId;
+    if (!zoneId || !vehicleTypeId) return badRequest('Missing zoneId or vehicleTypeId', 'VALIDATION_ERROR');
+
+    const parsed = validateSchema(body, [
+      { key: 'isEnabled', type: 'boolean', required: true },
+    ]);
+    if (!parsed.ok) return validationError(parsed.error);
+
+    const zones = await zoneRestrictionsService.list();
+    const zone = zones.find((item) => String(item.id) === String(zoneId));
+    if (!zone) return notFoundError('Zone not found', 'ZONE_NOT_FOUND');
+
+    const vehicleType = await vehicleTypeService.getById(vehicleTypeId);
+    if (!vehicleType) {
+      return notFoundError('Vehicle type not found', 'VEHICLE_TYPE_NOT_FOUND');
+    }
+
+    const updatedBy = headers['x-admin-id'] || headers['x-admin-email'] || 'admin';
+    const availability = await zoneVehicleTypeAvailabilityService.setZoneAvailability({
+      zoneId,
+      vehicleType,
+      isEnabled: parsed.data.isEnabled,
+      updatedBy: String(updatedBy),
+    });
+    return { data: { availability } };
+  });
+
+  router.register('POST', '/api/v1/admin/zones/:zoneId/vehicle-types/bulk', async ({ headers, pathParams, body }) => {
+    const err = ensureAdmin(headers);
+    if (err) return err;
+
+    const zoneId = pathParams?.zoneId;
+    if (!zoneId) return badRequest('Missing zoneId', 'VALIDATION_ERROR');
+    const availability = Array.isArray(body?.availability) ? body.availability : null;
+    if (!availability || availability.length === 0) {
+      return badRequest('availability array is required', 'VALIDATION_ERROR');
+    }
+
+    const zones = await zoneRestrictionsService.list();
+    const zone = zones.find((item) => String(item.id) === String(zoneId));
+    if (!zone) return notFoundError('Zone not found', 'ZONE_NOT_FOUND');
+
+    const vehicleTypes = await vehicleTypeService.listAll();
+    const vehicleTypeById = new Map(vehicleTypes.map((item) => [String(item.id), item]));
+    const entries = [];
+    for (const row of availability) {
+      const vehicleTypeId = String(row?.vehicleTypeId || '').trim();
+      if (!vehicleTypeId || typeof row?.isEnabled !== 'boolean') {
+        return badRequest('Each availability item requires vehicleTypeId and isEnabled', 'VALIDATION_ERROR');
+      }
+      const vehicleType = vehicleTypeById.get(vehicleTypeId);
+      if (!vehicleType) {
+        return notFoundError(`Vehicle type not found: ${vehicleTypeId}`, 'VEHICLE_TYPE_NOT_FOUND');
+      }
+      entries.push({
+        ...vehicleType,
+        isEnabled: row.isEnabled,
+      });
+    }
+
+    const updatedBy = headers['x-admin-id'] || headers['x-admin-email'] || 'admin';
+    const updates = await zoneVehicleTypeAvailabilityService.bulkSetZoneAvailability({
+      zoneId,
+      vehicleTypes: entries,
+      updatedBy: String(updatedBy),
+    });
+    return { data: { updates } };
+  });
+
+  router.register('PUT', '/api/v1/admin/zones/:zoneId/vehicle-types/:vehicleTypeId/pricing', async ({ headers, pathParams, body }) => {
+    const err = ensureAdmin(headers);
+    if (err) return err;
+
+    const zoneId = pathParams?.zoneId;
+    const vehicleTypeId = pathParams?.vehicleTypeId;
+    if (!zoneId || !vehicleTypeId) return badRequest('Missing zoneId or vehicleTypeId', 'VALIDATION_ERROR');
+
+    const parsed = validateSchema(body, [
+      { key: 'baseFare', type: 'number', required: true, min: 0 },
+      { key: 'perKmRate', type: 'number', required: true, min: 0 },
+      { key: 'perMinRate', type: 'number', required: true, min: 0 },
+      { key: 'minFare', type: 'number', required: true, min: 0 },
+      { key: 'commissionPct', type: 'number', required: false, min: 0, max: 1 },
+    ]);
+    if (!parsed.ok) return validationError(parsed.error);
+
+    const zones = await zoneRestrictionsService.list();
+    const zone = zones.find((item) => String(item.id) === String(zoneId));
+    if (!zone) return notFoundError('Zone not found', 'ZONE_NOT_FOUND');
+
+    const vehicleType = await vehicleTypeService.getById(vehicleTypeId);
+    if (!vehicleType) {
+      return notFoundError('Vehicle type not found', 'VEHICLE_TYPE_NOT_FOUND');
+    }
+
+    const updatedBy = headers['x-admin-id'] || headers['x-admin-email'] || 'admin';
+    const pricing = await zoneVehicleTypePricingService.setZonePricing({
+      zoneId,
+      vehicleType,
+      pricing: parsed.data,
+      updatedBy: String(updatedBy),
+    });
+    return { data: { pricing } };
+  });
+
+  router.register('POST', '/api/v1/admin/zones/:zoneId/vehicle-types/pricing/bulk', async ({ headers, pathParams, body }) => {
+    const err = ensureAdmin(headers);
+    if (err) return err;
+
+    const zoneId = pathParams?.zoneId;
+    if (!zoneId) return badRequest('Missing zoneId', 'VALIDATION_ERROR');
+
+    const pricingEntries = Array.isArray(body?.pricing) ? body.pricing : null;
+    if (!pricingEntries || pricingEntries.length === 0) {
+      return badRequest('pricing array is required', 'VALIDATION_ERROR');
+    }
+
+    const zones = await zoneRestrictionsService.list();
+    const zone = zones.find((item) => String(item.id) === String(zoneId));
+    if (!zone) return notFoundError('Zone not found', 'ZONE_NOT_FOUND');
+
+    const vehicleTypes = await vehicleTypeService.listAll();
+    const vehicleTypeById = new Map(vehicleTypes.map((item) => [String(item.id), item]));
+    const entries = [];
+    for (const row of pricingEntries) {
+      const vehicleTypeId = String(row?.vehicleTypeId || '').trim();
+      if (!vehicleTypeId) {
+        return badRequest('Each pricing item requires vehicleTypeId', 'VALIDATION_ERROR');
+      }
+      const vehicleType = vehicleTypeById.get(vehicleTypeId);
+      if (!vehicleType) {
+        return notFoundError(`Vehicle type not found: ${vehicleTypeId}`, 'VEHICLE_TYPE_NOT_FOUND');
+      }
+      const parsed = validateSchema(row, [
+        { key: 'baseFare', type: 'number', required: true, min: 0 },
+        { key: 'perKmRate', type: 'number', required: true, min: 0 },
+        { key: 'perMinRate', type: 'number', required: true, min: 0 },
+        { key: 'minFare', type: 'number', required: true, min: 0 },
+        { key: 'commissionPct', type: 'number', required: false, min: 0, max: 1 },
+      ]);
+      if (!parsed.ok) return validationError(parsed.error);
+      entries.push({
+        vehicleType,
+        pricing: parsed.data,
+      });
+    }
+
+    const updatedBy = headers['x-admin-id'] || headers['x-admin-email'] || 'admin';
+    const updates = await zoneVehicleTypePricingService.bulkSetZonePricing({
+      zoneId,
+      entries,
+      updatedBy: String(updatedBy),
+    });
+    return { data: { updates } };
+  });
+
+  router.register('DELETE', '/api/v1/admin/zones/:zoneId/vehicle-types/:vehicleTypeId/pricing', async ({ headers, pathParams }) => {
+    const err = ensureAdmin(headers);
+    if (err) return err;
+
+    const zoneId = pathParams?.zoneId;
+    const vehicleTypeId = pathParams?.vehicleTypeId;
+    if (!zoneId || !vehicleTypeId) return badRequest('Missing zoneId or vehicleTypeId', 'VALIDATION_ERROR');
+
+    const zones = await zoneRestrictionsService.list();
+    const zone = zones.find((item) => String(item.id) === String(zoneId));
+    if (!zone) return notFoundError('Zone not found', 'ZONE_NOT_FOUND');
+
+    const vehicleType = await vehicleTypeService.getById(vehicleTypeId);
+    if (!vehicleType) {
+      return notFoundError('Vehicle type not found', 'VEHICLE_TYPE_NOT_FOUND');
+    }
+
+    const removed = await zoneVehicleTypePricingService.clearZonePricing(zoneId, vehicleTypeId);
+    if (!removed) return notFoundError('Zone vehicle pricing override not found', 'ZONE_VEHICLE_PRICING_NOT_FOUND');
+    return { data: { removed: true } };
   });
 
   // ── Admin: pricing tax config ─────────────────────────────────────────────

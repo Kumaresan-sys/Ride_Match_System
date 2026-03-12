@@ -1,6 +1,6 @@
 'use strict';
 
-const DOMAINS = ['identity', 'drivers', 'rides', 'payments', 'analytics'];
+const DOMAINS = ['identity', 'drivers', 'rides', 'payments', 'analytics', 'support'];
 
 // Extension/system-managed tables that should not be domain-owned or extracted.
 const IGNORED_TABLES = new Set([
@@ -27,6 +27,10 @@ const EXACT_TABLE_OWNERS = Object.freeze({
   ride_chat_attachments: 'rides',
   ride_chat_message_receipts: 'rides',
   ride_chat_events: 'rides',
+  ride_tracking_shares: 'rides',
+  trip_share_delivery_logs: 'rides',
+  zone_vehicle_type_availability: 'rides',
+  zone_vehicle_type_pricing: 'rides',
   payment_rider_projection: 'payments',
   payment_driver_projection: 'payments',
   driver_user_projection: 'drivers',
@@ -96,16 +100,18 @@ const EXACT_TABLE_OWNERS = Object.freeze({
   in_app_messages: 'rides',
   email_logs: 'rides',
   sms_logs: 'rides',
-  support_agents: 'rides',
-  support_categories: 'rides',
-  support_csat: 'rides',
-  support_faq: 'rides',
-  support_ticket_messages: 'rides',
-  support_tickets: 'rides',
-  ticket_escalations: 'rides',
-  ticket_messages: 'rides',
-  ticket_ratings: 'rides',
-  ticket_status_history: 'rides',
+  support_agents: 'support',
+  support_categories: 'support',
+  support_csat: 'support',
+  support_faq: 'support',
+  support_ticket_messages: 'support',
+  support_ticket_read_state: 'support',
+  support_ticket_attachments: 'support',
+  support_tickets: 'support',
+  ticket_escalations: 'support',
+  ticket_messages: 'support',
+  ticket_ratings: 'support',
+  ticket_status_history: 'support',
   sos_logs: 'rides',
   sos_admin_actions: 'rides',
   sos_location_track: 'rides',

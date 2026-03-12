@@ -6,6 +6,7 @@ const config = require('../config');
 const { haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
 const googleMapsService = require('./google-maps-service');
+const zoneVehicleTypePricingService = require('./zone-vehicle-type-pricing-service');
 
 const CACHE_TTL_MS = 60_000; // reload from DB every 60 seconds
 
@@ -26,6 +27,85 @@ class PricingService {
   _getDb() {
     if (!this._db) this._db = require('./db');
     return this._db;
+  }
+
+  _normalizeCard(card) {
+    if (!card) return null;
+    return {
+      ...card,
+      baseFare: Number.parseFloat(card.baseFare),
+      perKm: Number.parseFloat(card.perKm ?? card.perKmRate),
+      perMin: Number.parseFloat(card.perMin ?? card.perMinRate),
+      minFare: Number.parseFloat(card.minFare),
+      commission: card.commission != null
+        ? Number.parseFloat(card.commission)
+        : card.commissionPct != null
+        ? Number.parseFloat(card.commissionPct)
+        : null,
+    };
+  }
+
+  async _getEffectiveRateCards({ pickupLat, pickupLng, role = 'rider' } = {}) {
+    const cards = await this._loadRateCards();
+    const normalizedCards = [...cards.values()].map((card) => this._normalizeCard(card));
+    if (!Number.isFinite(pickupLat) || !Number.isFinite(pickupLng)) {
+      return new Map(normalizedCards.map((card) => [card.name, card]));
+    }
+
+    const zonePriced = await zoneVehicleTypePricingService.applyZonePricingForLocation(
+      normalizedCards.map((card) => ({
+        ...card,
+        perKmRate: card.perKm,
+        perMinRate: card.perMin,
+        commissionPct: card.commission,
+      })),
+      { pickupLat, pickupLng, role },
+    );
+
+    return new Map(zonePriced.map((card) => [card.name, this._normalizeCard(card)]));
+  }
+
+  _calculateFareFromCard(card, rideType, distanceKm, durationMin, surgeMultiplier, taxConfig) {
+    const normalizedCard = this._normalizeCard(card);
+    const baseFare = normalizedCard.baseFare;
+    const distanceCharge = distanceKm * normalizedCard.perKm;
+    const timeCharge = durationMin * normalizedCard.perMin;
+    const subtotal = Math.max(normalizedCard.minFare, baseFare + distanceCharge + timeCharge);
+    const serviceCostRaw = subtotal * surgeMultiplier;
+    const gstAmountRaw = serviceCostRaw * ((taxConfig.gstPct || 0) / 100);
+    const finalFareRaw = serviceCostRaw + gstAmountRaw;
+    const serviceCost = Math.round(serviceCostRaw * 100) / 100;
+    const gstAmount = Math.round(gstAmountRaw * 100) / 100;
+    const finalFare = Math.round(finalFareRaw * 100) / 100;
+    const commissionPct = Number.isFinite(taxConfig.platformCommissionPct)
+      ? taxConfig.platformCommissionPct
+      : normalizedCard.commission;
+    const platformCommission = Math.round(finalFare * commissionPct * 100) / 100;
+    const driverEarnings = Math.round((finalFare - platformCommission) * 100) / 100;
+
+    return {
+      rideType,
+      distanceKm: Math.round(distanceKm * 100) / 100,
+      durationMin: Math.round(durationMin * 10) / 10,
+      finalFare,
+      serviceCost,
+      gstAmount,
+      gstPct: taxConfig.gstPct || 0,
+      commissionPct,
+      driverEarnings,
+      platformCommission,
+      breakdown: {
+        baseFare,
+        distanceCharge: Math.round(distanceCharge * 100) / 100,
+        timeCharge: Math.round(timeCharge * 100) / 100,
+        subtotal: Math.round(subtotal * 100) / 100,
+        serviceCost,
+        gstPct: taxConfig.gstPct || 0,
+        gstAmount,
+        commissionPct,
+        surgeMultiplier: Math.round(surgeMultiplier * 100) / 100,
+      },
+    };
   }
 
   // Load rate cards from vehicle_types table; returns Map<name, card>
@@ -219,57 +299,21 @@ class PricingService {
   }
 
   // Returns all active vehicle types for the app
-  async getVehicleTypes() {
-    const cards = await this._loadRateCards();
+  async getVehicleTypes(options = {}) {
+    const cards = await this._getEffectiveRateCards(options);
     return [...cards.values()];
   }
 
-  async calculateFare(rideType, distanceKm, durationMin, surgeMultiplier = 1) {
-    const cards = await this._loadRateCards();
+  async calculateFare(rideType, distanceKm, durationMin, surgeMultiplier = 1, options = {}) {
+    const cards = options.cardMap instanceof Map
+      ? options.cardMap
+      : await this._getEffectiveRateCards(options);
     const taxConfig = await this.getTaxConfig();
     const card = cards.get(rideType) || cards.get('sedan') || cards.values().next().value;
 
-    const baseFare      = card.baseFare;
-    const distanceCharge = distanceKm * card.perKm;
-    const timeCharge    = durationMin * card.perMin;
-    const subtotal      = Math.max(card.minFare, baseFare + distanceCharge + timeCharge);
-    const serviceCostRaw = subtotal * surgeMultiplier;
-    const gstAmountRaw = serviceCostRaw * ((taxConfig.gstPct || 0) / 100);
-    const finalFareRaw = serviceCostRaw + gstAmountRaw;
-    const serviceCost  = Math.round(serviceCostRaw * 100) / 100;
-    const gstAmount    = Math.round(gstAmountRaw * 100) / 100;
-    const finalFare    = Math.round(finalFareRaw * 100) / 100;
-    const commissionPct = Number.isFinite(taxConfig.platformCommissionPct)
-      ? taxConfig.platformCommissionPct
-      : card.commission;
-    const platformCommission = Math.round(finalFare * commissionPct * 100) / 100;
-    const driverEarnings = Math.round((finalFare - platformCommission) * 100) / 100;
-
     this.stats.fareCalculations += 1;
 
-    return {
-      rideType,
-      distanceKm:   Math.round(distanceKm * 100) / 100,
-      durationMin:  Math.round(durationMin * 10) / 10,
-      finalFare,
-      serviceCost,
-      gstAmount,
-      gstPct: taxConfig.gstPct || 0,
-      commissionPct,
-      driverEarnings,
-      platformCommission,
-      breakdown: {
-        baseFare,
-        distanceCharge:  Math.round(distanceCharge * 100) / 100,
-        timeCharge:      Math.round(timeCharge * 100) / 100,
-        subtotal:        Math.round(subtotal * 100) / 100,
-        serviceCost,
-        gstPct: taxConfig.gstPct || 0,
-        gstAmount,
-        commissionPct,
-        surgeMultiplier: Math.round(surgeMultiplier * 100) / 100,
-      },
-    };
+    return this._calculateFareFromCard(card, rideType, distanceKm, durationMin, surgeMultiplier, taxConfig);
   }
 
   // Synchronous fallback used internally when async isn't available
@@ -286,11 +330,16 @@ class PricingService {
 
     const zoneId = 'chennai:default';
     const surge  = this.getSurgeMultiplier(zoneId);
-    const cards  = await this._loadRateCards();
+    const cards  = await this._getEffectiveRateCards({ pickupLat, pickupLng, role: 'rider' });
 
     const estimates = {};
     for (const [rideType] of cards) {
-      const fare = await this.calculateFare(rideType, distanceKm, durationMin, surge.multiplier);
+      const fare = await this.calculateFare(rideType, distanceKm, durationMin, surge.multiplier, {
+        cardMap: cards,
+        pickupLat,
+        pickupLng,
+        role: 'rider',
+      });
       estimates[rideType] = {
         ...fare,
         etaMin: Math.max(3, Math.round(durationMin * 0.25)),

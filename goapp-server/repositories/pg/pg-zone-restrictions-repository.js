@@ -80,6 +80,16 @@ class PgZoneRestrictionsRepository {
     return rows.map((r) => this._mapRow(r));
   }
 
+  async findMatchingZones(lat, lng, role = 'rider', location = {}) {
+    const zones = await this.listEnabled(role);
+    const normalizedLocation = this._normalizeGeoInput(location);
+    return zones.filter(
+      (zone) =>
+        haversine(lat, lng, zone.lat, zone.lng) <= zone.radiusKm &&
+        this._matchesGeoFilter(zone, normalizedLocation),
+    );
+  }
+
   // ── create ────────────────────────────────────────────────────────────────
   async create({ name, lat, lng, radiusKm, appliesTo = 'both', isAllowed = false, country, state, pincode, restrictionMessage, createdBy }) {
     const geo = this._normalizeGeoInput({ country, state, pincode });

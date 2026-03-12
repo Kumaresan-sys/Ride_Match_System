@@ -22,6 +22,7 @@ const domainProjectionService = require('./domain-projection-service');
 const RedisStateStore = require('../infra/redis/state-store');
 const KafkaProducer = require('../infra/kafka/producer');
 const { TOPICS } = require('../infra/kafka/topics');
+const tripShareService = require('./trip-share-service');
 
 const S = config.rideStatuses;
 
@@ -485,6 +486,10 @@ class RideService {
     logger.success('RIDE', `Trip started for ride ${rideId}`);
 
     notificationService.notifyTripStarted(ride.riderId, rideId);
+    tripShareService.handleRideStarted({
+      rideId,
+      riderId: ride.riderId,
+    }).catch((err) => logger.warn('TRIP_SHARE', `Ride-start trip share failed for ${rideId}: ${err.message}`));
 
     return ride;
   }
@@ -500,7 +505,12 @@ class RideService {
       ride.rideType,
       actualDistanceKm || ride.fareEstimate.distanceKm,
       actualDurationMin || ride.fareEstimate.durationMin,
-      ride.surgeMultiplier
+      ride.surgeMultiplier,
+      {
+        pickupLat: Number(ride.pickupLat),
+        pickupLng: Number(ride.pickupLng),
+        role: 'rider',
+      }
     );
     ride.finalFare = finalFare;
 
@@ -1013,6 +1023,11 @@ class RideService {
         destLng: ride.destLng,
         updatedAt: Date.now(),
       }, 4 * 3600).catch((err) => logger.warn('RIDE', `REDIS_STATE_V2 setActiveRide failed: ${err.message}`));
+    }
+
+    if ([S.TRIP_COMPLETED, S.CANCELLED_BY_RIDER, S.CANCELLED_BY_DRIVER, S.NO_DRIVERS].includes(newStatus)) {
+      tripShareService.finalizeRideShares({ rideId, finalStatus: newStatus })
+        .catch((err) => logger.warn('TRIP_SHARE', `Failed to finalize shares for ${rideId}: ${err.message}`));
     }
   }
 

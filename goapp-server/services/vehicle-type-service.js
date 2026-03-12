@@ -26,6 +26,19 @@ class VehicleTypeService {
     return rows.map(this._formatType);
   }
 
+  async getById(id) {
+    const { rows } = await db.query(
+      `SELECT id, name, display_name, category, base_fare, per_km_rate, per_min_rate,
+              min_fare, commission_pct, max_passengers, sort_order, icon_url, description,
+              is_active, created_at, updated_at
+         FROM vehicle_types
+        WHERE id = $1
+        LIMIT 1`,
+      [id],
+    );
+    return rows[0] ? this._formatType(rows[0]) : null;
+  }
+
   async create(payload) {
     const { rows } = await db.query(
       `INSERT INTO vehicle_types

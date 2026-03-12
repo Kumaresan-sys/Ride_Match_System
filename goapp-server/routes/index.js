@@ -11,6 +11,7 @@ const registerCancelRideRoutes = require('./cancel-ride-routes');
 const registerDriverDocumentRoutes = require('./driver-document-routes');
 const registerProfileRoutes = require('./profile-routes');
 const registerSafetyRoutes  = require('./safety-routes');
+const registerPublicShareRoutes = require('./public-share-routes');
 const registerDriverRoutes = require('./driver-routes');
 const registerSosRoutes = require('./sos-routes');
 const registerTicketRoutes = require('./ticket-routes');
@@ -31,6 +32,7 @@ function buildRouteDispatcher(context) {
   registerAuthRoutes(router, context);
   registerProfileRoutes(router, context);
   registerSafetyRoutes(router, context);
+  registerPublicShareRoutes(router, context);
   registerSosRoutes(router, context);
   registerDriverRoutes(router, context);
   registerTicketRoutes(router, context);
