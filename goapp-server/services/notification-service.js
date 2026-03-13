@@ -9,8 +9,10 @@
 
 const config = require('../config');
 const db = require('./db');
+const notificationCenterService = require('./notification-center-service');
 const { logger } = require('../utils/logger');
 const ALLOWED_PLATFORMS = new Set(['ios', 'android', 'web']);
+const CATEGORY_VALUES = new Set(['ride', 'payment', 'promo', 'system', 'security', 'other']);
 const APP_DEEP_LINK_SCHEME = process.env.APP_DEEP_LINK_SCHEME || 'goapp://';
 const UUID_V4_LIKE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -129,6 +131,188 @@ class NotificationService {
     this._cacheTimestamps.delete(normalizedUserId);
   }
 
+  async _createNotificationRecord(userId, {
+    title,
+    body,
+    data = {},
+  } = {}) {
+    try {
+      const referenceType = String(
+        data.referenceType ||
+        (String(data.type || '').trim() ? String(data.type || '').trim().toLowerCase() : '') ||
+        'push'
+      ).slice(0, 30);
+      const referenceIdRaw =
+        data.referenceId ||
+        data.trackingId ||
+        data.rideId ||
+        data.ticketId ||
+        null;
+      const referenceId = referenceIdRaw == null ? null : String(referenceIdRaw);
+      const category = this._inferCategory(data);
+      const deepLink = this._normalizeDeepLinkForStorage(data.deepLink);
+      const navPayload = this._buildNavPayload(data);
+      const { rows } = await db.query(
+        `INSERT INTO notifications (
+           user_id,
+           channel,
+           title,
+           body,
+           data_payload,
+           priority,
+           status,
+           reference_type,
+           reference_id,
+           event_type,
+           category,
+           deep_link,
+           nav_payload,
+           source_service,
+           updated_at
+         ) VALUES ($1, 'push', $2, $3, $4::jsonb, 'normal', 'unread', $5, $6, $7, $8, $9, $10::jsonb, $11, NOW())
+         RETURNING id::text AS "notificationId"`,
+        [
+          userId,
+          title || null,
+          body || '',
+          JSON.stringify(data || {}),
+          referenceType || null,
+          referenceId,
+          String(data.eventType || data.type || '').trim() || null,
+          category,
+          deepLink,
+          JSON.stringify(navPayload || {}),
+          'notification-service',
+        ],
+      );
+      const notificationId = rows[0]?.notificationId || null;
+      if (notificationId) {
+        await this._appendNotificationLog(notificationId, 'queued', {
+          payload: data || {},
+        });
+        await notificationCenterService.appendEvent(notificationId, userId, 'created', {
+          sourceService: 'notification-service',
+          referenceType,
+          referenceId,
+          eventType: data.eventType || data.type || null,
+          deepLink,
+        });
+      }
+      return notificationId;
+    } catch (err) {
+      logger.warn('FCM', `Failed to persist notification row for ${userId}: ${err.message}`);
+      return null;
+    }
+  }
+
+  async _appendNotificationLog(notificationId, event, {
+    providerResponse = null,
+    errorMessage = null,
+    payload = null,
+  } = {}) {
+    if (!notificationId) return;
+    try {
+      await db.query(
+        `INSERT INTO notification_logs (
+           notification_id,
+           event,
+           provider_response,
+           error_message
+         ) VALUES ($1, $2, $3::jsonb, $4)`,
+        [
+          notificationId,
+          String(event || 'unknown').slice(0, 30),
+          JSON.stringify(providerResponse || payload || {}),
+          errorMessage,
+        ],
+      );
+    } catch (err) {
+      logger.warn('FCM', `Failed to persist notification log ${notificationId}: ${err.message}`);
+    }
+  }
+
+  async _updateNotificationStatus(notificationId, status, userId, {
+    providerResponse = null,
+    errorMessage = null,
+  } = {}) {
+    if (!notificationId) return;
+    try {
+      if (status === 'sent') {
+        await db.query(
+          `UPDATE notifications
+           SET delivered_at = COALESCE(delivered_at, NOW()),
+               updated_at = NOW()
+           WHERE id = $1`,
+          [notificationId],
+        );
+        if (userId) {
+          await notificationCenterService.appendEvent(notificationId, userId, 'delivered', {
+            provider: 'fcm',
+          });
+        }
+      } else if (status === 'failed') {
+        await db.query(
+          `UPDATE notifications
+           SET updated_at = NOW()
+           WHERE id = $1`,
+          [notificationId],
+        );
+      }
+      await this._appendNotificationLog(notificationId, status, {
+        providerResponse,
+        errorMessage,
+      });
+    } catch (err) {
+      logger.warn('FCM', `Failed to update notification ${notificationId}: ${err.message}`);
+    }
+  }
+
+  async _recordDeliveryAttempt(notificationId, {
+    deviceId = null,
+    tokenId = null,
+    providerMessageId = null,
+    status = 'sent',
+    errorCode = null,
+    errorMessage = null,
+  } = {}) {
+    try {
+      if (!notificationId) return;
+      const { rows } = await db.query(
+        `SELECT COALESCE(MAX(attempt_no), 0) + 1 AS attempt_no
+         FROM notification_delivery_attempts
+         WHERE notification_id = $1`,
+        [notificationId]
+      );
+      const attemptNo = rows[0]?.attempt_no || 1;
+      await db.query(
+        `INSERT INTO notification_delivery_attempts (
+           notification_id,
+           device_id,
+           token_id,
+           attempt_no,
+           provider,
+           provider_message_id,
+           status,
+           error_code,
+           error_message
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          notificationId,
+          deviceId,
+          tokenId,
+          attemptNo,
+          'fcm',
+          providerMessageId,
+          status,
+          errorCode,
+          errorMessage,
+        ],
+      );
+    } catch (err) {
+      logger.warn('FCM', `Failed to persist delivery attempt ${notificationId}: ${err.message}`);
+    }
+  }
+
   // ─── Core send ────────────────────────────────────────────────────────────
   async send(userId, { title, body, data = {}, channelId = 'goapp_rides' }) {
     const normalizedUserId = this._normalizeUserId(userId);
@@ -137,14 +321,36 @@ class NotificationService {
       return { sent: false, reason: 'invalid_user_id' };
     }
 
+    const notificationId = await this._createNotificationRecord(normalizedUserId, {
+      title,
+      body,
+      data,
+    });
+
     if (!this.initialized) {
       logger.info('FCM', `[SKIP — not initialised] ${normalizedUserId}: "${title}"`);
+      await this._recordDeliveryAttempt(notificationId, {
+        status: 'failed',
+        errorMessage: 'push provider not initialized',
+        errorCode: 'not_initialized',
+      });
+      await this._updateNotificationStatus(notificationId, 'failed', normalizedUserId, {
+        errorMessage: 'push provider not initialized',
+      });
       return { sent: false, reason: 'not_initialized' };
     }
 
     const devices = await this._getDevicesForUser(normalizedUserId);
     if (devices.length === 0) {
       logger.info('FCM', `[SKIP — no token] ${normalizedUserId}: "${title}"`);
+      await this._recordDeliveryAttempt(notificationId, {
+        status: 'failed',
+        errorMessage: 'no active push tokens',
+        errorCode: 'no_token',
+      });
+      await this._updateNotificationStatus(notificationId, 'failed', normalizedUserId, {
+        errorMessage: 'no active push tokens',
+      });
       return { sent: false, reason: 'no_token' };
     }
 
@@ -166,9 +372,22 @@ class NotificationService {
               payload: { aps: { sound: 'default', badge: 1 } },
             },
           });
+          await this._recordDeliveryAttempt(notificationId, {
+            deviceId: device.deviceId,
+            tokenId: device.token,
+            providerMessageId: messageId,
+            status: 'sent',
+          });
           logger.info('FCM', `✓ Sent to ${normalizedUserId} (${device.platform}): "${title}" [${messageId}]`);
           return messageId;
         } catch (err) {
+          await this._recordDeliveryAttempt(notificationId, {
+            deviceId: device.deviceId,
+            tokenId: device.token,
+            status: 'failed',
+            errorMessage: err?.message,
+            errorCode: err?.code,
+          });
           await this._handleSendError(normalizedUserId, device.token, err);
           return null;
         }
@@ -176,9 +395,21 @@ class NotificationService {
     );
 
     const messageIds = results.filter(Boolean);
-    return messageIds.length > 0
-      ? { sent: true, messageIds, delivered: messageIds.length }
-      : { sent: false, reason: 'all_tokens_failed' };
+    if (messageIds.length > 0) {
+      await this._updateNotificationStatus(notificationId, 'sent', normalizedUserId, {
+        providerResponse: {
+          messageIds,
+          delivered: messageIds.length,
+          attempted: devices.length,
+        },
+      });
+      return { sent: true, messageIds, delivered: messageIds.length, notificationId };
+    }
+
+    await this._updateNotificationStatus(notificationId, 'failed', normalizedUserId, {
+      errorMessage: 'all push token deliveries failed',
+    });
+    return { sent: false, reason: 'all_tokens_failed', notificationId };
   }
 
   // ─── Ride lifecycle notifications ─────────────────────────────────────────
@@ -414,6 +645,44 @@ class NotificationService {
     });
   }
 
+  async notifyReferralApplied(userId, { referralCode, rewardCoins }) {
+    return this.send(userId, {
+      title: 'Referral Code Accepted',
+      body: `Referral code ${referralCode} has been linked. Your referrer will earn ${rewardCoins} coins after your first ride.`,
+      channelId: 'goapp_rewards',
+      data: this._withNavigationData(
+        {
+          type: 'REFERRAL_APPLIED',
+          referenceType: 'referral',
+          referralCode,
+          rewardCoins,
+          screen: 'refer_earn',
+        },
+        { route: 'home', deepLink: this._buildDeepLink('/profile') },
+      ),
+    });
+  }
+
+  async notifyReferralRewardIssued(userId, { rewardCoins, rideId, trackingId, refereeName }) {
+    return this.send(userId, {
+      title: 'Referral Reward Credited',
+      body: `${refereeName || 'Your friend'} completed the first ride. ${rewardCoins} coins have been added to your wallet.`,
+      channelId: 'goapp_rewards',
+      data: this._withNavigationData(
+        {
+          type: 'REFERRAL_REWARD_ISSUED',
+          referenceType: 'referral',
+          referenceId: trackingId,
+          trackingId,
+          rideId,
+          rewardCoins,
+          screen: 'refer_earn',
+        },
+        { route: 'home', deepLink: this._buildDeepLink('/wallet') },
+      ),
+    });
+  }
+
   async notifyTicketCreated(userId, { ticketId, ticketCode = null, category, priority }) {
     const reference = ticketCode || ticketId;
     await this.send(userId, {
@@ -550,7 +819,7 @@ class NotificationService {
     if (cacheStale) {
       // Refresh from DB and populate the in-memory cache
       const { rows } = await db.query(
-        `SELECT token, platform
+        `SELECT token, platform, device_id
          FROM push_tokens
          WHERE user_id = $1
            AND is_active = true
@@ -567,6 +836,7 @@ class NotificationService {
           userId: normalizedUserId,
           token: row.token,
           platform: row.platform,
+          deviceId: row.device_id,
           updatedAt: Date.now(),
         });
       });
@@ -599,6 +869,52 @@ class NotificationService {
       .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
       .join('&');
     return `${base}?${qs}`;
+  }
+
+  _normalizeDeepLinkForStorage(deepLink) {
+    if (!deepLink) return null;
+    const normalized = String(deepLink).trim();
+    if (!normalized) return null;
+    if (normalized === 'wallet_activity_detail') return normalized;
+    if (normalized.includes('://')) {
+      const afterScheme = normalized.split('://').slice(1).join('://');
+      if (!afterScheme) return null;
+      if (afterScheme === 'wallet_activity_detail') return afterScheme;
+      const trimmed = afterScheme.replace(/^\/+/, '');
+      return trimmed ? `/${trimmed}` : null;
+    }
+    return normalized.startsWith('/') ? normalized : `/${normalized}`;
+  }
+
+  _inferCategory(data = {}) {
+    const category = String(data.category || '').trim().toLowerCase();
+    if (CATEGORY_VALUES.has(category)) return category;
+    const type = String(data.type || '').toUpperCase();
+    if (type.includes('PAYMENT') || type.includes('WALLET')) return 'payment';
+    if (type.includes('PROMO') || type.includes('OFFER')) return 'promo';
+    if (type.includes('SECURITY')) return 'security';
+    if (type.includes('RIDE') || type.includes('TRIP')) return 'ride';
+    return 'system';
+  }
+
+  _buildNavPayload(data = {}) {
+    if (data.navPayload && typeof data.navPayload === 'object') {
+      return data.navPayload;
+    }
+    const payload = {};
+    if (data.rideId) payload.rideId = String(data.rideId);
+    if (data.ticketId) payload.ticketId = String(data.ticketId);
+    if (data.paymentId) payload.paymentId = String(data.paymentId);
+    if (data.orderId) payload.orderId = String(data.orderId);
+    if (data.paymentStatus || data.status) payload.status = String(data.paymentStatus || data.status);
+    if (data.paymentMethod || data.method) payload.method = String(data.paymentMethod || data.method);
+    const amountCandidate = data.amount ?? data.paymentAmount ?? data.fare;
+    if (amountCandidate != null && !Number.isNaN(Number(amountCandidate))) {
+      payload.amount = Number(amountCandidate);
+    }
+    if (data.campaignId) payload.campaignId = String(data.campaignId);
+    if (data.action) payload.action = String(data.action);
+    return Object.keys(payload).length > 0 ? payload : null;
   }
 
   _withNavigationData(data = {}, { route = 'home', deepLink = null } = {}) {

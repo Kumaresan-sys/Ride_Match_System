@@ -37,7 +37,7 @@
     "test:integration": "npm run test:integration:base && npm run test:dev-verification",
     "test:integration:all": "NODE_ENV=test node --require ./config/env-loader.js --test --test-force-exit tests/integration/*.test.js",
     "test:integration:base": "NODE_ENV=test node --require ./config/env-loader.js --test --test-force-exit tests/integration/db.integration.test.js tests/integration/dev-reset-service.integration.test.js tests/integration/matching-engine-dev.integration.test.js tests/integration/redis.integration.test.js tests/integration/refresh-token-security.integration.test.js tests/integration/response-envelope.integration.test.js tests/integration/trip-share.integration.test.js",
-    "test:dev-verification": "npm run dev:seed-drivers && NODE_ENV=test node --require ./config/env-loader.js --test --test-concurrency=1 --test-force-exit tests/integration/driver-avatar.integration.test.js tests/integration/ride-request-dev.integration.test.js tests/integration/safety-preferences.integration.test.js tests/integration/zone-vehicle-types.integration.test.js tests/integration/admin-zone-vehicle-types.integration.test.js tests/integration/admin-zone-vehicle-types-bulk.integration.test.js tests/integration/admin-zone-vehicle-type-pricing.integration.test.js tests/integration/admin-zone-vehicle-type-pricing-bulk.integration.test.js",
+    "test:dev-verification": "node scripts/run-dev-verification.js",
     "docs:db-schema": "node scripts/generate-db-schema-doc.js"
   },
   "dependencies": {

@@ -60,6 +60,45 @@ class PgIdentityRepository {
     );
   }
 
+  _parseJsonb(value) {
+    if (!value) return {};
+    if (typeof value === 'object') return value;
+    if (typeof value !== 'string') return {};
+    try {
+      return JSON.parse(value);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  _getActiveReferralReward(programRow) {
+    const conditions = this._parseJsonb(programRow?.conditions);
+    const rewardCoins = Number.parseInt(
+      conditions.referrer_coins ?? programRow?.referrer_reward ?? 100,
+      10,
+    ) || 100;
+    return {
+      rewardCoins,
+      rewardUnit: String(conditions.reward_unit || 'coins'),
+      programName: String(programRow?.program_name || 'GoApp Rider Referral'),
+    };
+  }
+
+  _maskPhoneNumber(phoneNumber) {
+    const digits = String(phoneNumber || '').replace(/\D/g, '');
+    if (!digits) return '';
+    if (digits.length <= 4) return digits;
+    const suffix = digits.slice(-4);
+    return `${'*'.repeat(Math.max(0, digits.length - 4))}${suffix}`;
+  }
+
+  _buildReferralError(message, code, status = 409) {
+    const err = new Error(message);
+    err.code = code;
+    err.status = status;
+    return err;
+  }
+
   // ─── OTP Rate Limiting ────────────────────────────────────────────────────
 
   async getRateLimit(phone) {
@@ -1140,6 +1179,480 @@ class PgIdentityRepository {
       }
     }
     return { code: null };
+  }
+
+  async validateReferralCode({ userId, referralCode }) {
+    const normalizedCode = String(referralCode || '').trim().toUpperCase();
+    if (!normalizedCode) {
+      throw this._buildReferralError('Referral code is required.', 'REFERRAL_CODE_REQUIRED', 400);
+    }
+
+    const [existingTracking, referralRow] = await Promise.all([
+      domainDb.query(
+        'identity',
+        `SELECT id
+         FROM referral_tracking
+         WHERE referee_id = $1
+         LIMIT 1`,
+        [userId],
+      ),
+      domainDb.query(
+        'identity',
+        `SELECT rc.id AS "referralCodeId",
+                rc.user_id AS "referrerId",
+                rc.code,
+                rc.uses_count AS "usesCount",
+                rc.max_uses AS "maxUses",
+                rp.id AS "programId",
+                rp.program_name,
+                rp.referrer_reward,
+                rp.reward_type,
+                rp.conditions,
+                up.display_name AS "referrerName"
+         FROM referral_codes rc
+         JOIN referral_programs rp ON rp.id = rc.program_id
+         LEFT JOIN user_profiles up ON up.user_id = rc.user_id
+         WHERE UPPER(rc.code) = $1
+           AND rp.is_active = true
+         ORDER BY rc.created_at DESC
+         LIMIT 1`,
+        [normalizedCode],
+      ),
+    ]);
+
+    if (existingTracking.rows[0]) {
+      throw this._buildReferralError(
+        'Referral code has already been used for this account.',
+        'REFERRAL_ALREADY_USED',
+        409,
+      );
+    }
+
+    const match = referralRow.rows[0];
+    if (!match) {
+      throw this._buildReferralError('Referral code is invalid.', 'INVALID_REFERRAL_CODE', 400);
+    }
+
+    if (String(match.referrerId) === String(userId)) {
+      throw this._buildReferralError(
+        'You cannot use your own referral code.',
+        'SELF_REFERRAL_NOT_ALLOWED',
+        409,
+      );
+    }
+
+    if (match.maxUses != null && Number(match.usesCount || 0) >= Number(match.maxUses || 0)) {
+      throw this._buildReferralError(
+        'Referral code has reached its usage limit.',
+        'REFERRAL_CODE_EXHAUSTED',
+        409,
+      );
+    }
+
+    return {
+      ...match,
+      ...this._getActiveReferralReward(match),
+      code: normalizedCode,
+    };
+  }
+
+  async applyReferralCode({ userId, referralCode }) {
+    const normalizedCode = String(referralCode || '').trim().toUpperCase();
+    const referral = await this.validateReferralCode({ userId, referralCode: normalizedCode });
+    const client = await domainDb.getClient('identity');
+    try {
+      await client.query('BEGIN');
+
+      const { rows: existingRows } = await client.query(
+        `SELECT id
+         FROM referral_tracking
+         WHERE referee_id = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [userId],
+      );
+      if (existingRows[0]) {
+        throw this._buildReferralError(
+          'Referral code has already been used for this account.',
+          'REFERRAL_ALREADY_USED',
+          409,
+        );
+      }
+
+      const trackingMetadata = {
+        referralCode: normalizedCode,
+        programId: referral.programId,
+        programName: referral.programName,
+        rewardCoins: referral.rewardCoins,
+      };
+      const idempotencyKey = `referral_apply:${userId}:${referral.referralCodeId}`;
+      const { rows } = await client.query(
+        `INSERT INTO referral_tracking (
+           referral_code_id,
+           referrer_id,
+           referee_id,
+           status,
+           referrer_rewarded,
+           referee_rewarded,
+           used_at,
+           metadata,
+           idempotency_key
+         ) VALUES ($1, $2, $3, 'signup_complete', false, false, NOW(), $4::jsonb, $5)
+         RETURNING id::text AS "trackingId"`,
+        [
+          referral.referralCodeId,
+          referral.referrerId,
+          userId,
+          JSON.stringify(trackingMetadata),
+          idempotencyKey,
+        ],
+      );
+
+      const trackingId = rows[0]?.trackingId || null;
+      await client.query(
+        `UPDATE referral_codes
+         SET uses_count = uses_count + 1
+         WHERE id = $1`,
+        [referral.referralCodeId],
+      );
+
+      if (trackingId) {
+        await client.query(
+          `INSERT INTO referral_events (tracking_id, event_type, actor_user_id, metadata)
+           VALUES ($1, 'code_applied', $2, $3::jsonb)`,
+          [
+            trackingId,
+            userId,
+            JSON.stringify({
+              referralCode: normalizedCode,
+              rewardCoins: referral.rewardCoins,
+            }),
+          ],
+        );
+      }
+
+      await client.query('COMMIT');
+      return {
+        applied: true,
+        trackingId,
+        referrerId: referral.referrerId,
+        referrerName: referral.referrerName || '',
+        rewardCoins: referral.rewardCoins,
+        code: normalizedCode,
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      if (err.code === '23505') {
+        throw this._buildReferralError(
+          'Referral code has already been used for this account.',
+          'REFERRAL_ALREADY_USED',
+          409,
+        );
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async getPendingReferralForReferee(refereeUserId) {
+    const { rows } = await domainDb.query(
+      'identity',
+      `SELECT rt.id::text AS "trackingId",
+              rt.referrer_id AS "referrerId",
+              rt.referee_id AS "refereeId",
+              rt.status,
+              rt.qualifying_ride_id AS "qualifyingRideId",
+              rt.reward_issued_at AS "rewardIssuedAt",
+              rp.id AS "programId",
+              rp.program_name,
+              rp.referrer_reward,
+              rp.reward_type,
+              rp.conditions,
+              up.display_name AS "referrerName"
+       FROM referral_tracking rt
+       JOIN referral_codes rc ON rc.id = rt.referral_code_id
+       JOIN referral_programs rp ON rp.id = rc.program_id
+       LEFT JOIN user_profiles up ON up.user_id = rt.referrer_id
+       WHERE rt.referee_id = $1
+         AND rt.status IN ('pending', 'signup_complete', 'first_ride')
+       ORDER BY rt.created_at DESC
+       LIMIT 1`,
+      [refereeUserId],
+    );
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      ...row,
+      ...this._getActiveReferralReward(row),
+    };
+  }
+
+  async markReferralFirstRideQualified({ trackingId, rideId }) {
+    const client = await domainDb.getClient('identity');
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `SELECT rt.id::text AS "trackingId",
+                rt.status,
+                rt.qualifying_ride_id AS "qualifyingRideId",
+                rt.referrer_id AS "referrerId",
+                rt.referee_id AS "refereeId",
+                up.display_name AS "refereeName"
+         FROM referral_tracking rt
+         LEFT JOIN user_profiles up ON up.user_id = rt.referee_id
+         WHERE rt.id = $1
+         LIMIT 1
+         FOR UPDATE OF rt`,
+        [trackingId],
+      );
+      const tracking = rows[0];
+      if (!tracking) {
+        await client.query('COMMIT');
+        return { qualified: false, reason: 'not_found' };
+      }
+      if (tracking.status === 'reward_issued') {
+        await client.query('COMMIT');
+        return { qualified: false, reason: 'already_rewarded' };
+      }
+      if (tracking.qualifyingRideId && String(tracking.qualifyingRideId) === String(rideId)) {
+        await client.query('COMMIT');
+        return {
+          qualified: true,
+          alreadyQualified: true,
+          referrerId: tracking.referrerId,
+          refereeId: tracking.refereeId,
+          refereeName: tracking.refereeName || '',
+        };
+      }
+
+      await client.query(
+        `UPDATE referral_tracking
+         SET status = 'first_ride',
+             qualifying_ride_id = $2::text,
+             completed_at = COALESCE(completed_at, NOW()),
+             metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('qualifyingRideId', $2::text)
+         WHERE id = $1`,
+        [trackingId, String(rideId || '')],
+      );
+      await client.query(
+        `INSERT INTO referral_events (tracking_id, event_type, actor_user_id, metadata)
+         VALUES ($1, 'first_ride_qualified', $2, $3::jsonb)`,
+        [
+          trackingId,
+          tracking.refereeId,
+          JSON.stringify({ rideId: String(rideId || '') }),
+        ],
+      );
+      await client.query('COMMIT');
+      return {
+        qualified: true,
+        alreadyQualified: false,
+        referrerId: tracking.referrerId,
+        refereeId: tracking.refereeId,
+        refereeName: tracking.refereeName || '',
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  async markReferralRewardIssued({
+    trackingId,
+    referrerUserId,
+    rewardCoins,
+    rideId,
+    coinTransactionId = null,
+    payoutIdempotencyKey,
+  }) {
+    await domainDb.query(
+      'payments',
+      `INSERT INTO referral_payouts (
+         tracking_id,
+         user_id,
+         amount,
+         payout_type,
+         status,
+         reward_unit,
+         coin_transaction_id,
+         metadata,
+         idempotency_key,
+         completed_at
+       ) VALUES ($1, $2, $3, 'coins', 'completed', 'coins', $4, $5::jsonb, $6, NOW())
+       ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+       DO UPDATE SET
+         status = 'completed',
+         reward_unit = EXCLUDED.reward_unit,
+         coin_transaction_id = COALESCE(referral_payouts.coin_transaction_id, EXCLUDED.coin_transaction_id),
+         metadata = COALESCE(referral_payouts.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+         completed_at = COALESCE(referral_payouts.completed_at, NOW())`,
+      [
+        trackingId,
+        referrerUserId,
+        rewardCoins,
+        coinTransactionId,
+        JSON.stringify({
+          trackingId,
+          rideId: String(rideId || ''),
+          rewardCoins,
+        }),
+        payoutIdempotencyKey,
+      ],
+    );
+
+    await domainDb.query(
+      'identity',
+      `UPDATE referral_tracking
+       SET status = 'reward_issued',
+           referrer_rewarded = true,
+           reward_issued_at = COALESCE(reward_issued_at, NOW()),
+           completed_at = COALESCE(completed_at, NOW()),
+           metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+             'rewardCoins', $2::int,
+             'rewardRideId', $3::text,
+             'coinTransactionId', $4::text
+           )
+       WHERE id = $1`,
+      [
+        trackingId,
+        rewardCoins,
+        String(rideId || ''),
+        coinTransactionId,
+      ],
+    );
+
+    await this.recordReferralEvent({
+      trackingId,
+      eventType: 'reward_issued',
+      actorUserId: referrerUserId,
+      metadata: {
+        rewardCoins,
+        rideId: String(rideId || ''),
+        coinTransactionId,
+      },
+    });
+  }
+
+  async recordReferralEvent({ trackingId, eventType, actorUserId = null, metadata = {} }) {
+    if (!trackingId || !eventType) return;
+    await domainDb.query(
+      'identity',
+      `INSERT INTO referral_events (tracking_id, event_type, actor_user_id, metadata)
+       VALUES ($1, $2, $3, $4::jsonb)`,
+      [
+        trackingId,
+        eventType,
+        actorUserId,
+        JSON.stringify(metadata || {}),
+      ],
+    );
+  }
+
+  async getReferralSummary(userId) {
+    const programResult = await domainDb.query(
+      'identity',
+      `SELECT id,
+              program_name,
+              referrer_reward,
+              reward_type,
+              conditions
+       FROM referral_programs
+       WHERE is_active = true
+       ORDER BY created_at DESC
+       LIMIT 1`,
+    );
+    const activeProgram = programResult.rows[0] || {
+      program_name: 'GoApp Rider Referral',
+      referrer_reward: 100,
+      reward_type: 'wallet_credit',
+      conditions: { reward_unit: 'coins', referrer_coins: 100 },
+    };
+    const rewardConfig = this._getActiveReferralReward(activeProgram);
+
+    const historyResult = await domainDb.query(
+      'identity',
+      `SELECT rt.id::text AS "trackingId",
+              rt.status,
+              EXTRACT(EPOCH FROM rt.used_at) * 1000 AS "usedAt",
+              EXTRACT(EPOCH FROM rt.completed_at) * 1000 AS "completedAt",
+              EXTRACT(EPOCH FROM rt.reward_issued_at) * 1000 AS "rewardIssuedAt",
+              rt.qualifying_ride_id AS "rideId",
+              up.display_name AS "displayName",
+              u.phone_number AS "phoneNumber"
+       FROM referral_tracking rt
+       LEFT JOIN user_profiles up ON up.user_id = rt.referee_id
+       LEFT JOIN users u ON u.id = rt.referee_id
+       WHERE rt.referrer_id = $1
+       ORDER BY rt.used_at DESC, rt.created_at DESC`,
+      [userId],
+    );
+    const trackingIds = historyResult.rows
+      .map((row) => row.trackingId)
+      .filter(Boolean);
+
+    let payoutsByTrackingId = new Map();
+    let totalEarnedCoins = 0;
+    if (trackingIds.length > 0) {
+      const payoutResult = await domainDb.query(
+        'payments',
+        `SELECT tracking_id::text AS "trackingId",
+                amount,
+                status,
+                reward_unit AS "rewardUnit",
+                coin_transaction_id::text AS "coinTransactionId",
+                EXTRACT(EPOCH FROM completed_at) * 1000 AS "completedAt"
+         FROM referral_payouts
+         WHERE user_id = $1
+           AND tracking_id = ANY($2::uuid[])`,
+        [userId, trackingIds],
+      );
+      payoutsByTrackingId = new Map(
+        payoutResult.rows.map((row) => [row.trackingId, row]),
+      );
+    }
+
+    const totalsResult = await domainDb.query(
+      'payments',
+      `SELECT COALESCE(SUM(amount), 0) AS total
+       FROM referral_payouts
+       WHERE user_id = $1
+         AND status = 'completed'
+         AND reward_unit = 'coins'`,
+      [userId],
+    );
+    totalEarnedCoins = Number.parseInt(totalsResult.rows[0]?.total || 0, 10) || 0;
+
+    const history = historyResult.rows.map((row) => {
+      const payout = payoutsByTrackingId.get(row.trackingId) || null;
+      return {
+        trackingId: row.trackingId,
+        displayName: row.displayName || 'Friend',
+        maskedPhone: this._maskPhoneNumber(row.phoneNumber),
+        status: String(row.status || 'pending'),
+        rewardCoins: Number.parseInt(payout?.amount || rewardConfig.rewardCoins, 10) || rewardConfig.rewardCoins,
+        usedAt: row.usedAt ? new Date(Number(row.usedAt)).toISOString() : null,
+        completedAt: row.completedAt ? new Date(Number(row.completedAt)).toISOString() : null,
+        rewardIssuedAt: row.rewardIssuedAt
+          ? new Date(Number(row.rewardIssuedAt)).toISOString()
+          : (payout?.completedAt ? new Date(Number(payout.completedAt)).toISOString() : null),
+        rideId: row.rideId || null,
+      };
+    });
+
+    return {
+      rewardCoins: rewardConfig.rewardCoins,
+      rewardUnit: rewardConfig.rewardUnit,
+      description: `Share your code and earn ${rewardConfig.rewardCoins} coins when your friend completes their first ride.`,
+      shareMessage: '',
+      totalEarnedCoins,
+      totalReferrals: history.length,
+      completedReferrals: history.filter((item) => item.status === 'reward_issued').length,
+      pendingReferrals: history.filter((item) => item.status !== 'reward_issued' && item.status !== 'expired').length,
+      history,
+    };
   }
 
   async _hasRiderColumn(columnName) {

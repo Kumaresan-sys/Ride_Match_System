@@ -34,7 +34,28 @@ function registerProfileRoutes(router, ctx) {
   const { requireAuth } = ctx;
   const notificationService = ctx.services?.notificationService;
   const profileService = ctx.services?.profileService || require('../services/profile-service');
+  const referralService = ctx.services?.referralService || require('../services/referral-service');
   const safetyService = ctx.services?.safetyService || require('../services/safety-service');
+
+  function buildReferralError(err) {
+    switch (err?.code) {
+      case 'INVALID_REFERRAL_CODE':
+      case 'REFERRAL_CODE_REQUIRED':
+        return {
+          status: 400,
+          data: { success: false, message: err.message, errorCode: err.code },
+        };
+      case 'SELF_REFERRAL_NOT_ALLOWED':
+      case 'REFERRAL_ALREADY_USED':
+      case 'REFERRAL_CODE_EXHAUSTED':
+        return {
+          status: 409,
+          data: { success: false, message: err.message, errorCode: err.code },
+        };
+      default:
+        return null;
+    }
+  }
 
   // POST /api/v1/profile/create  — save/update rider profile
   const createProfileHandler = async ({ body, headers }) => {
@@ -47,12 +68,23 @@ function registerProfileRoutes(router, ctx) {
     const dateOfBirth      = String(body?.date_of_birth || '').trim();
     const email            = String(body?.email || '').trim();
     const emergencyContact = String(body?.emergency_contact || '').trim();
+    const referralCode     = String(body?.referral_code || '').trim().toUpperCase();
 
     if (!name || !gender || !dateOfBirth) {
       return {
         status: 400,
         data: { success: false, message: 'name, gender and date_of_birth are required' },
       };
+    }
+
+    if (referralCode) {
+      try {
+        await referralService.validateReferralCode(userId, referralCode);
+      } catch (err) {
+        const referralError = buildReferralError(err);
+        if (referralError) return referralError;
+        throw err;
+      }
     }
 
     try {
@@ -71,7 +103,18 @@ function registerProfileRoutes(router, ctx) {
       throw err;
     }
 
-    const [bonusResult, referralResult] = await Promise.all([
+    let appliedReferral = null;
+    if (referralCode) {
+      try {
+        appliedReferral = await referralService.applyReferralCode(userId, referralCode);
+      } catch (err) {
+        const referralError = buildReferralError(err);
+        if (referralError) return referralError;
+        throw err;
+      }
+    }
+
+    const [bonusResult, ownReferralResult] = await Promise.all([
       profileService.awardWelcomeBonus(userId),
       profileService.generateOrGetReferralCode(userId),
       safetyService.seedProfileEmergencyContact(userId, emergencyContact),
@@ -101,7 +144,8 @@ function registerProfileRoutes(router, ctx) {
         email,
         emergency_contact: emergencyContact,
         coinsAwarded: bonusResult.coinsAwarded,
-        referralCode: referralResult.code,
+        referralCode: ownReferralResult.code,
+        appliedReferralCode: appliedReferral?.code || null,
       },
     };
   };
@@ -112,9 +156,10 @@ function registerProfileRoutes(router, ctx) {
     if (authResult.error) return authResult.error;
 
     const { userId } = authResult.session;
-    const [profile, user] = await Promise.all([
+    const [profile, user, referralResult] = await Promise.all([
       profileService.getUserProfile(userId),
       profileService.getUserById(userId),
+      profileService.generateOrGetReferralCode(userId),
     ]);
 
     if (!profile) {
@@ -137,6 +182,7 @@ function registerProfileRoutes(router, ctx) {
         emergency_contact: profile.emergency_contact || '',
         phone_number:      user?.phone_number || '',
         member_since:      memberSince,
+        referralCode:      referralResult?.code || '',
       },
     };
   };

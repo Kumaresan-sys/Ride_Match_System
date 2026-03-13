@@ -46,7 +46,7 @@ function registerRideChatRoutes(router, ctx) {
       return { isAdmin: true, userId: 'admin' };
     }
     const auth = await authenticate(headers);
-    if (auth.error) return { error: auth.error };
+    if (auth.error) return { error: normalizeRouteError(auth.error, 'AUTH_REQUIRED') };
     return { session: auth.session, userId: auth.session.userId, isAdmin: false };
   }
 

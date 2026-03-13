@@ -27,6 +27,11 @@ function unique(values) {
   return [...new Set((values || []).filter(Boolean).map((value) => String(value)))];
 }
 
+function isUuidLike(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    .test(String(value || '').trim());
+}
+
 class DevResetService {
   constructor(deps = {}) {
     this.domainDb = deps.domainDb || domainDb;
@@ -35,6 +40,7 @@ class DevResetService {
     this.matchingEngine = deps.matchingEngine || matchingEngine;
     this.rideService = deps.rideService || rideService;
     this.devDriverSeedService = deps.devDriverSeedService || devDriverSeedService;
+    this._columnTypeCache = new Map();
   }
 
   async reset(options = {}) {
@@ -429,6 +435,36 @@ class DevResetService {
       const userRefs = await this._loadForeignKeyRefs(client, 'users');
       const otpRequestRefs = await this._loadForeignKeyRefs(client, 'otp_requests');
       const otpRequestIds = await this._selectIds(client, 'otp_requests', 'id', 'phone_number', phoneNumbers, 'text');
+      const referralCodeIds = await this._selectIds(client, 'referral_codes', 'id', 'user_id', riderUserIds);
+      const referralTrackingIds = unique([
+        ...(await this._selectIds(client, 'referral_tracking', 'id', 'referral_code_id', referralCodeIds)),
+        ...(await this._selectIds(client, 'referral_tracking', 'id', 'referrer_id', riderUserIds)),
+        ...(await this._selectIds(client, 'referral_tracking', 'id', 'referee_id', riderUserIds)),
+      ]);
+      const deviceIds = await this._selectIds(client, 'user_devices', 'id', 'user_id', riderUserIds);
+      const deviceRefs = await this._loadForeignKeyRefs(client, 'user_devices');
+
+      summary.deleted.referral_payouts = await this._deleteByIds(
+        client,
+        'referral_payouts',
+        'tracking_id',
+        referralTrackingIds,
+      );
+      summary.deleted.referral_tracking = await this._deleteByIds(
+        client,
+        'referral_tracking',
+        'id',
+        referralTrackingIds,
+      );
+      summary.deleted.referral_codes = await this._deleteByIds(
+        client,
+        'referral_codes',
+        'id',
+        referralCodeIds,
+      );
+
+      await this._deleteForeignKeyRefs(client, summary.deleted, deviceRefs, deviceIds);
+      summary.deleted.user_devices = await this._deleteByIds(client, 'user_devices', 'id', deviceIds);
 
       await this._deleteForeignKeyRefs(client, summary.deleted, riderRefs, riderIds);
       summary.deleted.riders = await this._deleteByIds(client, 'riders', 'id', riderIds);
@@ -487,6 +523,36 @@ class DevResetService {
     return rows.map((row) => row.table_name);
   }
 
+  async _resolveColumnInfo(client, table, column, preferredType = null) {
+    const key = `${table}:${column}`;
+    let baseInfo = this._columnTypeCache.get(key);
+    if (!baseInfo) {
+      const { rows } = await client.query(
+        `SELECT data_type, udt_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = $1
+           AND column_name = $2
+         LIMIT 1`,
+        [table, column],
+      );
+      if (!rows.length) {
+        baseInfo = { exists: false, isUuid: false, actualType: null };
+      } else {
+        const dataType = rows[0]?.data_type || '';
+        const udtName = rows[0]?.udt_name || '';
+        const isUuid = dataType === 'uuid' || udtName === 'uuid';
+        baseInfo = { exists: true, isUuid, actualType: dataType || udtName || null };
+      }
+      this._columnTypeCache.set(key, baseInfo);
+    }
+    let resolvedType = baseInfo.isUuid ? 'uuid' : 'text';
+    if (preferredType === 'text') {
+      resolvedType = 'text';
+    }
+    return { ...baseInfo, resolvedType };
+  }
+
   async _deleteAcrossTables(client, summary, { column, ids, type = 'uuid', excludeTables = [] }) {
     const values = unique(ids);
     if (!values.length) return;
@@ -499,10 +565,19 @@ class DevResetService {
   async _selectIds(client, table, targetColumn, filterColumn, values, type = 'uuid') {
     const normalizedValues = unique(values);
     if (!normalizedValues.length) return [];
+    const columnInfo = await this._resolveColumnInfo(client, table, filterColumn, type);
+    if (!columnInfo.exists) return [];
+    let resolvedType = columnInfo.resolvedType || type;
+    if (resolvedType === 'uuid' && !normalizedValues.every(isUuidLike)) {
+      resolvedType = 'text';
+    }
+    const columnExpr = resolvedType === 'text' && columnInfo.isUuid
+      ? `${quoteIdentifier(filterColumn)}::text`
+      : quoteIdentifier(filterColumn);
     const { rows } = await client.query(
       `SELECT ${quoteIdentifier(targetColumn)} AS id
        FROM ${quoteIdentifier(table)}
-       WHERE ${quoteIdentifier(filterColumn)} = ANY($1::${type}[])`,
+       WHERE ${columnExpr} = ANY($1::${resolvedType}[])`,
       [normalizedValues],
     );
     return unique(rows.map((row) => row.id));
@@ -526,9 +601,18 @@ class DevResetService {
   async _deleteByIds(client, table, column, values, type = 'uuid') {
     const ids = unique(values);
     if (!ids.length) return 0;
+    const columnInfo = await this._resolveColumnInfo(client, table, column, type);
+    if (!columnInfo.exists) return 0;
+    let resolvedType = columnInfo.resolvedType || type;
+    if (resolvedType === 'uuid' && !ids.every(isUuidLike)) {
+      resolvedType = 'text';
+    }
+    const columnExpr = resolvedType === 'text' && columnInfo.isUuid
+      ? `${quoteIdentifier(column)}::text`
+      : quoteIdentifier(column);
     const { rowCount } = await client.query(
       `DELETE FROM ${quoteIdentifier(table)}
-       WHERE ${quoteIdentifier(column)} = ANY($1::${type}[])`,
+       WHERE ${columnExpr} = ANY($1::${resolvedType}[])`,
       [ids],
     );
     return Number(rowCount || 0);

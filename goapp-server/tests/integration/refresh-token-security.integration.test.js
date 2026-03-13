@@ -10,7 +10,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 
-const db = require('../../services/db');
+const domainDb = require('../../infra/db/domain-db');
 const repo = require('../../repositories/pg/pg-identity-repository');
 
 function makeFixtureIds() {
@@ -25,8 +25,8 @@ function makeFixtureIds() {
 }
 
 async function ensureIdentitySchema() {
-  await db.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
-  await db.query(`
+  await domainDb.query('identity', 'CREATE EXTENSION IF NOT EXISTS pgcrypto');
+  await domainDb.query('identity', `
     CREATE TABLE IF NOT EXISTS users (
       id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       phone_number   VARCHAR(20) UNIQUE NOT NULL,
@@ -41,7 +41,7 @@ async function ensureIdentitySchema() {
       version        INTEGER NOT NULL DEFAULT 1
     )
   `);
-  await db.query(`
+  await domainDb.query('identity', `
     CREATE TABLE IF NOT EXISTS user_devices (
       id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id        UUID NOT NULL REFERENCES users(id),
@@ -58,7 +58,7 @@ async function ensureIdentitySchema() {
       updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-  await db.query(`
+  await domainDb.query('identity', `
     CREATE TABLE IF NOT EXISTS user_sessions (
       id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id       UUID NOT NULL REFERENCES users(id),
@@ -73,7 +73,7 @@ async function ensureIdentitySchema() {
       revoked_at    TIMESTAMPTZ
     )
   `);
-  await db.query(`
+  await domainDb.query('identity', `
     CREATE TABLE IF NOT EXISTS user_security_logs (
       id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id      UUID NOT NULL REFERENCES users(id),
@@ -85,7 +85,7 @@ async function ensureIdentitySchema() {
       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
-  await db.query(`
+  await domainDb.query('identity', `
     CREATE TABLE IF NOT EXISTS refresh_token_security (
       refresh_token_hash       VARCHAR(512) PRIMARY KEY,
       user_id                  UUID NOT NULL REFERENCES users(id),
@@ -100,27 +100,30 @@ async function ensureIdentitySchema() {
 }
 
 async function cleanupFixtureRows(fixture) {
-  await db.query('DELETE FROM refresh_token_security WHERE refresh_token_hash = $1', [fixture.refreshHash]);
-  await db.query('DELETE FROM user_security_logs WHERE user_id = $1', [fixture.userId]);
-  await db.query('DELETE FROM user_sessions WHERE id = $1 OR user_id = $2', [fixture.sessionId, fixture.userId]);
-  await db.query('DELETE FROM user_devices WHERE id = $1 OR user_id = $2', [fixture.deviceRowId, fixture.userId]);
-  await db.query('DELETE FROM users WHERE id = $1', [fixture.userId]);
+  await domainDb.query('identity', 'DELETE FROM refresh_token_security WHERE refresh_token_hash = $1', [fixture.refreshHash]);
+  await domainDb.query('identity', 'DELETE FROM user_security_logs WHERE user_id = $1', [fixture.userId]);
+  await domainDb.query('identity', 'DELETE FROM user_sessions WHERE id = $1 OR user_id = $2', [fixture.sessionId, fixture.userId]);
+  await domainDb.query('identity', 'DELETE FROM user_devices WHERE id = $1 OR user_id = $2', [fixture.deviceRowId, fixture.userId]);
+  await domainDb.query('identity', 'DELETE FROM users WHERE id = $1', [fixture.userId]);
 }
 
 async function seedAuthRows(fixture) {
-  await db.query(
+  await domainDb.query(
+    'identity',
     `INSERT INTO users (id, phone_number, email, phone_verified, user_type, status)
      VALUES ($1, $2, $3, true, 'rider', 'active')`,
     [fixture.userId, fixture.phoneNumber, fixture.email]
   );
 
-  await db.query(
+  await domainDb.query(
+    'identity',
     `INSERT INTO user_devices (id, user_id, device_id, device_type, is_active, last_active_at)
      VALUES ($1, $2, $3, $4, true, NOW())`,
     [fixture.deviceRowId, fixture.userId, 'android-bound-int-1', 'android']
   );
 
-  await db.query(
+  await domainDb.query(
+    'identity',
     `INSERT INTO user_sessions (
        id, user_id, device_id, session_token, refresh_token, is_active, expires_at
      )
@@ -130,9 +133,7 @@ async function seedAuthRows(fixture) {
 }
 
 test.after(async () => {
-  if (db.pool) {
-    await db.pool.end();
-  }
+  await domainDb.manager.close();
 });
 
 test.before(async () => {
@@ -174,7 +175,8 @@ test('recordSuspiciousRefreshAttempt persists strikes and revokes at threshold',
 
     assert.deepEqual(third, { attempts: 3, revoked: true });
 
-    const persisted = await db.query(
+    const persisted = await domainDb.query(
+      'identity',
       `SELECT suspicious_attempt_count, last_reason, revoked_at IS NOT NULL AS revoked
        FROM refresh_token_security
        WHERE refresh_token_hash = $1`,
@@ -205,7 +207,8 @@ test('clearSuspiciousRefreshAttempts removes the persisted counter row', async (
 
     await repo.clearSuspiciousRefreshAttempts(fixture.refreshHash);
 
-    const persisted = await db.query(
+    const persisted = await domainDb.query(
+      'identity',
       `SELECT COUNT(*) AS cnt
        FROM refresh_token_security
        WHERE refresh_token_hash = $1`,
@@ -225,7 +228,8 @@ test('revokeSessionByRefreshToken deactivates the matching session row', async (
 
     await repo.revokeSessionByRefreshToken(fixture.refreshHash);
 
-    const session = await db.query(
+    const session = await domainDb.query(
+      'identity',
       `SELECT is_active, revoked_at IS NOT NULL AS revoked
        FROM user_sessions
        WHERE refresh_token = $1`,

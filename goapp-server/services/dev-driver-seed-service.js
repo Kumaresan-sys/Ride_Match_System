@@ -1,6 +1,7 @@
 'use strict';
 
 const config = require('../config');
+const db = require('./db');
 const domainDb = require('../infra/db/domain-db');
 const matchingEngine = require('./matching-engine');
 const locationService = require('./location-service');
@@ -256,6 +257,7 @@ class DevDriverSeedService {
     }
 
     const fleet = createSeedFleet(options);
+    await this._ensureEnterpriseVehicleTypesActive(fleet);
     const vehicleTypeMap = await this._loadVehicleTypes(fleet);
 
     for (const driver of fleet) {
@@ -354,6 +356,19 @@ class DevDriverSeedService {
       speed: driver.speed,
       heading: driver.heading,
     })));
+  }
+
+  async _ensureEnterpriseVehicleTypesActive(fleet) {
+    const names = [...new Set((fleet || [])
+      .map((driver) => String(driver.vehicleType || '').trim().toLowerCase())
+      .filter(Boolean))];
+    if (!names.length) return;
+    await db.query(
+      `UPDATE vehicle_types
+       SET is_active = true, updated_at = NOW()
+       WHERE name = ANY($1::text[])`,
+      [names],
+    );
   }
 
   async _loadVehicleTypes(fleet) {
@@ -738,6 +753,11 @@ class DevDriverSeedService {
     const cancelledRides = Math.max(0, totalRides - completedRides);
 
     await domainDb.withTransaction('drivers', async (client) => {
+      await client.query(
+        `DELETE FROM driver_performance_metrics WHERE driver_id = $1`,
+        [driver.driverId],
+      );
+
       await client.query(
         `UPDATE driver_documents
          SET is_active = false,

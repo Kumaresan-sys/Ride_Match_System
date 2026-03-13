@@ -244,6 +244,116 @@ class PgWalletRepository {
     return this._queryWithSchemaFallback(queries);
   }
 
+  async creditCoins(userId, coins, {
+    referenceType = 'referral',
+    referenceId = null,
+    description = 'Coin credit',
+    idempotencyKey = null,
+  } = {}) {
+    const numericCoins = Math.max(0, Math.floor(Number(coins || 0)));
+    if (!numericCoins) {
+      return {
+        coinBalance: Number((await this.getBalance(userId)).coin_balance || 0),
+        coinTransactionId: null,
+      };
+    }
+
+    const client = await domainDb.getClient('payments');
+    try {
+      await client.query('BEGIN');
+
+      await client.query(
+        `INSERT INTO coin_wallets (user_id, balance, lifetime_earned, lifetime_redeemed)
+         VALUES ($1, 0, 0, 0)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [userId],
+      );
+
+      const { rows: walletRows } = await client.query(
+        `SELECT id, balance
+         FROM coin_wallets
+         WHERE user_id = $1
+         FOR UPDATE`,
+        [userId],
+      );
+      const wallet = walletRows[0];
+      if (!wallet) {
+        throw new Error(`Coin wallet not found for user ${userId}`);
+      }
+
+      const balanceBefore = Number(wallet.balance || 0);
+      const balanceAfter = balanceBefore + numericCoins;
+      const resolvedIdempotencyKey = idempotencyKey || `coin_credit:${userId}:${Date.now()}`;
+      const { rows: txRows } = await client.query(
+        `INSERT INTO coin_transactions (
+           wallet_id,
+           user_id,
+           transaction_type,
+           coins,
+           balance_before,
+           balance_after,
+           reference_type,
+           reference_id,
+           description,
+           idempotency_key
+         ) VALUES ($1, $2, 'credit', $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (idempotency_key) DO NOTHING
+         RETURNING id::text AS "coinTransactionId", balance_after AS "balanceAfter"`,
+        [
+          wallet.id,
+          userId,
+          numericCoins,
+          balanceBefore,
+          balanceAfter,
+          referenceType,
+          this._isUuid(referenceId) ? referenceId : null,
+          description,
+          resolvedIdempotencyKey,
+        ],
+      );
+
+      if (!txRows[0]) {
+        const { rows: existingRows } = await client.query(
+          `SELECT id::text AS "coinTransactionId",
+                  balance_after AS "balanceAfter"
+           FROM coin_transactions
+           WHERE idempotency_key = $1
+           LIMIT 1`,
+          [resolvedIdempotencyKey],
+        );
+        await client.query('COMMIT');
+        return {
+          coinBalance: Number(existingRows[0]?.balanceAfter || balanceBefore),
+          coinTransactionId: existingRows[0]?.coinTransactionId || null,
+        };
+      }
+
+      const coinTransactionId = txRows[0].coinTransactionId || null;
+      const persistedBalanceAfter = Number(txRows[0].balanceAfter || balanceAfter);
+
+      await client.query(
+        `UPDATE coin_wallets
+         SET balance = $2,
+             lifetime_earned = lifetime_earned + $3,
+             updated_at = NOW()
+         WHERE id = $1`,
+        [wallet.id, persistedBalanceAfter, numericCoins],
+      );
+      await this._syncRiderCoinMirror(client, userId, persistedBalanceAfter);
+
+      await client.query('COMMIT');
+      return {
+        coinBalance: persistedBalanceAfter,
+        coinTransactionId,
+      };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   // ─── Atomic balance adjustment + transaction log ──────────────────────────
 
   async adjustAndRecord(userId, { coinDelta = 0, cashDelta = 0 }, tx, options = {}) {

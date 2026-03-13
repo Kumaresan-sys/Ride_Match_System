@@ -31,11 +31,13 @@ const redis = require('./services/redis-client');
 const razorpayService = require('./services/razorpay-service');
 const zoneService = require('./services/zone-service');
 const notificationService = require('./services/notification-service');
+const notificationCenterService = require('./services/notification-center-service');
 const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
 const googleMapsService = require('./services/google-maps-service');
 const db = require('./services/db');
 const profileService = require('./services/profile-service');
+const referralService = require('./services/referral-service');
 const safetyService = require('./services/safety-service');
 const tripShareService = require('./services/trip-share-service');
 const zoneCatalogService = require('./services/zone-catalog-service');
@@ -57,6 +59,8 @@ const { bootstrapArchitecture } = require('./infra/bootstrap');
 const { bootstrapModules } = require('./modules');
 const MatchingWorker = require('./workers/matching-worker');
 const NotificationWorker = require('./workers/notification-worker');
+const NotificationIngestWorker = require('./workers/notification-ingest-worker');
+const NotificationRetentionWorker = require('./workers/notification-retention-worker');
 const OutboxRelayWorker = require('./workers/outbox-relay-worker');
 const DomainProjectionWorker = require('./workers/domain-projection-worker');
 const {
@@ -220,7 +224,9 @@ function startAPIServer(port, runtime = {}) {
       driverDocumentService,
       rideChatService,
       notificationService,
+      notificationCenterService,
       profileService,
+      referralService,
       safetyService,
       tripShareService,
       zoneCatalogService,
@@ -683,6 +689,13 @@ async function main() {
     const worker = new NotificationWorker({ notificationService });
     worker.start().catch((err) => logger.error('BOOT', `notification worker start failed: ${err.message}`));
   }
+  // Kafka ingest for in-app notifications (always safe to run; no-op if Kafka disabled)
+  const notificationIngestWorker = new NotificationIngestWorker({ notificationCenterService });
+  notificationIngestWorker.start().catch((err) => logger.error('BOOT', `notification ingest worker failed: ${err.message}`));
+
+  // Retention/expiry sweeper
+  const notificationRetentionWorker = new NotificationRetentionWorker();
+  notificationRetentionWorker.start().catch((err) => logger.error('BOOT', `notification retention worker failed: ${err.message}`));
 
   const wsServer = new WebSocketServer({
     authTimeoutMs: config.security.wsAuthTimeoutMs,

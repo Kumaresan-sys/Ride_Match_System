@@ -465,6 +465,54 @@ class WalletService {
     };
   }
 
+  async creditCoins(userId, coins, {
+    referenceType = 'referral',
+    referenceId = null,
+    description = 'Coin credit',
+    idempotencyKey = null,
+    metadata = {},
+  } = {}) {
+    const numericCoins = Math.max(0, Math.floor(Number(coins || 0)));
+    if (!numericCoins) {
+      return {
+        success: true,
+        coinsCredited: 0,
+        coinTransactionId: null,
+        coinBalanceAfter: (await this.getBalance(userId)).coinBalance,
+      };
+    }
+
+    await pgRepo._ensureWallet(userId);
+    const result = await pgRepo.creditCoins(userId, numericCoins, {
+      referenceType,
+      referenceId,
+      description,
+      idempotencyKey,
+    });
+    eventBus.publish('coins_credited', {
+      userId,
+      coins: numericCoins,
+      referenceType,
+      referenceId,
+      metadata,
+      balance: result.coinBalance,
+    });
+    eventBus.publish('wallet_updated', { userId, reason: 'coins_credited' });
+    logger.info('WALLET', `User ${userId} credited ${numericCoins} coins`, {
+      userId,
+      coins: numericCoins,
+      referenceType,
+      referenceId,
+      idempotencyKey,
+    });
+    return {
+      success: true,
+      coinsCredited: numericCoins,
+      coinTransactionId: result.coinTransactionId,
+      coinBalanceAfter: result.coinBalance,
+    };
+  }
+
   // ─── Earn coins after trip completion ────────────────────────────────────
   async earnCoins(userId, fareInr, rideId) {
     if (!userId || !fareInr || fareInr <= 0) return null;

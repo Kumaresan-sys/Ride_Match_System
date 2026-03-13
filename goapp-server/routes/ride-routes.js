@@ -918,6 +918,15 @@ function registerRideRoutes(router, ctx) {
       const earnFare = result.fare?.finalFare;
       const earnResult = await services.walletService.earnCoins(ride.riderId, earnFare, rideId);
       if (earnResult) result.coinsEarned = earnResult.coins;
+      if (services.referralService) {
+        const referralReward = await services.referralService.processFirstRideReward({
+          refereeUserId: ride.riderId,
+          rideId,
+        });
+        if (referralReward?.rewardIssued) {
+          result.referralReward = referralReward;
+        }
+      }
     }
 
     return { data: result };
